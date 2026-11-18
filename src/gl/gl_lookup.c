@@ -39,6 +39,8 @@ void APIENTRY_GL4ES gl4es_Stub(void *x) {}
 extern void* gl4es_gl31_proc_lookup(const char* name);
 #endif
 
+static void APIENTRY_GL4ES lorica_noop_provoking_vertex(GLenum mode) { (void)mode; }
+
 void* APIENTRY_GL4ES gl4es_GetProcAddress(const char *name) {
     DBG(printf("glGetProcAddress(\"%s\")", name);)
     #ifndef NOEGL
@@ -47,6 +49,9 @@ void* APIENTRY_GL4ES gl4es_GetProcAddress(const char *name) {
         if(gl31fn) return gl31fn;
     }
     #endif
+    // Legacy (GL4ES) contexts have no glProvokingVertex; Wine's wined3d still calls it when the
+    // reported version allows it and would jump to NULL. A no-op keeps it from crashing.
+    if(name && strcmp(name, "glProvokingVertex") == 0) return (void*)lorica_noop_provoking_vertex;
     // generated gles wrappers
     #include "glesfuncs.inc"
 

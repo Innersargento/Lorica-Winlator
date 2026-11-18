@@ -379,6 +379,9 @@ char* preproc(const char* code, int keepcomments, int gl_es, extensions_t* exts,
     char* old_locale = setlocale(LC_ALL, "C");
 
     khash_t(alldefine) *alldefines = kh_init(alldefine);  // will conatin all defines, even the one without int inside
+    // names #defined inside a conditional block this preprocessor cannot evaluate (#if expressions, GL_*):
+    // whether they end up defined is only known to the real compiler, so "#ifdef NAME" on them is passed through.
+    khash_t(alldefine) *maybedefs = kh_init(alldefine);
 
     khash_t(define) *defines = kh_init(define);
     if(gl_es) {
@@ -525,7 +528,7 @@ char* preproc(const char* code, int keepcomments, int gl_es, extensions_t* exts,
                             v = 1;
                         else if(kh_get(alldefine, alldefines, tok.str)!=kh_end(alldefines)) {
                             v = 0;
-                        } else if (strncmp(tok.str, "GL_", 3)==0)
+                        } else if (strncmp(tok.str, "GL_", 3)==0 || kh_get(alldefine, maybedefs, tok.str)!=kh_end(maybedefs))
                             v = -1;
                         push_if(&stackif, v);
                         nowrite_ifs = result_if(&stackif);
@@ -546,7 +549,7 @@ char* preproc(const char* code, int keepcomments, int gl_es, extensions_t* exts,
                             v = 0;
                         else if(kh_get(alldefine, alldefines, tok.str)!=kh_end(alldefines)) {
                             v = 1;
-                        } else if (strncmp(tok.str, "GL_", 3)==0)
+                        } else if (strncmp(tok.str, "GL_", 3)==0 || kh_get(alldefine, maybedefs, tok.str)!=kh_end(maybedefs))
                             v = -1;
                         push_if(&stackif, v);
                         nowrite_ifs = result_if(&stackif);
@@ -657,8 +660,22 @@ char* preproc(const char* code, int keepcomments, int gl_es, extensions_t* exts,
                         // nothing...
                     } else if(tok.type==TK_TEXT && strlen(tok.str)<50) {
                         defname = strdup(tok.str);
-                        k = kh_put(alldefine, alldefines, defname, &ret);
-                        kh_value(alldefines, k) = defname;
+                        if(nowrite_ifs == 0) {
+                            // definitely active: known to be defined from here on
+                            k = kh_put(alldefine, alldefines, defname, &ret);
+                            kh_value(alldefines, k) = defname;
+                        } else if(nowrite_ifs == -1) {
+                            // inside a conditional we cannot evaluate: maybe defined
+                            if(kh_get(alldefine, maybedefs, defname)==kh_end(maybedefs)) {
+                                k = kh_put(alldefine, maybedefs, defname, &ret);
+                                kh_value(maybedefs, k) = defname;
+                            } else
+                                free(defname), defname = strdup(tok.str);
+                        } else {
+                            // inside a block known to be dead: this define never happens
+                            free(defname);
+                            defname = strdup(tok.str);   // still used below for the int-define bookkeeping
+                        }
                         status = 620; // and now get the value
                     } else {
                         status = 399; // fallback, define name too long...
@@ -817,6 +834,10 @@ char* preproc(const char* code, int keepcomments, int gl_es, extensions_t* exts,
             free(defname);
         )
     kh_destroy(alldefine, alldefines);
+    kh_foreach_value(maybedefs, defname,
+            free(defname);
+        )
+    kh_destroy(alldefine, maybedefs);
     if(stackif.ifs)
         free(stackif.ifs);
 

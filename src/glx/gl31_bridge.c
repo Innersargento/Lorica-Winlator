@@ -108,6 +108,29 @@ EGLContext gl4es_gl31_create_backend_context(EGLDisplay dpy, EGLConfig* configs,
         }
     }
 
+    /* LIBGL_ES3=1 (opt-in): contexto de backend ES 3.0 tambien para contextos GL legados. El camino AHB
+     * (glx_ahb.c) usa glBlitFramebuffer, "#version 300 es" y VAOs, que en un contexto ES 2.0 de ANGLE dan
+     * GL_INVALID_OPERATION y dejan la ventana negra. es_major/es_minor se dejan en 2.0: GL4ES sigue siendo
+     * quien despacha (no se activa GLADIATOR). */
+    {
+        const char* e3 = getenv("LIBGL_ES3");
+        if (e3 && e3[0] == '1' && hardext.esversion >= 2) {
+            static const EGLint attrib_es3[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+            int i, found = -1;
+            if (idx >= 0 && idx < nconfigs && config_has_es3(dpy, configs[idx])) found = idx;
+            else for (i = 0; i < nconfigs; i++) if (config_has_es3(dpy, configs[i])) { found = i; break; }
+            if (found >= 0) {
+                ctx = egl_eglCreateContext(dpy, configs[found], shared, attrib_es3);
+                if (ctx != EGL_NO_CONTEXT) {
+                    if (cfgidx) *cfgidx = found;
+                    LOGD("LIBGL: contexto de backend ES 3.0 para GL legado (LIBGL_ES3=1)\n");
+                    return ctx;
+                }
+            }
+            LOGE("LIBGL: LIBGL_ES3=1 pedido pero no se pudo crear un contexto ES 3.0: uso ES 2.0\n");
+        }
+    }
+
     /* camino de siempre */
     ctx = egl_eglCreateContext(dpy, configs[idx], shared,
                                (hardext.esversion == 1) ? attrib_none : attrib_es2);

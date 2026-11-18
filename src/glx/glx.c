@@ -120,6 +120,13 @@ static int pbuf_owns_context(EGLContext c) {
         if (pbufferlist[i] && pbuffersize[i].Context == c) return 1;
     return 0;
 }
+/* 1 si alguna entrada viva usa el contexto EGL c con la misma config (el contexto se puede reutilizar para otro drawable). */
+static int pbuf_context_matches(EGLContext c, EGLConfig cfg) {
+    if (c == EGL_NO_CONTEXT) return 0;
+    for (int i=0; i<pbufferlist_size; i++)
+        if (pbufferlist[i] && pbuffersize[i].Context == c && pbuffersize[i].Config == cfg) return 1;
+    return 0;
+}
 static int pbuf_owns_surface(EGLSurface sf) {
     if (sf == EGL_NO_SURFACE) return 0;
     for (int i=0; i<pbufferlist_size; i++)
@@ -1263,6 +1270,7 @@ EGL_NO_SURFACE, or if draw or read are set to EGL_NO_SURFACE and context is
 not set to EGL_NO_CONTEXT.
 */
 
+static EGLContext lorica_reuse_ctx = 0;   /* contexto EGL que createPBuffer debe reutilizar (mismo contexto GLX, otro drawable) */
 Bool gl4es_glXMakeCurrent(Display *display,
                     GLXDrawable drawable,
                     GLXContext context) {
@@ -1395,6 +1403,9 @@ Bool gl4es_glXMakeCurrent(Display *display,
                     egl_attribs[i++] = height;
                     egl_attribs[i++] = EGL_NONE;
 
+                    /* Un contexto GLX que cambia de drawable conserva su contexto EGL (como hace un driver real): solo se crea
+                     * la superficie nueva. createPBuffer crea un contexto nuevo unicamente si la config no coincide. */
+                    lorica_reuse_ctx = context->eglContext;
                     if(createPBuffer(display, egl_attribs, &eglSurf, &eglCtx, &eglConfig, (depth>16)?8:5, (depth==15)?5:(depth>16)?8:6, (depth>16)?8:5, (depth==32)?8:0, context->samplebuffers, context->samples)==0) {
                         // fail too, abort
                         SHUT_LOGE("PBuffer creation failed too\n");
@@ -1670,8 +1681,13 @@ void gl4es_glXSwapBuffers(Display *display,
     }
     // check emulated Pixmap
     if(PBuffer && glstate->emulatedPixmap) {
-        LOAD_GLES(glFinish);
-        gles_glFinish();
+        /* Con AHB el volcado solo hace glFlush (lorica_ahb_present): no se espera a la GPU con glFinish. El glFinish
+         * queda unicamente para la copia por CPU. */
+        extern int lorica_ahb_active(void);
+        if (!lorica_ahb_active()) {
+            LOAD_GLES(glFinish);
+            gles_glFinish();
+        }
         BlitEmulatedPixmap(drawable);
     } else
         egl_eglSwapBuffers(eglDisplay, surface);
@@ -2552,6 +2568,15 @@ int createPBuffer(Display * dpy, const EGLint * egl_attribs, EGLSurface* Surface
         LOGD("Error creating PBuffer\n");
         return 0;
     }
+    {
+        /* Mismo contexto GLX en otro drawable: se reutiliza el contexto EGL (conserva estado y objetos) y solo cambia la superficie. */
+        EGLContext reuse = lorica_reuse_ctx;
+        lorica_reuse_ctx = EGL_NO_CONTEXT;
+        if (reuse != EGL_NO_CONTEXT && pbuf_context_matches(reuse, Config[0])) {
+            (*Context) = reuse;
+            return 1;
+        }
+    }
     (*Context) = egl_eglCreateContext(eglDisplay, Config[0], EGL_NO_CONTEXT, (hardext.esversion==1)?egl_context_attrib:glx_get_context_attrib_es2());
     CheckEGLErrors();
 
@@ -2647,7 +2672,8 @@ void delPixBuffer(int j)
     pbuffersize[j].dpy = 0;
     pbuffersize[j].gc = 0;
     pbuffersize[j].Surface = 0;
-    egl_eglDestroyContext(eglDisplay, pbuffersize[j].Context);
+    if (!pbuf_owns_context(pbuffersize[j].Context))   /* otra ventana viva puede seguir usando este contexto */
+        egl_eglDestroyContext(eglDisplay, pbuffersize[j].Context);
     CheckEGLErrors();
     // should pack, but I think it's useless for common use 
 }
@@ -2789,7 +2815,41 @@ void gl4es_glXDestroyPixmap(Display *display, void *pixmap) {
 }
 
 
-void actualBlit(int reverse, int Width, int Height, int Depth, 
+/* HUD de Winlator: el servidor X toma como fuente de FPS la ventana que publica las propiedades
+ * _MESA_DRV_ENGINE_NAME / _MESA_DRV_GPU_NAME (las mismas que publica Mesa) y cuenta los cuadros que
+ * esa ventana presenta. Se publican una vez por ventana, tanto con AHB como con copia por CPU.
+ *   LIBGL_HUD=0          no publica nada
+ *   LIBGL_HUD_ENGINE=..  nombre del motor (por defecto "Lorica")
+ *   LIBGL_HUD_GPU=..     nombre de la GPU (por defecto GL_RENDERER del backend) */
+#include <X11/Xatom.h>
+static void lorica_hud_publish(Display *dpy, Window win)
+{
+    const char *off = getenv("LIBGL_HUD");
+    if (off && off[0] == '0') return;
+    const char *eng = getenv("LIBGL_HUD_ENGINE");
+    if (!eng || !*eng) eng = "Lorica";
+    char gpu[192];
+    const char *g = getenv("LIBGL_HUD_GPU");
+    if (g && *g) {
+        snprintf(gpu, sizeof(gpu), "%s", g);
+    } else {
+        const char *r = (const char*)gl4es_glGetString(GL_RENDERER);
+        snprintf(gpu, sizeof(gpu), "%s", (r && *r) ? r : "GPU");
+        if (strncmp(gpu, "Lorica (", 8) == 0) {          // "Lorica (ANGLE ...)" -> "ANGLE ..."
+            size_t n = strlen(gpu);
+            memmove(gpu, gpu + 8, n - 8 + 1);
+            n = strlen(gpu);
+            if (n && gpu[n - 1] == ')') gpu[n - 1] = '\0';
+        }
+    }
+    Atom ae = XInternAtom(dpy, "_MESA_DRV_ENGINE_NAME", False);
+    Atom ag = XInternAtom(dpy, "_MESA_DRV_GPU_NAME", False);
+    XChangeProperty(dpy, win, ae, XA_STRING, 8, PropModeReplace, (const unsigned char*)eng, (int)strlen(eng));
+    XChangeProperty(dpy, win, ag, XA_STRING, 8, PropModeReplace, (const unsigned char*)gpu, (int)strlen(gpu));
+    XFlush(dpy);
+}
+
+void actualBlit(int reverse, int Width, int Height, int Depth,
                     Display *dpy, Pixmap drawable, GC gc, XImage* frame,
                     uintptr_t pix, void* tmp) {
 const int sbuf = Width * Height * (Depth==16?2:4);
@@ -2852,7 +2912,15 @@ void BlitEmulatedPixmap(int win) {
         unsigned int width, height, border, depth;
         Window root;
         int x, y;
-        XGetGeometry(dpy, drawable, &root, &x, &y, &width, &height, &border, &depth);
+        /* XGetGeometry es una ida y vuelta sincrona al servidor X: se hace cada LIBGL_GEOM_INTERVAL cuadros
+         * (por defecto 30) en vez de en cada uno. 1 = en cada cuadro (comportamiento anterior). */
+        static int geom_interval = -1, geom_tick = 0;
+        if (geom_interval < 0) { const char *gi = getenv("LIBGL_GEOM_INTERVAL"); geom_interval = (gi && atoi(gi) > 0) ? atoi(gi) : 30; }
+        if (frame && (geom_tick++ % geom_interval) != 0) {
+            width = Width; height = Height;
+        } else {
+            XGetGeometry(dpy, drawable, &root, &x, &y, &width, &height, &border, &depth);
+        }
         if(width!=Width || height!=Height /*|| depth!=Depth*/) {
             LOAD_EGL(eglDestroySurface);
             LOAD_EGL(eglMakeCurrent);
@@ -2917,7 +2985,8 @@ void BlitEmulatedPixmap(int win) {
     if (!frame) {
         return;
     }
-    { extern int lorica_ahb_present(Display*, Window, int, int, EGLDisplay); if(reverse && hardext.android && lorica_ahb_present(dpy, (Window)drawable, Width, Height, eglDisplay)) return; }
+    { static Window hud_win = 0; if (reverse && hardext.android && hud_win != (Window)drawable) { lorica_hud_publish(dpy, (Window)drawable); hud_win = (Window)drawable; } }
+    { extern int lorica_ahb_present(Display*, Window, int, int, EGLDisplay, unsigned); if(reverse && hardext.android && lorica_ahb_present(dpy, (Window)drawable, Width, Height, eglDisplay, glstate ? ((glstate->fbo.fbo_read && glstate->fbo.fbo_read->id) ? glstate->fbo.fbo_read->id : glstate->fbo.mainfbo_fbo) : 0)) return; }
     static int direct_copy = 0; /* eglCopyBuffers reports success without drawing on desktop Mesa: use glReadPixels + XPutImage */
     if(direct_copy) {
         if(hardext.android)

@@ -1,0 +1,111 @@
+name: Android NDK (Winlator)
+
+# Builds libGL.so.1 (Lorica) for the Winlator bionic guest with the Android NDK.
+# Recipe: NDK r29, android-29, arm64-v8a, NOX11=OFF (GLX front-end + DRI3/Present),
+# host xlib/xcb headers and stub libs carrying the real imagefs SONAMEs.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "Android ABI"
+        default: arm64-v8a
+        type: choice
+        options: [arm64-v8a, x86_64]
+
+env:
+  NDK_VERSION: r29
+  ANDROID_API: "29"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          link-to-sdk: true
+
+      - name: Install tools and X11/xcb headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build cmake \
+            libx11-dev libxcb1-dev libxcb-dri3-dev libxcb-present-dev x11proto-dev
+
+      - name: Prepare X11/xcb headers and stubs
+        env:
+          ABI: ${{ inputs.abi || 'arm64-v8a' }}
+        run: |
+          set -eu
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          case "$ABI" in
+            arm64-v8a) TRIPLE=aarch64-linux-android ;;
+            x86_64)    TRIPLE=x86_64-linux-android ;;
+          esac
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${TRIPLE}${ANDROID_API}-clang"
+
+          # Only X11/ and xcb/ (not all of /usr/include, to avoid mixing with the NDK sysroot)
+          mkdir -p "$RUNNER_TEMP/xsys/include" "$RUNNER_TEMP/xsys/lib"
+          cp -r /usr/include/X11 /usr/include/xcb "$RUNNER_TEMP/xsys/include/"
+
+          # Empty stubs with the SONAME they have in the Winlator imagefs.
+          # Symbols are resolved at runtime (-z undefs / allow-shlib-undefined).
+          echo "" > "$RUNNER_TEMP/empty.c"
+          mk() { "$CC" -shared -o "$RUNNER_TEMP/xsys/lib/$1" -Wl,-soname,"$2" "$RUNNER_TEMP/empty.c"; }
+          mk libX11.so         libX11.so.6
+          mk libxcb.so         libxcb.so.1
+          mk libX11-xcb.so     libX11-xcb.so.1
+          mk libxcb-dri3.so    libxcb-dri3.so.0
+          mk libxcb-present.so libxcb-present.so.0
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" rc "$RUNNER_TEMP/xsys/lib/libpthread.a"
+
+      - name: Configure
+        env:
+          ABI: ${{ inputs.abi || 'arm64-v8a' }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$ABI" \
+            -DANDROID_PLATFORM=android-${ANDROID_API} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID=ON -DNOX11=OFF -DNOEGL=OFF -DGBM=OFF -DUSE_ANDROID_LOG=ON \
+            "-DCMAKE_C_FLAGS=-I$RUNNER_TEMP/xsys/include -fno-math-errno" \
+            "-DCMAKE_SHARED_LINKER_FLAGS=-L$RUNNER_TEMP/xsys/lib -Wl,--allow-shlib-undefined -Wl,-z,undefs"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Package
+        env:
+          ABI: ${{ inputs.abi || 'arm64-v8a' }}
+        run: |
+          set -eu
+          STRIP="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          mkdir -p dist/usr/lib
+          cp lib/libGL.so.1 dist/usr/lib/libGL.so.1
+          "$STRIP" dist/usr/lib/libGL.so.1
+          file dist/usr/lib/libGL.so.1
+          readelf -d dist/usr/lib/libGL.so.1 | grep NEEDED || true
+          (cd dist && tar -czf "../lorica-android-${ABI}.tar.gz" usr)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lorica-android-${{ inputs.abi || 'arm64-v8a' }}
+          path: |
+            dist/usr/lib/libGL.so.1
+            lorica-android-*.tar.gz
+
+      - name: Publish release (tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lorica-android-*.tar.gz

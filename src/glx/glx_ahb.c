@@ -4,12 +4,15 @@
 #include <X11/Xlib.h>
 #include <EGL/egl.h>
 void lorica_ahb_context_destroyed(void) { }
-int lorica_ahb_present(Display *dpy, Window win, int w, int h, EGLDisplay ed) {
+int lorica_ahb_active(void) { return 0; }
+int lorica_ahb_present(Display *dpy, Window win, int w, int h, EGLDisplay ed, unsigned srcfb) {
+    (void)srcfb;
     (void)dpy; (void)win; (void)w; (void)h; (void)ed;
     return 0;
 }
 #else
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -93,7 +96,23 @@ static void (*f_BindFb)(unsigned, unsigned);
 static void (*f_FbTex)(unsigned, unsigned, unsigned, unsigned, int);
 static unsigned (*f_FbStatus)(unsigned);
 static void (*f_Blit)(int,int,int,int,int,int,int,int,unsigned,unsigned);
-static void (*f_Finish)(void);
+static void (*f_Flush)(void);
+static unsigned (*f_GetError)(void);
+static int ahb_dbg = -1;
+static void (*f_ReadPix)(int, int, int, int, unsigned, unsigned, void*);
+/* Diagnostico: lee un pixel del centro de un framebuffer (0xAABBGGRR en memoria RGBA) y lo imprime. */
+static void dbg_px(const char *tag, unsigned fb, int w, int h) {
+    unsigned char px[4] = {0xee, 0xee, 0xee, 0xee};
+    int rb = 0; unsigned er;
+    if (!f_ReadPix) return;
+    f_GetInt(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &rb);
+    f_BindFb(0x8CA8 /* READ_FRAMEBUFFER */, fb);
+    f_ReadPix(w / 2, h / 2, 1, 1, 0x1908 /* RGBA */, 0x1401 /* UNSIGNED_BYTE */, px);
+    er = f_GetError();
+    f_BindFb(0x8CA8, (unsigned)rb);
+    fprintf(stderr, "LIBGL: AHB-DBG: %s fb=%u centro RGBA=%02x%02x%02x%02x err=0x%x\n", tag, fb, px[0], px[1], px[2], px[3], er);
+}
+static unsigned g_srcfb;   /* framebuffer 0 de GL4ES: su FBO principal si existe, si no 0 */
 static unsigned char (*f_IsEn)(unsigned);
 static void (*f_En)(unsigned);
 static void (*f_Dis)(unsigned);
@@ -144,7 +163,7 @@ static int resolve(void) {
     R(f_ClearColor, "glClearColor") R(f_Clear, "glClear") R(f_ColorMask, "glColorMask")
     R(f_GenFb, "glGenFramebuffers") R(f_DelFb, "glDeleteFramebuffers")
     R(f_BindFb, "glBindFramebuffer") R(f_FbTex, "glFramebufferTexture2D")
-    R(f_FbStatus, "glCheckFramebufferStatus") R(f_Blit, "glBlitFramebuffer") R(f_Finish, "glFinish")
+    R(f_FbStatus, "glCheckFramebufferStatus") R(f_Blit, "glBlitFramebuffer") R(f_Flush, "glFlush") R(f_GetError, "glGetError") R(f_ReadPix, "glReadPixels")
     R(f_IsEn, "glIsEnabled") R(f_En, "glEnable") R(f_Dis, "glDisable")
     R(f_Target, "glEGLImageTargetTexture2DOES") R(f_CreateImg, "eglCreateImageKHR")
     R(f_DestroyImg, "eglDestroyImageKHR") R(f_NativeBuf, "eglGetNativeClientBufferANDROID")
@@ -261,7 +280,7 @@ static int swz_draw(buf_t *b, int w, int h) {
 
     // (1) framebuffer 0 -> textura propia, sin voltear (mascara de color completa por si el driver la aplica al blit)
     f_ColorMask(1, 1, 1, 1);
-    f_BindFb(G_READ_FB, 0); f_BindFb(G_DRAW_FB, Z.fbo);
+    f_BindFb(G_READ_FB, g_srcfb); f_BindFb(G_DRAW_FB, Z.fbo);
     f_Blit(0, 0, w, h, 0, 0, w, h, G_COLOR_BIT, G_NEAREST);
     // (2) triangulo a pantalla completa hacia el FBO del AHB
     f_BindFb(G_FB, b->fbo);
@@ -289,7 +308,7 @@ static void blit_flip(buf_t *b, int w, int h) {
     f_GetInt(G_READ_FB_BIND, &rb); f_GetInt(G_DRAW_FB_BIND, &db);
     unsigned char sc = f_IsEn(G_SCISSOR);
     if (sc) f_Dis(G_SCISSOR);
-    f_BindFb(G_READ_FB, 0); f_BindFb(G_DRAW_FB, b->fbo);
+    f_BindFb(G_READ_FB, g_srcfb); f_BindFb(G_DRAW_FB, b->fbo);
     f_Blit(0, 0, w, h, 0, h, w, 0, G_COLOR_BIT, G_NEAREST);
     f_BindFb(G_READ_FB, rb); f_BindFb(G_DRAW_FB, db);
     if (sc) f_En(G_SCISSOR);
@@ -364,12 +383,19 @@ static int mk(buf_t *b, Window win, int w, int h, EGLDisplay ed) {
     xcb_flush(S.c);
     struct pollfd p = { sv[1], POLLIN, 0 };
     char c1 = 0; int ok = 0;
-    if (poll(&p, 1, 3000) == 1 && read(sv[1], &c1, 1) == 1 && a_send(b->ahb, sv[1]) == 0) ok = 1;
-    else fprintf(stderr, "LIBGL: AHB: handshake DRI3 sin respuesta del servidor\n");
+    int pr = poll(&p, 1, 3000), rr = -2, sr = -2, ser = 0;
+    if (pr == 1) { rr = (int)read(sv[1], &c1, 1); if (rr == 1) { errno = 0; sr = a_send(b->ahb, sv[1]); ser = errno; } }
+    if (pr == 1 && rr == 1 && sr == 0) ok = 1;
+    else fprintf(stderr, "LIBGL: AHB: handshake DRI3 sin respuesta del servidor (poll=%d revents=0x%x read=%d send=%d errno=%d)\n", pr, p.revents, rr, sr, ser);
     close(sv[1]);
     if (!ok) return 0;
     xcb_generic_error_t *er = xcb_request_check(S.c, ck);
-    if (er) { fprintf(stderr, "LIBGL: AHB: DRI3 error %d\n", er->error_code); free(er); b->pix = 0; return 0; }
+    if (er) {
+        fprintf(stderr, "LIBGL: AHB: DRI3 error %d (major=%u minor=%u recurso=0x%x) | ventana=0x%x %dx%d stride=%u formato=%u uso=0x%llx capas=%u | byte=%d envio=%d\n",
+                er->error_code, (unsigned)er->major_code, (unsigned)er->minor_code, (unsigned)er->resource_id, (unsigned)win, w, h, stride,
+                (unsigned)dd.format, (unsigned long long)dd.usage, (unsigned)dd.layers, (int)c1, sr);
+        free(er); b->pix = 0; return 0;
+    }
     return 1;
 }
 
@@ -421,10 +447,14 @@ static void hooks_once(void) {
     }
 }
 
+// 1 si el volcado AHB esta activo (glx.c evita entonces su glFinish duplicado).
+int lorica_ahb_active(void) { return S.ready && !S.dead; }
+
 // Prototipo de libX11 (esta en Xlibint.h; se declara aca para no depender de ese header).
 extern int (*XESetCloseDisplay(Display *dpy, int extension, int (*proc)(Display*, XExtCodes*)))(Display*, XExtCodes*);
 
-int lorica_ahb_present(Display *dpy, Window win, int w, int h, EGLDisplay ed) {
+int lorica_ahb_present(Display *dpy, Window win, int w, int h, EGLDisplay ed, unsigned srcfb) {
+    g_srcfb = srcfb;
     if (g_sig) {                       // Ctrl+C / SIGTERM: liberar en el servidor y terminar como corresponde
         int sg = g_sig; g_sig = 0;
         free_x();
@@ -434,9 +464,13 @@ int lorica_ahb_present(Display *dpy, Window win, int w, int h, EGLDisplay ed) {
     if (S.dead) return 0;
     if (!S.init) {
         S.init = 1;
-        const char *e = getenv("LIBGL_AHB"), *z = getenv("LIBGL_AHB_SWIZZLE");
+        const char *e = getenv("LIBGL_AHB"), *z = getenv("LIBGL_AHB_RBSWAP"), *zl = getenv("LIBGL_AHB_SWIZZLE");
         if ((e && e[0] == '0') || !resolve()) { S.dead = 1; return 0; }
-        if ((z && z[0] == '0') || !resolve_swz()) noswz = 1;
+        /* LIBGL_AHB_RBSWAP=1 intercambia rojo y azul (shader) al volcar al AHB; 0 o sin definir deja los canales
+         * tal cual (el servidor X de Winlator lee el AHB como RGBA, asi que no hace falta intercambiar).
+         * LIBGL_AHB_SWIZZLE=1 se mantiene como alias antiguo cuando RBSWAP no esta definida. */
+        int want_swap = (z && z[0] == '1') || (!z && zl && zl[0] == '1');
+        if (!want_swap || !resolve_swz()) noswz = 1;
     }
     // Si el contexto GL cambio (la app destruyo y recreo el suyo), la textura y el FBO guardados
     // pertenecian al viejo. Se olvidan sin borrarlos (borrar esos nombres desde el contexto nuevo
@@ -477,8 +511,23 @@ int lorica_ahb_present(Display *dpy, Window win, int w, int h, EGLDisplay ed) {
         fprintf(stderr, "LIBGL: AHB cero-copia activo %dx%d (%s)\n", w, h, noswz ? "blit" : "swizzle BGRA");
     }
     buf_t *b = &S.b[S.cur];
+    if (ahb_dbg < 0) { const char *d = getenv("LIBGL_AHB_DEBUG"); ahb_dbg = d ? atoi(d) : 0; }
+    if (ahb_dbg) { unsigned pe = f_GetError(); if (pe) fprintf(stderr, "LIBGL: AHB-DBG: error GL previo al volcado 0x%x\n", pe); }
+    { static int np = 0; if (ahb_dbg && np < 6) { np++; dbg_px("origen(mainfbo/0)", g_srcfb, w, h); if (g_srcfb) dbg_px("framebuffer 0 real", 0, w, h); } }
     if (noswz || !swz_draw(b, w, h)) blit_flip(b, w, h);
-    f_Finish();
+    { static int nq = 0; if (ahb_dbg && nq < 6) { nq++; dbg_px("AHB tras copia", b->fbo, w, h); } }
+    if (ahb_dbg) {
+        static int n = 0;
+        unsigned er = f_GetError();
+        if (n < 20) { n++; fprintf(stderr, "LIBGL: AHB-DBG: frame %d buf %d tras volcado: error GL 0x%x (%d)\n", n, S.cur, er, (int)ahb_dbg); }
+        if (ahb_dbg == 2) {   /* relleno magenta: prueba de que el servidor muestra el AHB */
+            int odb = 0; f_GetInt(G_DRAW_FB_BIND, &odb);
+            f_BindFb(G_DRAW_FB, b->fbo); f_ColorMask(1, 1, 1, 1); f_ClearColor(1, 0, 1, 1); f_Clear(G_COLOR_BIT);
+            f_BindFb(G_DRAW_FB, odb);
+        }
+    }
+    /* glFlush y no glFinish: no se espera a que la GPU termine el cuadro antes de presentarlo (mas rapido). */
+    f_Flush();
     if (S.first) {
         S.first = 0;
         xcb_void_cookie_t ck = xcb_present_pixmap_checked(S.c, win, b->pix, ++S.serial, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL);
