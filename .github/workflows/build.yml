@@ -38,7 +38,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ninja-build cmake \
-            libx11-dev libxcb1-dev libxcb-dri3-dev libxcb-present-dev x11proto-dev
+            libx11-dev libxcb1-dev libxcb-dri3-dev libxcb-present-dev x11proto-dev libx11-xcb-dev
 
       - name: Prepare X11/xcb headers and stubs
         env:
