@@ -1,4 +1,5 @@
 #include "texture.h"
+#include "hybrid.h"
 
 #include "../glx/hardext.h"
 #include "../glx/streaming.h"
@@ -16,6 +17,23 @@
 #include "pixel.h"
 #include "raster.h"
 #include "stb_dxt_104.h"
+
+#ifndef NOEGL
+extern int gl4es_backend_es3(void);   // glx/gl31_bridge.c
+#endif
+
+// GL semantics: every mip level the application uploads belongs to the texture as sent. GL4ES stores them that way when the backend can
+// express the application's level range (GL_TEXTURE_BASE_LEVEL / MAX_LEVEL, ES 3) and level 0 kept the application's size (no shrink,
+// no power-of-two adjustment, NPOT mipmaps allowed). Otherwise it keeps its fallback: decode the first level it sees and generate the
+// lower ones from it.
+static int explicit_mips(const gltexture_t* bound) {
+#ifndef NOEGL
+    return bound && gl4es_backend_es3() && !bound->shrink && !bound->adjust && (!bound->npot || hardext.npot>=2);
+#else
+    (void)bound;
+    return 0;
+#endif
+}
 
 //#define DEBUG
 #ifdef DEBUG
@@ -206,7 +224,8 @@ void APIENTRY_GL4ES gl4es_glCompressedTexImage2D(GLenum target, GLint level, GLe
     GLenum type = GL_UNSIGNED_BYTE;
         
     if (isDXTc(internalformat)) {
-        if(level && bound->mipmap_auto==1)
+        const int explicit_chain = explicit_mips(bound);
+        if(level && bound->mipmap_auto==1 && !explicit_chain)
             return; // nothing to do
         GLvoid *pixels, *half;
         pixels = half = NULL;
@@ -289,13 +308,19 @@ void APIENTRY_GL4ES gl4es_glCompressedTexImage2D(GLenum target, GLint level, GLe
         if(level && bound && bound->valid)
             new_intformat = (bound->format==GL_RGB)?GL_COMPRESSED_RGB:GL_COMPRESSED_RGBA;
         DBG(printf(" => internalformat=%s (Alpha=%d/%d), %dx%d %s/%s\n\n", PrintEnum(new_intformat), simpleAlpha, complexAlpha, width, height, PrintEnum(format), PrintEnum(type));)
+        // the decoded pixels are GL4ES's own (native byte order): GL_UNPACK_SWAP_BYTES does not apply to them
+        const GLboolean swap_unpack = glstate->texture.unpack_swap_bytes;
+        glstate->texture.unpack_swap_bytes = GL_FALSE;
         gl4es_glTexImage2D(target, level, new_intformat, width, height, border, format, type, half);
         // re-update bounded texture info, but not format and type
         bound->alpha = (simpleAlpha||complexAlpha)?1:0;
         bound->compressed = 1;
         bound->wanted_internal = bound->internalformat = internalformat;
         bound->valid = 1;
-        if(level) {
+        if(level && explicit_chain) {
+            // the application supplies this level (and the following ones): nothing to synthesise, and mipmapped sampling must stay on
+            bound->mipmap_explicit = 1;
+        } else if(level) {
             // not automipmap yet? then set it...
             bound->mipmap_need = 1;
             // and upload higher level here...
@@ -321,6 +346,7 @@ void APIENTRY_GL4ES gl4es_glCompressedTexImage2D(GLenum target, GLint level, GLe
             bound->mipmap_auto = 1;
         }
 
+        glstate->texture.unpack_swap_bytes = swap_unpack;
         if (oldalign!=1) 
             gl4es_glPixelStorei(GL_UNPACK_ALIGNMENT, oldalign);
         if (half!=pixels)
@@ -366,7 +392,7 @@ void APIENTRY_GL4ES gl4es_glCompressedTexSubImage2D(GLenum target, GLint level, 
     int complexAlpha = 0;
     int transparent0 = (format==GL_COMPRESSED_RGBA_S3TC_DXT1_EXT || format==GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT)?1:0;
     if (isDXTc(format)) {
-        if(level) {
+        if(level && !explicit_mips(bound)) {
             noerrorShim();
             return;
         }
@@ -469,14 +495,13 @@ void APIENTRY_GL4ES gl4es_glGetCompressedTexImage(GLenum target, GLint lod, GLvo
 void APIENTRY_GL4ES gl4es_glCompressedTexImage1D(GLenum target, GLint level, GLenum internalformat,
                             GLsizei width, GLint border,
                             GLsizei imageSize, const GLvoid *data) {
-                                
     gl4es_glCompressedTexImage2D(target, level, internalformat, width, 1, border, imageSize, data);
 }
 
 void APIENTRY_GL4ES gl4es_glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat,
                             GLsizei width, GLsizei height, GLsizei depth, GLint border,
                             GLsizei imageSize, const GLvoid *data) {
-                                
+    if (!glstate->list.compiling && gl4es_hybrid_tex_target(target)) { FLUSH_BEGINEND; gl4es_hybrid_CompressedTexImage3D(target, level, internalformat, width, height, depth, border, imageSize, data); noerrorShim(); return; }
     gl4es_glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
 }
 
@@ -490,6 +515,7 @@ void APIENTRY_GL4ES gl4es_glCompressedTexSubImage3D(GLenum target, GLint level, 
                                GLsizei width, GLsizei height, GLsizei depth, GLenum format, 
                                GLsizei imageSize, const GLvoid *data) {
 
+    if (!glstate->list.compiling && gl4es_hybrid_tex_target(target)) { FLUSH_BEGINEND; gl4es_hybrid_CompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data); noerrorShim(); return; }
     gl4es_glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
 }
 

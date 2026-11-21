@@ -72,11 +72,20 @@
    #if defined(__linux__) && !defined(LORICA_NO_DISPATCH) && (defined(__x86_64__) || defined(__aarch64__))
     /* Despacho indirecto: cada simbolo GL exportado es un salto a traves de un slot que
      * glXMakeCurrent repunta (GL4ES o GLADIATOR, ver gl4es_gl31_dispatch_update). Cada entrada se
-     * registra en la seccion lorica_disp como {nombre, slot, destino por defecto}. */
+     * registra en la seccion lorica_disp como {nombre, slot, destino por defecto, simbolo}.
+     * La seccion solo la referencian __start_/__stop_lorica_disp: con --gc-sections, lld (>= 13,
+     * -z start-stop-gc por defecto, y el NDK siempre pasa --gc-sections) la descarta entera y el
+     * despacho queda vacio. La marca R (SHF_GNU_RETAIN) la conserva; GNU ld ya conserva por defecto
+     * las secciones con __start_ referenciado, y gas < 2.36 no conoce R. */
     #ifdef __x86_64__
      #define __LORICA_JMP_ARCH(E) "endbr64\n\tjmp *.Lsl_" #E "(%rip)\n"
     #else
      #define __LORICA_JMP_ARCH(E) "hint 34\n\tadrp x16, .Lsl_" #E "\n\tldr x16, [x16, :lo12:.Lsl_" #E "]\n\tbr x16\n"
+    #endif
+    #ifdef __clang__
+     #define __LORICA_DISP_FLAGS "\"awR\""
+    #else
+     #define __LORICA_DISP_FLAGS "\"aw\""
     #endif
     #define _AliasExport_(RET,ENM,DEF,INM,SUF) \
       __asm__(".text\n\t.globl " #ENM "\n\t.type " #ENM ",@function\n\t.p2align 4\n" \
@@ -85,8 +94,8 @@
               ".Lsl_" #ENM ": .quad gl4es_" #INM "\n\t.popsection\n" \
               ".pushsection .rodata.lorica_names,\"a\",@progbits\n" \
               ".Lnm_" #ENM ": .asciz \"" #ENM "\"\n\t.popsection\n" \
-              ".pushsection lorica_disp,\"aw\",@progbits\n\t.p2align 3\n\t" \
-              ".quad .Lnm_" #ENM ", .Lsl_" #ENM ", gl4es_" #INM "\n\t.popsection\n")
+              ".pushsection lorica_disp," __LORICA_DISP_FLAGS ",@progbits\n\t.p2align 3\n\t" \
+              ".quad .Lnm_" #ENM ", .Lsl_" #ENM ", gl4es_" #INM ", " #ENM "\n\t.popsection\n")
    #else
    #define _AliasExport_(RET,ENM,DEF,INM,SUF) EXPORT \
       RET APIENTRY_GL4ES ENM DEF __attribute__((alias(_MNG(gl4es_##INM,SUF))))

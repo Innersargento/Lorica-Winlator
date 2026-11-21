@@ -1,4 +1,5 @@
 #include "gl4es.h"
+#include "hybrid.h"
 
 #if defined(AMIGAOS4) || (defined(NOX11) && defined(NOEGL) && !defined(_WIN32))
 #include <sys/time.h>
@@ -63,6 +64,7 @@ int adjust_vertices(GLenum mode, int nb) {
 #define clone_gl_pointer(t, s, n)\
     t.size = s; t.type = type; t.stride = stride; t.pointer = (void*)((char*)pointer + (uintptr_t)((glstate->vao->vertex)?glstate->vao->vertex->data:0));\
     t.real_buffer=(glstate->vao->vertex)?glstate->vao->vertex->real_buffer:0; t.real_pointer=(glstate->vao->vertex)?pointer:0;   \
+    t.vbuf=glstate->vao->vertex;   \
     t.normalized=n; t.divisor=0
 #define break_lockarrays(t)\
     if(glstate->vao->vertexattrib[t].real_buffer && glstate->vao->locked_mapped[t]) {    \
@@ -1142,10 +1144,14 @@ AliasExport(void,glColorMask,,(GLboolean red, GLboolean green, GLboolean blue, G
 
 void APIENTRY_GL4ES gl4es_glClear(GLbitfield mask) {
     PUSH_IF_COMPILING(glClear);
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
+    if (glstate->raster.bm_drawing) bitmap_flush();   // pending glBitmap pixels belong before this framebuffer access
 
     mask &= GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
     LOAD_GLES(glClear);
+    gl4es_fbo_draw_begin();     // draw buffers mapped through a proxy FBO (framebuffers.c)
     gles_glClear(mask);
+    gl4es_fbo_draw_end();
 }
 AliasExport(void,glClear,,(GLbitfield mask));
 

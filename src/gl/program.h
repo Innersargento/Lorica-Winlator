@@ -237,6 +237,12 @@ typedef struct {
     GLint                           builtin_normalrescale;
     GLint                           builtin_clipplanes[MAX_CLIP_PLANES];
     int                             has_builtin_clipplanes;
+    // hybrid mode: a shader converted by GLADIATOR carries its own uniforms lorica_vs, lorica_vs2, lorica_fs (point
+    // size, glClipControl, GL_CLIP_DISTANCEi mask...). GLADIATOR feeds them for the programs it links; for the ones
+    // GL4ES links, realize_glenv does it. `gladiator` = some attached shader was converted by GLADIATOR.
+    GLint                           builtin_lorica[3];
+    int                             has_builtin_lorica;
+    int                             gladiator;
     builtin_pointsprite_t           builtin_pointsprite;
     GLint                           builtin_texenvcolor[MAX_TEX];
     int                             has_builtin_texenv;
@@ -331,6 +337,8 @@ int gl4es_getProgramBinary(GLuint program, int *length, GLenum *format, void** b
 
 void GoUniformfv(program_t *glprogram, GLint location, int size, int count, const GLfloat *value);
 void GoUniformiv(program_t *glprogram, GLint location, int size, int count, const GLint *value);
+void GoUniformuiv(program_t *glprogram, GLint location, int size, int count, const GLuint *value);
+void GoUniformMatrixNxMfv(program_t *glprogram, GLenum mtype, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 void GoUniformMatrix2fv(program_t *glprogram, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 void GoUniformMatrix3fv(program_t *glprogram, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 void GoUniformMatrix4fv(program_t *glprogram, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);

@@ -71,6 +71,7 @@ void APIENTRY_GL4ES gl4es_glFinish(void);
 void APIENTRY_GL4ES gl4es_glFogfv(GLenum pname, const GLfloat* params);
 
 void APIENTRY_GL4ES gl4es_glStencilMaskSeparate(GLenum face, GLuint mask);
+void APIENTRY_GL4ES gl4es_glStencilFuncSeparateATI(GLenum frontfunc, GLenum backfunc, GLint ref, GLuint mask);
 
 void APIENTRY_GL4ES gl4es_glMultiDrawArrays(GLenum mode, const GLint *first, const GLsizei *count, GLsizei primcount);
 void APIENTRY_GL4ES gl4es_glMultiDrawElements( GLenum mode, GLsizei *count, GLenum type, const void * const *indices, GLsizei primcount);

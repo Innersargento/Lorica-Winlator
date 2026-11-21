@@ -27,6 +27,7 @@ void APIENTRY_GL4ES gl4es_glFramebufferTextureLayer(	GLenum target, GLenum attac
 void APIENTRY_GL4ES gl4es_glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
 
 void APIENTRY_GL4ES gl4es_glDrawBuffers(GLsizei n, const GLenum *bufs);
+void APIENTRY_GL4ES gl4es_glReadBuffer(GLenum mode);
 void APIENTRY_GL4ES gl4es_glNamedFramebufferDrawBuffers(GLuint framebuffer, GLsizei n, const GLenum *bufs);
 
 void APIENTRY_GL4ES gl4es_glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint * value);
@@ -49,6 +50,9 @@ void bindMainFBO();
 void unbindMainFBO();
 
 void readfboBegin();
+// draw buffer mapping GLES cannot express (output i -> attachment k != i): proxy FBO bound around GL4ES's draws/clears
+void gl4es_fbo_draw_begin(void);
+void gl4es_fbo_draw_end(void);
 void readfboEnd();
 
 GLuint gl4es_getCurrentFBO();

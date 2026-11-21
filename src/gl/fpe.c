@@ -1,4 +1,16 @@
 #include "../glx/hardext.h"
+#ifndef NOEGL
+extern void gl4es_gl31_ubo_fit(unsigned program);   // glx/gl31_bridge.c
+#ifndef NOEGL
+extern int gl4es_backend_es3(void);   // glx/gl31_bridge.c: the current context's GLES backend is 3.x
+static int fpe_backend_es3(void) { return gl4es_backend_es3(); }
+#else
+static int fpe_backend_es3(void) { return 0; }
+#endif
+// glx/gl31_bridge.c: values of lorica_vs / lorica_vs2 / lorica_fs for a hybrid context (0 = not hybrid)
+extern int gl4es_gl31_lorica_values(float point_size, int program_point_size, unsigned sprite_origin,
+                                    unsigned clip_mask_lo, float out[3][4]);
+#endif
 #include "array.h"
 #include "debug.h"
 #include "enum_info.h"
@@ -9,6 +21,7 @@
 #include "matrix.h"
 #include "matvec.h"
 #include "program.h"
+#include "queries.h"
 #include "shaderconv.h"
 
 #include "fpe.h"
@@ -17,6 +30,7 @@
 #define fpe_fpe_t fpe_fpe_t
 #define kh_fpecachelist_t kh_fpecachelist_t
 #include "fpe_cache.h"
+#include "framebuffers.h"
 #undef fpe_state_t
 #undef fpe_fpe_t
 #undef kh_fpecachelist_t
@@ -813,36 +827,110 @@ void APIENTRY_GL4ES fpe_glNormal3f(GLfloat nx, GLfloat ny, GLfloat nz) {
 void APIENTRY_GL4ES fpe_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     DBG(printf("fpe_glDrawArrays(%s, %d, %d), program=%d, instanceID=%u\n", PrintEnum(mode), first, count, glstate->glsl->program, glstate->instanceID);)
     scratch_t scratch = {0};
+    gl4es_occl_count_draw(mode, first, count, 0, NULL);
     realize_glenv(mode==GL_POINTS, first, count, 0, NULL, &scratch);
     LOAD_GLES(glDrawArrays);
     gles_glDrawArrays(mode, first, count);
+    gl4es_fbo_draw_end();
     free_scratch(&scratch);
+}
+
+// The element VBO has to hold the indices [indices, indices+count) of the shadow copy: send only the written blocks they touch
+static void index_buffer_sync(glbuffer_t *eb, const GLvoid *indices, GLsizei count, GLenum type) {
+    GLsizei isz = (type==GL_UNSIGNED_INT)?4:(type==GL_UNSIGNED_BYTE)?1:2;
+    GLintptr off = (GLintptr)((const char*)indices - (const char*)eb->data);
+    gl4es_buffer_resync_range(eb, off, off + (GLintptr)count*isz);
+}
+
+// glDrawElementsBaseVertex done by the driver: the indices stay in the element VBO and the driver adds the base vertex, instead of
+// GL4ES copying them, adding it to each one and drawing from client memory (the index copy and its upload cost CPU on every draw).
+// The caller (glDrawElementsBaseVertex) sets fpe_basevertex and draws through glDrawElementsCommon with the indices of the shadow copy;
+// fpe_glDrawElements takes it.
+int fpe_basevertex = 0;
+#ifndef NOEGL
+extern void* gl31_native_basevertex_fn(void);       // GLADIATOR: the driver's glDrawElementsBaseVertex, NULL if it has none
+extern int   gl4es_gl31_hybrid_active(void);
+#endif
+
+int fpe_native_basevertex_ok(GLenum mode, GLenum type, const void *indices) {
+#ifdef NOEGL
+    return 0;
+#else
+    if(hardext.esversion<2 || !gl4es_gl31_hybrid_active() || !gl31_native_basevertex_fn()) return 0;
+    if(mode > GL_TRIANGLE_FAN) return 0;                                        // GL_QUADS, GL_QUAD_STRIP, GL_POLYGON need rewritten indices
+    // GL_LINE / GL_POINT polygon modes (0 = never set = GL_FILL) and selection rewrite the indices too
+    if(glstate->polygon_mode == GL_LINE || glstate->polygon_mode == GL_POINT || glstate->render_mode == GL_SELECT) return 0;
+    if(type!=GL_UNSIGNED_SHORT && !(type==GL_UNSIGNED_INT && hardext.elementuint)) return 0;
+    glbuffer_t *eb = glstate->vao->elements;
+    if(!eb || !eb->real_buffer || !eb->data || (uintptr_t)indices >= (uintptr_t)eb->size) return 0;   // indices must be an offset in a real VBO
+    if(glstate->vao->locked) return 0;
+    for(int i=0; i<hardext.maxvattrib; i++) {
+        vertexattrib_t *a = &glstate->vao->vertexattrib[i];
+        // every enabled array must be read by the driver from a real VBO as it is
+        if(a->enabled && (!a->real_buffer || a->divisor || a->size==GL_BGRA || a->type==GL_DOUBLE)) return 0;
+    }
+    return 1;
+#endif
 }
 
 void APIENTRY_GL4ES fpe_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) {
     DBG(printf("fpe_glDrawElements(%s, %d, %s, %p), program=%d, instanceID=%u\n", PrintEnum(mode), count, PrintEnum(type), indices, glstate->glsl->program, glstate->instanceID);)
     scratch_t scratch = {0};
+    gl4es_occl_count_draw(mode, 0, count, type, indices);
+    int basevertex = fpe_basevertex;    // set for this draw only; realize_glenv offsets the vertex range by it
     realize_glenv(mode==GL_POINTS, 0, count, type, indices, &scratch);
+    fpe_basevertex = 0;
     LOAD_GLES(glDrawElements);
     int use_vbo = 0;
     if(glstate->vao->elements && glstate->vao->elements->real_buffer && indices>=glstate->vao->elements->data && indices<=((void*)((char*)glstate->vao->elements->data+glstate->vao->elements->size))) {
         use_vbo = 1;
+        index_buffer_sync(glstate->vao->elements, indices, count, type);   // indices the app wrote (mapped or flushed) and the VBO lacks
         bindBuffer(GL_ELEMENT_ARRAY_BUFFER, glstate->vao->elements->real_buffer);
         indices = (GLvoid*)((uintptr_t)indices - (uintptr_t)(glstate->vao->elements->data));
         DBG(printf("Using VBO %d for indices\n", glstate->vao->elements->real_buffer);)
     }
+    // Indices in client memory (e.g. the 32-bit copy made for glDrawElementsBaseVertex): GLES reads the pointer as an offset into the bound
+    // element buffer, so none may stay bound (it made the draw fail with GL_INVALID_OPERATION and the picture go black)
+    if(!use_vbo)
+        wantBufferIndex(0);
     realize_bufferIndex();
+#ifndef NOEGL
+    if(basevertex && use_vbo) {
+        ((void (APIENTRY_GLES *)(GLenum, GLsizei, GLenum, const GLvoid*, GLint))gl31_native_basevertex_fn())(mode, count, type, indices, basevertex);
+    } else
+#endif
     gles_glDrawElements(mode, count, type, indices);
+    gl4es_fbo_draw_end();
     if(use_vbo)
         wantBufferIndex(0);
     free_scratch(&scratch);
 }
+// Instanced draw done by the hardware: ES 3.x backend and a program whose shaders GLADIATOR converted (they use the
+// native gl_InstanceID; GL4ES's own GLSL ES 1.00 has none and gets _gl4es_InstanceID from the emulation loop).
+static int fpe_native_instancing(void) {
+    static int have = -1;
+    if(have<0) have = (gles && proc_address(gles, "glDrawArraysInstanced")
+                       && proc_address(gles, "glDrawElementsInstanced") && proc_address(gles, "glVertexAttribDivisor")) ? 1 : 0;
+    return have && fpe_backend_es3() && glstate->glsl->program && glstate->glsl->glprogram && glstate->glsl->glprogram->gladiator;
+}
+
 void APIENTRY_GL4ES fpe_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei primcount) {
     DBG(printf("fpe_glDrawArraysInstanced(%s, %d, %d, %d), program=%d\n", PrintEnum(mode), first, count, primcount, glstate->glsl->program);)
     LOAD_GLES(glDrawArrays);
     LOAD_GLES2(glVertexAttrib4fv);
     scratch_t scratch = {0};
     GLfloat tmp[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    if(fpe_native_instancing()) {   // GLSL ES 3.x program (GLADIATOR): gl_InstanceID and divisors are the hardware's
+        static void (APIENTRY_GLES *es_dai)(GLenum, GLint, GLsizei, GLsizei) = NULL;
+        if(!es_dai) es_dai = (void (APIENTRY_GLES *)(GLenum, GLint, GLsizei, GLsizei))proc_address(gles, "glDrawArraysInstanced");
+        glstate->instancing_native = 1;
+        realize_glenv(mode==GL_POINTS, first, count, 0, NULL, &scratch);
+        glstate->instancing_native = 0;
+        es_dai(mode, first, count, primcount);
+        gl4es_fbo_draw_end();
+        free_scratch(&scratch);
+        return;
+    }
     realize_glenv(mode==GL_POINTS, first, count, 0, NULL, &scratch);
     program_t *glprogram = glstate->gleshard->glprogram;
     for (GLint id=0; id<primcount; ++id) {
@@ -885,6 +973,7 @@ void APIENTRY_GL4ES fpe_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei 
         }
         gles_glDrawArrays(mode, first, count);
     }
+    gl4es_fbo_draw_end();
     free_scratch(&scratch);
 }
 void APIENTRY_GL4ES fpe_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices, GLsizei primcount) {
@@ -892,13 +981,17 @@ void APIENTRY_GL4ES fpe_glDrawElementsInstanced(GLenum mode, GLsizei count, GLen
     LOAD_GLES(glDrawElements);
     LOAD_GLES2(glVertexAttrib4fv);
     scratch_t scratch = {0};
+    int native = fpe_native_instancing();   // GLSL ES 3.x program (GLADIATOR): gl_InstanceID and divisors are the hardware's
+    glstate->instancing_native = native;
     realize_glenv(mode==GL_POINTS, 0, count, type, indices, &scratch);
+    glstate->instancing_native = 0;
     program_t *glprogram = glstate->gleshard->glprogram;
     int use_vbo = 0;
     void* inds;
     GLfloat tmp[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     if(glstate->vao->elements && glstate->vao->elements->real_buffer && indices>=glstate->vao->elements->data && indices<=((void*)((char*)glstate->vao->elements->data+glstate->vao->elements->size))) {
         use_vbo = 1;
+        index_buffer_sync(glstate->vao->elements, indices, count, type);   // indices the app wrote (mapped or flushed) and the VBO lacks
         bindBuffer(GL_ELEMENT_ARRAY_BUFFER, glstate->vao->elements->real_buffer);
         inds = (void*)((uintptr_t)indices - (uintptr_t)(glstate->vao->elements->data));
     } else {
@@ -906,6 +999,12 @@ void APIENTRY_GL4ES fpe_glDrawElementsInstanced(GLenum mode, GLsizei count, GLen
         bindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     }
     //realize_bufferIndex();    // not useful here
+    if(native) {
+        static void (APIENTRY_GLES *es_dei)(GLenum, GLsizei, GLenum, const void*, GLsizei) = NULL;
+        if(!es_dei) es_dei = (void (APIENTRY_GLES *)(GLenum, GLsizei, GLenum, const void*, GLsizei))proc_address(gles, "glDrawElementsInstanced");
+        es_dei(mode, count, type, inds, primcount);
+        primcount = 0;   // skip the emulation loop
+    }
     for (GLint id=0; id<primcount; ++id) {
         GoUniformiv(glprogram, glprogram->builtin_instanceID, 1, 1, &id);
         for(int i=0; i<hardext.maxvattrib; i++) 
@@ -946,6 +1045,7 @@ void APIENTRY_GL4ES fpe_glDrawElementsInstanced(GLenum mode, GLsizei count, GLen
         }
         gles_glDrawElements(mode, count, type, inds);
     }
+    gl4es_fbo_draw_end();
     if(use_vbo)
         wantBufferIndex(0);
     free_scratch(&scratch);
@@ -1094,6 +1194,10 @@ void realize_glenv(int ispoint, int first, int count, GLenum type, const void* i
         fpe_ReleventState(&state, glstate->fpe_state, 0);
         GLuint program = glstate->glsl->program;
         program_t *glprogram = glstate->glsl->glprogram;
+        // GLSL >= 1.30 shaders (converted by GLADIATOR) clip with gl_ClipDistance: GL_CLIP_DISTANCEi has the value of
+        // GL_CLIP_PLANEi, and injecting GL4ES's user-clip-plane code (gl_Vertex at location 0) into them breaks the link
+        if(glprogram->gladiator)
+            state.plane = 0;
         if(glprogram->default_vertex) {
             fpe_state_t vertex_state;
             fpe_ReleventState_DefaultVertex(&vertex_state, glstate->fpe_state, glprogram->default_need);
@@ -1349,6 +1453,22 @@ void realize_glenv(int ispoint, int first, int count, GLenum type, const void* i
             GoUniformfv(glprogram, glprogram->builtin_clipplanes[i], 4, 1, glstate->planes[i]);
         }
     }
+#ifndef NOEGL
+    // GLADIATOR's own uniforms in a program GL4ES linked (hybrid mode). GL_CLIP_DISTANCE0..5 share their value with
+    // GL_CLIP_PLANE0..5, so GL4ES holds those enables; the bridge adds the state GLADIATOR holds (glClipControl,
+    // GL_DEPTH_CLAMP, GL_CLIP_DISTANCE6/7). GoUniformfv skips unchanged values.
+    if(glprogram->has_builtin_lorica)
+    {
+        GLfloat lv[3][4];
+        unsigned mlo = 0;
+        for (int i=0; i<MAX_CLIP_PLANES; i++) if(glstate->enable.plane[i]) mlo |= 1u<<i;
+        if(gl4es_gl31_lorica_values(glstate->pointsprite.size, glstate->enable.point_size,
+                                    glstate->pointsprite.coordOrigin, mlo, lv))
+            for (int i=0; i<3; i++)
+                if(glprogram->builtin_lorica[i]!=-1)
+                    GoUniformfv(glprogram, glprogram->builtin_lorica[i], 4, 1, lv[i]);
+    }
+#endif
     // check point sprite if needed
     if(glprogram->builtin_pointsprite.has)
     {
@@ -1436,9 +1556,18 @@ void realize_glenv(int ispoint, int first, int count, GLenum type, const void* i
         #undef GO
     }
     // set VertexAttrib if needed
+    int vr_done = 0, vr_ok = 0;     // vertex range [vr_min, vr_max] this draw reads (see the buffer sync below)
+    GLsizei vr_min = 0, vr_max = 0;
+    static void (APIENTRY_GLES *es_divisor)(GLuint, GLuint) = NULL;
+    if(!es_divisor && gles) es_divisor = (void (APIENTRY_GLES *)(GLuint, GLuint))proc_address(gles, "glVertexAttribDivisor");
     for(int i=0; i<hardext.maxvattrib; i++) 
     if(glprogram->va_size[i])   // only check used VA...
     {
+        if(es_divisor && fpe_backend_es3()) {   // the divisor GLES applies: the real one only in a native instanced draw
+            vertexattrib_t *vd = &glstate->gleshard->vertexattrib[i];
+            GLint want = glstate->instancing_native ? glstate->vao->vertexattrib[i].divisor : 0;
+            if(vd->divisor != want) { es_divisor(i, want); vd->divisor = want; }
+        }
         vertexattrib_t *v = &glstate->gleshard->vertexattrib[i];
         vertexattrib_t *w = &glstate->vao->vertexattrib[i];
         int enabled = w->enabled;
@@ -1447,10 +1576,12 @@ void realize_glenv(int ispoint, int first, int count, GLenum type, const void* i
             DBG(printf("Warning: VA %d Enabled with buffer:0 and NULL pointer, disabling\n", i));
             enabled = 0;
         }
-        // enable / disable Array if needed
-        if(v->enabled != enabled || (v->enabled && w->divisor)) {
+        // enable / disable Array if needed (an attribute with a divisor is a per-instance constant in the emulated
+        // instancing loop, and a real array with a real divisor in a native instanced draw)
+        int native_div = glstate->instancing_native && w->divisor;
+        if(v->enabled != enabled || (v->enabled && w->divisor && !native_div)) {
             dirty = 1;
-            v->enabled = (w->divisor)?0:enabled;
+            v->enabled = (w->divisor && !native_div)?0:enabled;
             DBG(printf("VertexAttribArray[%d]:%s, divisor=%d\n", i, (enabled)?"Enable":"Disable", w->divisor);)
             if(v->enabled)
                 gles_glEnableVertexAttribArray(i);
@@ -1460,8 +1591,39 @@ void realize_glenv(int ispoint, int first, int count, GLenum type, const void* i
         // check if new value has to be sent to hardware
         if(v->enabled) {
             // array case
+            // vertices the app wrote (mapped or flushed) and the VBO lacks: send the written blocks this draw reads, not the buffer
+            // (glVertexPointer & co keep the buffer in `vbuf`, and `pointer` is then the shadow copy's address: the offset is real_pointer)
+            glbuffer_t *sbuf = w->buffer ? w->buffer : w->vbuf;
+            if(sbuf && w->real_buffer && (sbuf->nstale || sbuf->rs_hi > sbuf->rs_lo)) {
+                int ranged = 0;
+                GLintptr rlo = 0, rhi = 0;
+                if(!w->divisor && (type==0 || indices)) {
+                    if(!vr_done) {  // the vertex range of the draw, computed once and only when a buffer has something to send
+                        vr_done = 1;
+                        if(type==0) { vr_min = first; vr_max = first + count - 1; vr_ok = (count > 0); }
+                        else {
+                            GLsizei imax = 0, imin = 0;
+                            if(type==GL_UNSIGNED_INT) getminmax_indices_ui((const GLuint*)indices, &imax, &imin, count);
+                            else getminmax_indices_us((const GLushort*)indices, &imax, &imin, count);
+                            vr_min = imin + fpe_basevertex; vr_max = imax + fpe_basevertex; vr_ok = (imax >= imin);
+                        }
+                    }
+                    if(vr_ok) {
+                        GLsizei asz = ((w->size==GL_BGRA)?4:w->size) * gl_sizeof(w->type);
+                        GLsizei str = w->stride?w->stride:asz;
+                        if(asz > 0 && str >= asz) {
+                            rlo = (GLintptr)w->real_pointer + (GLintptr)vr_min*str;
+                            rhi = (GLintptr)w->real_pointer + (GLintptr)vr_max*str + asz;
+                            ranged = 1;
+                        }
+                    }
+                }
+                if(ranged) gl4es_buffer_resync_range(sbuf, rlo, rhi);
+                else gl4es_buffer_resync(sbuf);
+            }
             void * ptr = (void*)((uintptr_t)w->pointer + ((w->buffer)?(uintptr_t)w->buffer->data:0));
-            if(dirty || v->size!=w->size || v->type!=w->type || v->normalized!=w->normalized 
+            if(dirty || v->size!=w->size || v->type!=w->type || v->normalized!=w->normalized
+                || v->integer!=w->integer   // glVertexAttribIPointer vs glVertexAttribPointer with the same layout
                 || v->stride!=w->stride || v->buffer!=w->buffer || (w->real_buffer==0 && v->pointer!=ptr)
                 || v->real_buffer!=w->real_buffer || (w->real_buffer!=0 && v->real_pointer != w->real_pointer) 
                 || w->real_buffer!=glstate->bind_buffer.array) {
@@ -1567,6 +1729,12 @@ void realize_glenv(int ispoint, int first, int count, GLenum type, const void* i
             gles_glDisableVertexAttribArray(i);
         }
     }
+#ifndef NOEGL
+    // uniform blocks larger than the range the application bound: GLES rejects the draw, desktop GL does not (resolved per draw)
+    gl4es_gl31_ubo_fit(glstate->gleshard->program);
+#endif
+    // draw buffer mapping GLES cannot express: the draw goes to the proxy FBO (until gl4es_fbo_draw_end)
+    gl4es_fbo_draw_begin();
 }
 
 void realize_blitenv(int alpha) {
@@ -1651,6 +1819,9 @@ void builtin_Init(program_t *glprogram) {
     glprogram->builtin_instanceID = -1;
     for (int i=0; i<MAX_CLIP_PLANES; i++)
         glprogram->builtin_clipplanes[i] = -1;
+    for (int i=0; i<3; i++)
+        glprogram->builtin_lorica[i] = -1;
+    glprogram->has_builtin_lorica = 0;
     glprogram->builtin_pointsprite.size = -1;
     glprogram->builtin_pointsprite.sizeMin = -1;
     glprogram->builtin_pointsprite.sizeMax = -1;
@@ -1744,6 +1915,15 @@ const char* samplers3d_noa = "_gl4es_Sampler3D_";
 const char* samplersCube_noa = "_gl4es_SamplerCube_";
 const char* blend_color_code = "_gl4es_BlendColor";
 int builtin_CheckUniform(program_t *glprogram, char* name, GLint id, int size) {
+    {   // uniforms of a GLADIATOR-converted shader (see program_t.builtin_lorica)
+        static const char* const lorica_u[3] = { "lorica_vs", "lorica_vs2", "lorica_fs" };
+        for (int i=0; i<3; i++)
+            if(strcmp(name, lorica_u[i])==0) {
+                glprogram->builtin_lorica[i] = id;
+                glprogram->has_builtin_lorica = 1;
+                return 1;
+            }
+    }
     if(strncmp(name, gl4es_code, strlen(gl4es_code)))
         return 0;   // doesn't start with "_gl4es_", no need to look further
     int builtin = isBuiltinMatrix(name);

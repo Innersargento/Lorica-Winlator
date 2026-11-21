@@ -59,6 +59,7 @@ LOCAL_SRC_FILES := \
 	src/gl/pointsprite.c \
 	src/gl/preproc.c \
 	src/gl/program.c \
+	src/gl/hybrid.c \
 	src/gl/queries.c \
 	src/gl/raster.c \
 	src/gl/render.c \
@@ -92,6 +93,7 @@ LOCAL_SRC_FILES := \
 	src/gl/GLADIATOR/gl31_vao.c \
 	src/gl/GLADIATOR/gl31_buffer.c \
 	src/gl/GLADIATOR/gl31_texture.c \
+	src/gl/GLADIATOR/gl31_bptc.c \
 	src/gl/GLADIATOR/gl31_fbo.c \
 	src/gl/GLADIATOR/gl31_draw.c \
 	src/gl/GLADIATOR/gl31_attrib.c \
@@ -99,6 +101,8 @@ LOCAL_SRC_FILES := \
 	src/gl/GLADIATOR/gl31_query.c \
 	src/gl/GLADIATOR/gl31_render.c \
 	src/gl/GLADIATOR/gl31_shader_glsl.c \
+	src/gl/GLADIATOR/gl31_glsl_pp.c \
+	src/gl/GLADIATOR/gl31_glsl_tc.c \
 	src/gl/GLADIATOR/gl31_shader_link.c \
 	src/gl/GLADIATOR/gl31_xfb.c \
 	src/gl/GLADIATOR/gl31_stubs.c \

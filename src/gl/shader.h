@@ -33,6 +33,10 @@ struct shader_s {
     struct oldprogram_s   *old;     // in case the shader is an old ARB ASM-like program
     char*           source; // original source of the shader (or converted if coming from "old")
     char*           converted;  // converted source (or null if nothing)
+    int             gladiator;  // 1 if the ES source comes from GLADIATOR (hybrid context, GLSL >= 1.30)
+    unsigned        gl31_flags; // GLADIATOR conversion: 1 = program has geometry/tessellation stages, 2 = GLSL <= 1.20
+    int             gl31_cd;    // GLADIATOR, backend without clip distances: VS = how many it writes to lorica_cd[],
+                                // FS = how many it was converted to discard on (redone at link to match the VS)
     // shaderconv
     shaderconv_need_t  need;    // the varying need / provide of the shader
 }; // shader_t defined in oldprogram.h
@@ -53,6 +57,10 @@ void APIENTRY_GL4ES gl4es_glReleaseShaderCompiler(void);
 
 void accumShaderNeeds(GLuint shader, shaderconv_need_t *need);
 int isShaderCompatible(GLuint shader, shaderconv_need_t *need);
+int isShaderGladiator(GLuint shader);
+int matchShaderClipDistances(GLuint shader, int cd);
+int gladiatorConvertShader(GLuint shader, unsigned flags, int fs_cd);   // (re)convert with GLADIATOR, 1 = compiled
+int isShaderStage(GLenum type);     // geometry / tessellation shader (hybrid contexts)
 void redoShader(GLuint shader, shaderconv_need_t *need);
 struct shader_s*getShader(GLuint shader);
 

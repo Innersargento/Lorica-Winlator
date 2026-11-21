@@ -96,6 +96,9 @@ static int storage_path(void)
     return gl31_caps.buffer_storage ? 1 : 0;
 }
 
+/* hay camino de GPU para glBufferStorage (lo usa la tabla de extensiones) */
+int gl31_buffer_storage_path(void) { return storage_path(); }
+
 /* acceso a los bytes de un buffer respaldado por Vulkan (NULL si no lo es) */
 static void* vk_ptr(GLuint id, GLsizeiptr* size)
 {
@@ -302,6 +305,8 @@ void gl31_glBindBufferBase(GLenum target, GLuint index, GLuint buffer)
         s->ubo[index].buffer = buffer;
         s->ubo[index].offset = 0;
         s->ubo[index].size = 0;
+        s->ubo[index].fit = 0;
+        s->ubo_gen++;
         s->uniform_buffer = buffer;
     }
     if (target == GL_SHADER_STORAGE_BUFFER) gl31_ssbo_record(index, buffer, 0, 0);
@@ -319,6 +324,8 @@ void gl31_glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr
         s->ubo[index].buffer = buffer;
         s->ubo[index].offset = offset;
         s->ubo[index].size = size;
+        s->ubo[index].fit = 0;
+        s->ubo_gen++;
         s->uniform_buffer = buffer;
     }
     if (target == GL_SHADER_STORAGE_BUFFER) gl31_ssbo_record(index, buffer, offset, size);

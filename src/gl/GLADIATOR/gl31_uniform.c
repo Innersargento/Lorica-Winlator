@@ -16,6 +16,7 @@ void gl31_glUniformBlockBinding(GLuint program, GLuint block, GLuint binding)
         return;
     }
     BE(glUniformBlockBinding)(program, block, binding);
+    gl31_state()->ubo_gen++;
 }
 
 void gl31_glGetActiveUniformBlockiv(GLuint program, GLuint block, GLenum pname, GLint* params)
@@ -236,4 +237,103 @@ GLint gl31_glGetFragDataLocation(GLuint program, const GLchar* name)
     if (!prog_linked_or_error(program)) return -1;
     if (!name) return -1;
     return BE(glGetFragDataLocation)(program, name);
+}
+
+/* ---- bloques uniform mas grandes que el rango ligado ----
+ * GL de escritorio deja ligar un rango mas corto que GL_UNIFORM_BLOCK_DATA_SIZE (leer fuera del rango es indefinido, no un error);
+ * GLES 3 rechaza ese draw con GL_INVALID_OPERATION. Se resuelve en el draw, como un state tracker valida los enlaces: para cada bloque
+ * activo del programa cuyo rango es corto, el backend recibe el tamano exacto del bloque sobre el mismo buffer si cabe, o una copia
+ * con ceros al final si el buffer no alcanza (rellenar es valido: el contenido fuera del rango no esta definido). */
+#ifndef GL_COPY_READ_BUFFER_BINDING
+#define GL_COPY_READ_BUFFER_BINDING 0x8F36
+#endif
+#ifndef GL_COPY_WRITE_BUFFER_BINDING
+#define GL_COPY_WRITE_BUFFER_BINDING 0x8F37
+#endif
+
+void gl31_ubo_invalidate(void)
+{
+    gl31_state()->ubo_gen++;
+}
+
+/* GL_BUFFER_SIZE del buffer del backend `buf` (sin tocar los enlaces de la app) */
+static GLint64 be_buffer_size(GLuint buf)
+{
+    GLint prev = 0;
+    GLint64 sz = 0;
+    BE(glGetIntegerv)(GL_COPY_READ_BUFFER_BINDING, &prev);
+    BE(glBindBuffer)(GL_COPY_READ_BUFFER, buf);
+    if (gl31_be.glGetBufferParameteri64v) BE(glGetBufferParameteri64v)(GL_COPY_READ_BUFFER, GL_BUFFER_SIZE, &sz);
+    else { GLint s32 = 0; BE(glGetBufferParameteriv)(GL_COPY_READ_BUFFER, GL_BUFFER_SIZE, &s32); sz = s32; }
+    BE(glBindBuffer)(GL_COPY_READ_BUFFER, (GLuint)prev);
+    return sz;
+}
+
+/* Copia [offset, offset+avail) de `src` al comienzo del buffer de relleno de `index`, deja ceros hasta `need` y lo liga */
+static void bind_padded(gl31_state_t* s, GLuint index, GLuint src, GLintptr offset, GLsizeiptr avail, GLsizeiptr need)
+{
+    GLint prev_r = 0, prev_w = 0, prev_u = 0;
+    BE(glGetIntegerv)(GL_COPY_READ_BUFFER_BINDING, &prev_r);
+    BE(glGetIntegerv)(GL_COPY_WRITE_BUFFER_BINDING, &prev_w);
+    BE(glGetIntegerv)(GL_UNIFORM_BUFFER_BINDING, &prev_u);
+    if (!s->ubo_pad[index]) BE(glGenBuffers)(1, &s->ubo_pad[index]);
+    BE(glBindBuffer)(GL_COPY_WRITE_BUFFER, s->ubo_pad[index]);
+    if (s->ubo_pad_cap[index] < need) {
+        BE(glBufferData)(GL_COPY_WRITE_BUFFER, need, NULL, GL_DYNAMIC_DRAW);
+        s->ubo_pad_cap[index] = need;
+    }
+    {
+        void* zeros = calloc(1, (size_t)(need - avail));
+        if (zeros) { BE(glBufferSubData)(GL_COPY_WRITE_BUFFER, avail, need - avail, zeros); free(zeros); }
+    }
+    if (avail > 0) {
+        BE(glBindBuffer)(GL_COPY_READ_BUFFER, src);
+        BE(glCopyBufferSubData)(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, offset, 0, avail);
+    }
+    BE(glBindBufferRange)(GL_UNIFORM_BUFFER, index, s->ubo_pad[index], 0, need);
+    BE(glBindBuffer)(GL_COPY_READ_BUFFER, (GLuint)prev_r);
+    BE(glBindBuffer)(GL_COPY_WRITE_BUFFER, (GLuint)prev_w);
+    BE(glBindBuffer)(GL_UNIFORM_BUFFER, (GLuint)prev_u);     /* glBindBufferRange tambien cambia el enlace generico */
+}
+
+void gl31_ubo_fit(GLuint program)
+{
+    gl31_state_t* s = gl31_state();
+    GLint nblk = 0, k;
+    int padded = 0;
+    if (!program) return;
+    if (program == s->ubo_fit_program && s->ubo_gen == s->ubo_fit_gen && !s->ubo_fit_padded) return;
+    gl31_state_load_limits();
+    BE(glGetProgramiv)(program, GL_ACTIVE_UNIFORM_BLOCKS, &nblk);
+    for (k = 0; k < nblk; k++) {
+        GLint binding = -1, need = 0;
+        gl31_ubo_binding_t* b;
+        GLint64 bufsz, avail;
+        BE(glGetActiveUniformBlockiv)(program, (GLuint)k, GL_UNIFORM_BLOCK_BINDING, &binding);
+        BE(glGetActiveUniformBlockiv)(program, (GLuint)k, GL_UNIFORM_BLOCK_DATA_SIZE, &need);
+        if (binding < 0 || binding >= s->max_ubo_bindings || binding >= GL31_MAX_UBO_BINDINGS || need <= 0) continue;
+        b = &s->ubo[binding];
+        if (!b->buffer) continue;                              /* sin buffer: el error es de la app, igual que en GL */
+        if (b->size >= need) continue;                         /* el rango de la app alcanza */
+        if (b->fit == 1) continue;                             /* ya ampliado sobre el mismo buffer */
+        bufsz = be_buffer_size(b->buffer);
+        avail = bufsz - b->offset;
+        if (b->size == 0 && avail >= need) continue;           /* BindBufferBase con un buffer suficiente */
+        if (avail >= need) {
+            GLint prev_u = 0;
+            BE(glGetIntegerv)(GL_UNIFORM_BUFFER_BINDING, &prev_u);
+            BE(glBindBufferRange)(GL_UNIFORM_BUFFER, (GLuint)binding, b->buffer, b->offset, need);
+            BE(glBindBuffer)(GL_UNIFORM_BUFFER, (GLuint)prev_u);
+            b->fit = 1;
+        } else {
+            if (b->size > 0 && b->size < avail) avail = b->size;
+            if (avail < 0) avail = 0;
+            bind_padded(s, (GLuint)binding, b->buffer, b->offset, (GLsizeiptr)avail, need);
+            b->fit = 2;
+            padded = 1;
+        }
+    }
+    s->ubo_fit_program = program;
+    s->ubo_fit_gen = s->ubo_gen;
+    s->ubo_fit_padded = padded;
 }

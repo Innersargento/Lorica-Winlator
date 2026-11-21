@@ -18,12 +18,31 @@ typedef struct {
     GLintptr    offset;
     GLsizeiptr  length;
     GLvoid     *data;
+    // bytes the app declared modified with glFlushMappedBufferRange (union, absolute offsets) that are not yet re-sent to the real
+    // buffer; see gl4es_buffer_resync
+    GLintptr    rs_lo;
+    GLintptr    rs_hi;
+    // lazy upload (see gl4es_buffer_resync_range): one flag per STALE_BLOCK bytes of the shadow copy, set when the app wrote the
+    // block (glUnmapBuffer) and the real VBO does not hold it yet; nstale counts the flags set
+    unsigned char *stale;
+    GLsizeiptr  stale_n;
+    int         nstale;
 } glbuffer_t;
+
+// re-sends the flushed ranges of a real VBO from the shadow copy, and every block the app wrote and the VBO does not hold
+// (before a draw that reads the whole buffer, or when the real name is handed out)
+void gl4es_buffer_resync(glbuffer_t *buff);
+// same, but only the blocks overlapping the bytes [lo, hi) of the buffer: what the draw reads
+void gl4es_buffer_resync_range(glbuffer_t *buff, GLintptr lo, GLintptr hi);
 
 KHASH_MAP_DECLARE_INT(buff, glbuffer_t *);
 
 void APIENTRY_GL4ES gl4es_glGenBuffers(GLsizei n, GLuint * buffers);
 void APIENTRY_GL4ES gl4es_glBindBuffer(GLenum target, GLuint buffer);
+void APIENTRY_GL4ES gl4es_glBindBufferBase(GLenum target, GLuint index, GLuint buffer);
+void APIENTRY_GL4ES gl4es_glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size);
+GLuint gl4es_real_buffer(GLuint id);
+int gl4es_es_only_binding(GLenum pname, GLuint* out);
 void APIENTRY_GL4ES gl4es_glBufferData(GLenum target, GLsizeiptr size, const GLvoid * data, GLenum usage);
 void APIENTRY_GL4ES gl4es_glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const GLvoid * data);
 void APIENTRY_GL4ES gl4es_glDeleteBuffers(GLsizei n, const GLuint * buffers);
@@ -180,6 +199,7 @@ typedef struct {
     GLuint          real_buffer;    // If there is a real VBO binded
     const GLvoid*   real_pointer;   // the pointer related to real VBO
     int             integer;
+    glbuffer_t      *vbuf;      // glVertexPointer & co (gl4es.c clone_gl_pointer): the GL_ARRAY_BUFFER it points into (`buffer` stays NULL there)
 } vertexattrib_t;
 
 typedef struct {

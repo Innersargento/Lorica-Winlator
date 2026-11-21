@@ -116,10 +116,16 @@ void gl31_glBindFramebuffer(GLenum target, GLuint fbo)
 
 GLboolean gl31_glIsFramebuffer(GLuint fbo) { return fbo ? BE(glIsFramebuffer)(fbo) : GL_FALSE; }
 
+static GLint att_query(GLenum target, GLenum att, GLenum pname);
+
 GLenum gl31_glCheckFramebufferStatus(GLenum target)
 {
     if (!is_fbo_target(target)) { gl31_set_error(GL_INVALID_ENUM); return 0; }
     {   int rd_; GLenum rt_ = gl31_fbo_redir(target, &rd_), st_ = BE(glCheckFramebufferStatus)(rt_);
+        if (gl31_diag() && st_ != GL_FRAMEBUFFER_COMPLETE) {
+            gl31_state_t* s = gl31_state();
+            gl31_log("LORICA FBO: framebuffer %u incomplete (0x%x)", target == GL_READ_FRAMEBUFFER ? s->read_fbo : s->draw_fbo, st_);
+        }
         gl31_fbo_redir_end(rd_, 0);
         return st_;
     }
@@ -129,12 +135,16 @@ void gl31_glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textar
 {
     GLenum be;
     if (!attach_prologue(target, attachment)) return;
-    if (textarget != GL_TEXTURE_2D && textarget != GL_TEXTURE_RECTANGLE &&
+    /* GL 3.2 (ARB_texture_multisample) admite TEXTURE_2D_MULTISAMPLE aqui, igual que ES 3.1 */
+    if (textarget != GL_TEXTURE_2D && textarget != GL_TEXTURE_RECTANGLE && textarget != GL_TEXTURE_2D_MULTISAMPLE &&
         !(textarget >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && textarget <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)) {
         gl31_set_error(GL_INVALID_ENUM);
         return;
     }
-    if (textarget == GL_TEXTURE_RECTANGLE && level != 0) { gl31_set_error(GL_INVALID_VALUE); return; }
+    if ((textarget == GL_TEXTURE_RECTANGLE || textarget == GL_TEXTURE_2D_MULTISAMPLE) && level != 0) {
+        gl31_set_error(GL_INVALID_VALUE);
+        return;
+    }
     be = gl31_tex_be_target(textarget);
     if (!be) { gl31_set_error(GL_INVALID_ENUM); return; }
     { int rd_; GLenum rt_ = gl31_fbo_redir(target, &rd_); BE(glFramebufferTexture2D)(rt_, attachment, be, texture, level); gl31_fbo_redir_end(rd_, 1); }
@@ -235,6 +245,14 @@ static GLenum rb_format(GLenum f)
     return f;
 }
 
+/* formato ES con el que se reserva un renderbuffer: el sin tamano resuelto y, como en las texturas, lo que el backend no
+ * renderiza sustituido segun sus capacidades (RGB16F -> RGBA16F, RGB16 -> RGBA16 o RGBA16F, SNORM...). Lo usa tambien
+ * GL4ES para sus renderbuffers en un contexto hibrido. */
+GLenum gl31_rb_storage_format(GLenum f)
+{
+    return gl31_storage_format(rb_format(f));
+}
+
 static int rb_check(GLenum target, GLsizei w, GLsizei h)
 {
     GLint m = 4096;
@@ -248,14 +266,14 @@ static int rb_check(GLenum target, GLsizei w, GLsizei h)
 void gl31_glRenderbufferStorage(GLenum target, GLenum ifmt, GLsizei w, GLsizei h)
 {
     if (!rb_check(target, w, h)) return;
-    BE(glRenderbufferStorage)(target, rb_format(ifmt), w, h);
+    BE(glRenderbufferStorage)(target, gl31_rb_storage_format(ifmt), w, h);
 }
 
 void gl31_glRenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum ifmt, GLsizei w, GLsizei h)
 {
     if (!rb_check(target, w, h)) return;
     if (samples < 0) { gl31_set_error(GL_INVALID_VALUE); return; }
-    BE(glRenderbufferStorageMultisample)(target, samples, rb_format(ifmt), w, h);
+    BE(glRenderbufferStorageMultisample)(target, samples, gl31_rb_storage_format(ifmt), w, h);
 }
 
 void gl31_glGetRenderbufferParameteriv(GLenum target, GLenum pname, GLint* params)
@@ -279,7 +297,15 @@ void gl31_glBlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx
         gl31_set_error(GL_INVALID_OPERATION);
         return;
     }
+    if (gl31_diag()) {
+        GLenum pre = BE(glGetError)();           /* error ya pendiente: no es del blit */
+        if (pre) gl31_log("LORICA BLIT: error 0x%x pending before the blit", pre);
+    }
     BE(glBlitFramebuffer)(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter);
+    if (gl31_diag()) {
+        GLenum e = BE(glGetError)();
+        if (e) { gl31_log("LORICA BLIT: backend error 0x%x", e); gl31_set_error(e); }
+    }
 }
 
 /* ---------- mapeo arbitrario de draw buffers (FBO proxy) ----------
@@ -878,6 +904,9 @@ static int read_depth_stencil(GLint x, GLint y, GLsizei w, GLsizei h, GLenum for
     GLboolean scissor;
     GLuint groups, gx, gy;
     int ok = 1;
+    GLuint direct = 0;                      /* textura de profundidad/stencil leida sin copia (si la copia por blit falla) */
+    GLint dsmode = GL_DEPTH_COMPONENT;
+    int dsmode_set = 0;
 
     /* tipo valido para el formato */
     if (format == GL_DEPTH_STENCIL) {
@@ -962,14 +991,33 @@ static int read_depth_stencil(GLint x, GLint y, GLsizei w, GLsizei h, GLenum for
     if (BE(glGetError)() != GL_NO_ERROR) tmp_ok = 0;
     BE(glBindFramebuffer)(GL_DRAW_FRAMEBUFFER, gl31_fbo_be_draw(s->draw_fbo));
     if (scissor) BE(glEnable)(GL_SCISSOR_TEST);
+    if (!tmp_ok) {
+        /* glBlitFramebuffer exige el mismo formato interno que el origen y hay drivers que guardan D24 / D24S8 / D32FS8
+         * con otro: si el origen es una textura 2D (nivel 0), el kernel la lee directamente, sin copia. */
+        GLenum sa = want_d ? a_d : a_s;
+        GLint nm = att_query(rd, sa, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) == (GLint)GL_TEXTURE ? att_query(rd, sa, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME) : 0;
+        GLint lv = nm ? att_query(rd, sa, 0x8CD2 /* TEXTURE_LEVEL */) : 1;
+        while (BE(glGetError)() != GL_NO_ERROR) {}
+        if (nm && lv == 0 && !(want_d && want_s) && gl31_tex_be_target_of((GLuint)nm) == GL_TEXTURE_2D) { direct = (GLuint)nm; tmp_ok = 1; }
+    }
     if (!tmp_ok) { ok = 0; gl31_set_error(GL_INVALID_OPERATION); goto done; }
 
-    if (want_s) {
-        BE(glActiveTexture)(GL_TEXTURE1);
-        BE(glBindTexture)(GL_TEXTURE_2D, tex_s);
-        BE(glTexParameteri)(GL_TEXTURE_2D, GL_DEPTH_STENCIL_TEXTURE_MODE, GL_STENCIL_INDEX);
+    if (direct) {
+        BE(glActiveTexture)(want_s ? GL_TEXTURE1 : GL_TEXTURE0);
+        BE(glBindTexture)(GL_TEXTURE_2D, direct);
+        dsmode_set = (sbits > 0);               /* el modo solo existe en las texturas con stencil */
+        if (dsmode_set) {
+            BE(glGetTexParameteriv)(GL_TEXTURE_2D, GL_DEPTH_STENCIL_TEXTURE_MODE, &dsmode);
+            BE(glTexParameteri)(GL_TEXTURE_2D, GL_DEPTH_STENCIL_TEXTURE_MODE, want_s ? GL_STENCIL_INDEX : GL_DEPTH_COMPONENT);
+        }
+    } else {
+        if (want_s) {
+            BE(glActiveTexture)(GL_TEXTURE1);
+            BE(glBindTexture)(GL_TEXTURE_2D, tex_s);
+            BE(glTexParameteri)(GL_TEXTURE_2D, GL_DEPTH_STENCIL_TEXTURE_MODE, GL_STENCIL_INDEX);
+        }
+        if (want_d) { BE(glActiveTexture)(GL_TEXTURE0); BE(glBindTexture)(GL_TEXTURE_2D, tex_d); }
     }
-    if (want_d) { BE(glActiveTexture)(GL_TEXTURE0); BE(glBindTexture)(GL_TEXTURE_2D, tex_d); }
 
     /* ---- kernel ---- */
     if (!g_ds_buf) BE(glGenBuffers)(1, &g_ds_buf);
@@ -992,7 +1040,7 @@ static int read_depth_stencil(GLint x, GLint y, GLsizei w, GLsizei h, GLenum for
     BE(glUniform1ui)(ds_u_total, (GLuint)total);
     BE(glUniform1ui)(ds_u_swap, (s->pack_swap_bytes && es > 1) ? 1u : 0u);
     BE(glUniform1ui)(ds_u_dbits, (GLuint)(dtype == (GLint)GL_FLOAT ? 32 : dbits));
-    BE(glUniform2i)(ds_u_org, 0, 0);
+    BE(glUniform2i)(ds_u_org, direct ? x : 0, direct ? y : 0);
     groups = (GLuint)((words + 63) / 64);
     gx = groups > 65535u ? 65535u : groups;
     gy = (groups + gx - 1) / gx;
@@ -1004,6 +1052,11 @@ static int read_depth_stencil(GLint x, GLint y, GLsizei w, GLsizei h, GLenum for
     ok = px_deliver(w, h, psize, total, pixels);
 
 done:
+    if (direct && dsmode_set) {      /* el modo de lectura de la textura de la app como estaba */
+        BE(glActiveTexture)(want_s ? GL_TEXTURE1 : GL_TEXTURE0);
+        BE(glBindTexture)(GL_TEXTURE_2D, direct);
+        BE(glTexParameteri)(GL_TEXTURE_2D, GL_DEPTH_STENCIL_TEXTURE_MODE, dsmode);
+    }
     if (sv_id && sv_size > 0) BE(glBindBufferRange)(GL_SHADER_STORAGE_BUFFER, 0, (GLuint)sv_id, (GLintptr)sv_start, (GLsizeiptr)sv_size);
     else BE(glBindBufferBase)(GL_SHADER_STORAGE_BUFFER, 0, (GLuint)sv_id);
     BE(glBindBuffer)(GL_SHADER_STORAGE_BUFFER, (GLuint)sv_ssbo);

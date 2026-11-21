@@ -62,7 +62,9 @@ struct glstate_s {
     int                 bound_stream[MAX_TEX];  // should be shared too
 #endif
     int                 gl_version;    // negotiated at context creation (major*10+minor), 0 = not set
+    int                 gl_legacy;     // 1 = the application asked for no version (wglCreateContext / glXCreateContext): a game of any age
     int                 gl_profile;    // negotiated profile mask (1 = core, 2 = compat), 0 = not set
+    int                 gl_flags;      // GL_CONTEXT_FLAGS (forward-compatible 1, debug 2), from the context attributes
     char                gl_version_str[16];
     int                 emulatedPixmap;
     int                 emulatedWin;
@@ -90,6 +92,7 @@ struct glstate_s {
     depth_state_t       depth;
     face_state_t        face;
     GLint               instanceID;
+    int                 instancing_native;  // the draw being realized is a real instanced draw (attribute divisors in GLES)
     GLint               proxy_width;
     GLint               proxy_height;
     GLint               proxy_intformat;
@@ -125,6 +128,9 @@ struct glstate_s {
     samplers_t          samplers;
     // Queries
     queries_t           queries;
+    // glBeginConditionalRender (hybrid.c): inside the block, and whether its query said "nothing passed"
+    int                 cond_render_active;
+    int                 cond_render_skip;
     // Binded buffer (if used)
     bind_buffers_t      bind_buffer;
     // Blend status

@@ -3,6 +3,7 @@
 #include "enum_info.h"
 #include "fpe.h"
 #include "gl4es.h"
+#include "hybrid.h"
 #include "gles.h"
 #include "glstate.h"
 #include "init.h"
@@ -257,8 +258,8 @@ static inline bool should_intercept_render(GLenum mode) {
                 return true;
         }
     }
-    if(glstate->polygon_mode == GL_LINE && mode>=GL_TRIANGLES)
-        return true;
+    // glPolygonMode(GL_LINE) is not a reason to intercept: glDrawElementsCommon rewrites the index list into the polygons' edges and draws
+    // through the normal path, keeping the application's program, generic attributes, VAO and buffers
     if ((hardext.esversion==1) && ((glstate->vao->vertexattrib[ATT_SECONDARY].enabled) && (glstate->vao->vertexattrib[ATT_COLOR].enabled)))
         return true;
     if ((hardext.esversion==1) && (glstate->vao->vertexattrib[ATT_COLOR].enabled && (glstate->vao->vertexattrib[ATT_COLOR].size != 4)))
@@ -282,6 +283,59 @@ GLuint len_indices(const GLushort *sindices, const GLuint *iindices, GLsizei cou
             if (len<iindices[i]) len = iindices[i]; // get the len of the arrays
     }
     return len+1;  // length is max(indices) + 1 !
+}
+
+// glPolygonMode(GL_LINE): every polygon edge becomes a line, the "unfilled" index translation of Mesa (src/gallium/auxiliary/indices/
+// u_unfilled_gen.py). Only the index list changes, so the draw keeps the application's program, vertex arrays and buffers. Source
+// indices are sindices / iindices, or first..first+count-1 for array draws. Returns the number of indices written to *out (malloc'd,
+// GLuint when *out_uint is set, GLushort otherwise), 0 when the mode has no polygon to outline or the indices cannot be expressed.
+static GLsizei unfilled_line_indices(GLenum mode, GLint first, GLsizei count, const GLushort *sindices, const GLuint *iindices, void **out, int *out_uint) {
+    GLsizei nedges;
+    switch (mode) {
+        case GL_TRIANGLES:      nedges = (count/3)*3; break;
+        case GL_TRIANGLE_STRIP:
+        case GL_TRIANGLE_FAN:   nedges = (count>=3)?(count-2)*3:0; break;
+        case GL_QUADS:          nedges = (count/4)*4; break;
+        case GL_QUAD_STRIP:     nedges = (count>=4)?((count-2)/2)*4:0; break;
+        case GL_POLYGON:        nedges = (count>=3)?count:0; break;
+        default:                return 0;
+    }
+    if (nedges<=0) return 0;
+    const int wide = (iindices!=NULL) || (!sindices && (GLuint)first+(GLuint)count > 65536);
+    if (wide && !hardext.elementuint) return 0;
+    void *buf = malloc((size_t)nedges*2*(wide?sizeof(GLuint):sizeof(GLushort)));
+    if (!buf) return 0;
+    GLsizei n = 0;
+#define UF_IDX(i)    (sindices?(GLuint)sindices[i]:(iindices?iindices[i]:(GLuint)(first+(i))))
+#define UF_EDGE(a,b) do { GLuint ea_ = UF_IDX(a), eb_ = UF_IDX(b); \
+                          if (wide) { ((GLuint*)buf)[n] = ea_; ((GLuint*)buf)[n+1] = eb_; } \
+                          else { ((GLushort*)buf)[n] = (GLushort)ea_; ((GLushort*)buf)[n+1] = (GLushort)eb_; } \
+                          n += 2; } while (0)
+    switch (mode) {
+        case GL_TRIANGLES:
+            for (int i=0; i+2<count; i+=3) { UF_EDGE(i, i+1); UF_EDGE(i+1, i+2); UF_EDGE(i+2, i); }
+            break;
+        case GL_TRIANGLE_STRIP:
+            for (int i=0; i+2<count; ++i) { UF_EDGE(i, i+1); UF_EDGE(i+1, i+2); UF_EDGE(i+2, i); }
+            break;
+        case GL_TRIANGLE_FAN:
+            for (int i=1; i+1<count; ++i) { UF_EDGE(0, i); UF_EDGE(i, i+1); UF_EDGE(i+1, 0); }
+            break;
+        case GL_QUADS:
+            for (int i=0; i+3<count; i+=4) { UF_EDGE(i, i+1); UF_EDGE(i+1, i+2); UF_EDGE(i+2, i+3); UF_EDGE(i+3, i); }
+            break;
+        case GL_QUAD_STRIP:     // quad i is v[2i], v[2i+1], v[2i+3], v[2i+2]
+            for (int i=0; i+3<count; i+=2) { UF_EDGE(i, i+1); UF_EDGE(i+1, i+3); UF_EDGE(i+3, i+2); UF_EDGE(i+2, i); }
+            break;
+        case GL_POLYGON:
+            for (int i=0; i<count; ++i) UF_EDGE(i, (i+1)%count);
+            break;
+    }
+#undef UF_EDGE
+#undef UF_IDX
+    *out = buf;
+    *out_uint = wide;
+    return n;
 }
 
 static void glDrawElementsCommon(GLenum mode, GLint first, GLsizei count, GLuint len, const GLushort *sindices, const GLuint *iindices, int instancecount) {
@@ -311,9 +365,20 @@ static void glDrawElementsCommon(GLenum mode, GLint first, GLsizei count, GLuint
 // it's a bit too much for mobile hardware, so it can be simply disabled here
 if(count>500000) return;
 #endif
-    GLenum mode_init = mode;
-    /*if (glstate->polygon_mode == GL_LINE && mode>=GL_TRIANGLES)
-        mode = GL_LINE_LOOP;*/
+    void *unfilled = NULL;
+    GLuint unfilled_old_index = 0;
+    if (glstate->polygon_mode == GL_LINE && mode>=GL_TRIANGLES) {
+        int wide = 0;
+        GLsizei n = unfilled_line_indices(mode, first, count, sindices, iindices, &unfilled, &wide);
+        if (n) {
+            mode = GL_LINES;
+            count = n;
+            first = 0;
+            if (wide) { iindices = (GLuint*)unfilled; sindices = NULL; }
+            else      { sindices = (GLushort*)unfilled; iindices = NULL; }
+            unfilled_old_index = wantBufferIndex(0);   // the new indices live in client memory
+        }
+    }
     if (glstate->polygon_mode == GL_POINT && mode>=GL_TRIANGLES)
         mode = GL_POINTS;
 
@@ -449,6 +514,10 @@ if(count>500000) return;
             TEXTURE(old_tex);
         #undef TEXTURE
     }
+    if (unfilled) {
+        free(unfilled);
+        wantBufferIndex(unfilled_old_index);
+    }
 }
 
 #define MIN_BATCH  globals4es.minbatch
@@ -456,6 +525,7 @@ if(count>500000) return;
 
 void APIENTRY_GL4ES gl4es_glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) {
     DBG(printf("glDrawRangeElements(%s, %i, %i, %i, %s, @%p), inlist=%i, pending=%d\n", PrintEnum(mode), start, end, count, PrintEnum(type), indices, (glstate->list.active)?1:0, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     count = adjust_vertices(mode, count);
     
     if (count<0) {
@@ -560,6 +630,7 @@ AliasExport(void,glDrawRangeElements,EXT,(GLenum mode,GLuint start,GLuint end,GL
 
 void APIENTRY_GL4ES gl4es_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) {
     DBG(printf("glDrawElements(%s, %d, %s, %p), vtx=%p map=%p, pending=%d\n", PrintEnum(mode), count, PrintEnum(type), indices, (glstate->vao->vertex)?glstate->vao->vertex->data:NULL, (glstate->vao->elements)?glstate->vao->elements->data:NULL, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     // TODO: split for count > 65535?
     // special check for QUADS and TRIANGLES that need multiple of 4 or 3 vertex...
     count = adjust_vertices(mode, count);
@@ -668,6 +739,7 @@ AliasExport(void,glDrawElements,,(GLenum mode, GLsizei count, GLenum type, const
 
 void APIENTRY_GL4ES gl4es_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     DBG(printf("glDrawArrays(%s, %d, %d), list=%p pending=%d\n", PrintEnum(mode), first, count, glstate->list.active, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     // special check for QUADS and TRIANGLES that need multiple of 4 or 3 vertex...
     count = adjust_vertices(mode, count);
 
@@ -732,7 +804,7 @@ void APIENTRY_GL4ES gl4es_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
         draw_renderlist(list);
         free_renderlist(list);
     } else {
-        if (mode==GL_QUADS) {
+        if (mode==GL_QUADS && glstate->polygon_mode!=GL_LINE) {
             // TODO: move those static in glstate
             static GLushort *indices = NULL;
             static int indcnt = 0;
@@ -772,6 +844,7 @@ AliasExport(void,glDrawArrays,EXT,(GLenum mode, GLint first, GLsizei count));
 void APIENTRY_GL4ES gl4es_glMultiDrawArrays(GLenum mode, const GLint *firsts, const GLsizei *counts, GLsizei primcount)
 {
     DBG(printf("glMultiDrawArrays(%s, %p, %p, %d), list=%p pending=%d\n", PrintEnum(mode), firsts, counts, primcount, glstate->list.active, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     if(!primcount) {
         noerrorShim();
         return;
@@ -842,7 +915,7 @@ void APIENTRY_GL4ES gl4es_glMultiDrawArrays(GLenum mode, const GLint *firsts, co
             else
                 list = arrays_to_renderlist(NULL, mode, first, count+first);
         } else {
-            if (mode==GL_QUADS) {
+            if (mode==GL_QUADS && glstate->polygon_mode!=GL_LINE) {
                 // TODO: move those static in glstate
                 static GLushort *indices = NULL;
                 static int indcnt = 0;
@@ -891,6 +964,7 @@ AliasExport(void,glMultiDrawArrays,,(GLenum mode, const GLint *first, const GLsi
 void APIENTRY_GL4ES gl4es_glMultiDrawElements( GLenum mode, GLsizei *counts, GLenum type, const void * const *indices, GLsizei primcount)
 {
     DBG(printf("glMultiDrawElements(%s, %p, %s, %p, %d), list=%p pending=%d\n", PrintEnum(mode), counts, PrintEnum(type), indices, primcount, glstate->list.active, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     if(!primcount) {
         noerrorShim();
         return;
@@ -1027,6 +1101,7 @@ AliasExport(void,glMultiDrawElements,,( GLenum mode, GLsizei *count, GLenum type
 
 void APIENTRY_GL4ES gl4es_glMultiDrawElementsBaseVertex( GLenum mode, GLsizei *counts, GLenum type, const void * const *indices, GLsizei primcount, const GLint * basevertex) {
     DBG(printf("glMultiDrawElementsBaseVertex(%s, %p, %s, @%p, %d, @%p), inlist=%i, pending=%d\n", PrintEnum(mode), counts, PrintEnum(type), indices, primcount, basevertex, (glstate->list.active)?1:0, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     // divide the call, should try something better one day...
     bool compiling = (glstate->list.active);
     bool intercept = should_intercept_render(mode);
@@ -1132,11 +1207,12 @@ AliasExport(void,glMultiDrawElementsBaseVertex,ARB,( GLenum mode, GLsizei *count
 
 void APIENTRY_GL4ES gl4es_glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLint basevertex) {
     DBG(printf("glDrawElementsBaseVertex(%s, %d, %s, %p, %d), vtx=%p map=%p, pending=%d\n", PrintEnum(mode), count, PrintEnum(type), indices, basevertex, (glstate->vao->vertex)?glstate->vao->vertex->data:NULL, (glstate->vao->elements)?glstate->vao->elements->data:NULL, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     if(basevertex==0)
         gl4es_glDrawElements(mode, count, type, indices);
     else {
         count = adjust_vertices(mode, count);
-       
+
         if (count<0) {
             errorShim(GL_INVALID_VALUE);
             return;
@@ -1148,6 +1224,20 @@ void APIENTRY_GL4ES gl4es_glDrawElementsBaseVertex(GLenum mode, GLsizei count, G
 
         bool compiling = (glstate->list.active);
         bool intercept = should_intercept_render(mode);
+
+        // The driver has glDrawElementsBaseVertex and the indices are in a real VBO: let it add the base vertex (no index copy)
+        if(!compiling && !intercept && fpe_native_basevertex_ok(mode, type, indices)) {
+            if(glstate->list.pending) gl4es_flush();
+            noerrorShim();
+            const char *sh = (const char*)glstate->vao->elements->data + (uintptr_t)indices;
+            fpe_basevertex = basevertex;
+            if(type==GL_UNSIGNED_INT)
+                glDrawElementsCommon(mode, 0, count, 0, NULL, (const GLuint*)sh, 1);
+            else
+                glDrawElementsCommon(mode, 0, count, 0, (const GLushort*)sh, NULL, 1);
+            fpe_basevertex = 0;
+            return;
+        }
 
         //BATCH Mode
         if(!compiling) {
@@ -1165,7 +1255,9 @@ void APIENTRY_GL4ES gl4es_glDrawElementsBaseVertex(GLenum mode, GLsizei count, G
         GLushort *sindices = NULL;
         GLuint *iindices = NULL;
 
-        if(type==GL_UNSIGNED_INT && hardext.elementuint && !compiling && !intercept)
+        // basevertex is added to every index, and the sum can pass 65535 even when the source indices are 16-bit: when GLES takes 32-bit
+        // indices they are used whatever the source type
+        if((type==GL_UNSIGNED_INT || basevertex != 0) && hardext.elementuint && !compiling && !intercept)
             iindices = copy_gl_array((glstate->vao->elements)?(void*)((char*)glstate->vao->elements->data + (uintptr_t)indices):indices,
                 type, 1, 0, GL_UNSIGNED_INT, 1, 0, count, NULL);
         else
@@ -1228,6 +1320,7 @@ AliasExport(void,glDrawElementsBaseVertex,ARB,(GLenum mode, GLsizei count, GLenu
 
 void APIENTRY_GL4ES gl4es_glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices, GLint basevertex) {
     DBG(printf("glDrawRangeElementsBaseVertex(%s, %i, %i, %i, %s, @%p, %d), inlist=%i, pending=%d\n", PrintEnum(mode), start, end, count, PrintEnum(type), indices, basevertex, (glstate->list.active)?1:0, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     if(basevertex==0) {
         gl4es_glDrawRangeElements(mode, start, end, count, type, indices);
     } else {
@@ -1323,6 +1416,7 @@ AliasExport(void,glDrawRangeElementsBaseVertex,ARB,(GLenum mode, GLuint start, G
 
 void APIENTRY_GL4ES gl4es_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei primcount) {
     DBG(printf("glDrawArraysInstanced(%s, %d, %d, %d), list=%p pending=%d\n", PrintEnum(mode), first, count, primcount, glstate->list.active, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     count = adjust_vertices(mode, count);
 
 	if (count<0) {
@@ -1381,7 +1475,7 @@ void APIENTRY_GL4ES gl4es_glDrawArraysInstanced(GLenum mode, GLint first, GLsize
         draw_renderlist(list);
         free_renderlist(list);
     } else {
-        if (mode==GL_QUADS) {
+        if (mode==GL_QUADS && glstate->polygon_mode!=GL_LINE) {
             // TODO: move those static in glstate
             static GLushort *indices = NULL;
             static int indcnt = 0;
@@ -1420,6 +1514,7 @@ AliasExport(void,glDrawArraysInstanced,ARB,(GLenum mode, GLint first, GLsizei co
 
 void APIENTRY_GL4ES gl4es_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount) {
     DBG(printf("glDrawElementsInstanced(%s, %d, %s, %p, %d), list=%p pending=%d\n", PrintEnum(mode), count, PrintEnum(type), indices, primcount, glstate->list.active, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     count = adjust_vertices(mode, count);
     
     if (count<0) {
@@ -1525,6 +1620,7 @@ AliasExport(void,glDrawElementsInstanced,ARB,(GLenum mode, GLsizei count, GLenum
 
 void APIENTRY_GL4ES gl4es_glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount, GLint basevertex) {
     DBG(printf("glDrawElementsInstanceBaseVertex(%s, %d, %s, %p, %d, %d), vtx=%p map=%p, pending=%d\n", PrintEnum(mode), count, PrintEnum(type), indices, primcount, basevertex, (glstate->vao->vertex)?glstate->vao->vertex->data:NULL, (glstate->vao->elements)?glstate->vao->elements->data:NULL, glstate->list.pending);)
+    if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)
     if(basevertex==0)
         gl4es_glDrawElementsInstanced(mode, count, type, indices, primcount);
     else {

@@ -245,8 +245,9 @@ int fill_lineIndices(modeinit_t *modes, int length, GLenum mode, GLushort* indic
     int k=0;
     int i=0;
     for (int m=0; m<length; m++) {
-        GLenum mode_init = modes[k].mode_init;
-        int len = modes[k].ilen;
+        // modes[m].ilen is the cumulative end of segment m (list_add_modeinit); k is the output count
+        GLenum mode_init = modes[m].mode_init;
+        int len = modes[m].ilen;
         switch (mode) {
             case GL_TRIANGLE_STRIP:
                 // first 3 points a triangle, then a 2 lines per new point
@@ -271,7 +272,8 @@ int fill_lineIndices(modeinit_t *modes, int length, GLenum mode, GLushort* indic
                             ind_line[k++] = ind(i+0); ind_line[k++] = ind(i+1);
                         }
                     }
-                } else if(mode_init==GL_POLYGON) {
+                } else if(mode_init==GL_POLYGON || mode_init==GL_QUADS) {
+                    // a polygon, or a single quad that end_renderlist turned into a fan: only the outline
                     if (len) {
                         int z = i;
                         ind_line[k++] = ind(i+0); ind_line[k++] = ind(i+1);

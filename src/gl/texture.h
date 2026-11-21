@@ -126,6 +126,7 @@ typedef struct {
     GLboolean mipmap_auto;
     GLboolean mipmap_need;
     GLboolean mipmap_done;
+    GLboolean mipmap_explicit;  // the application's own mip levels are stored as sent (explicit_mips, texture_compressed.c)
     int base_level;
     int max_level;
     GLenum  format;
@@ -156,6 +157,7 @@ typedef struct {
     glsampler_t sampler;    // internal sampler if not superseded by glBindSampler
     glsampler_t actual;     // actual sampler
     float fbtex_ratio; // Lower rendering resolution
+    int hybrid;        // hybrid context: GLADIATOR keeps the storage (sRGB / integer formats, hybrid.c)
 } gltexture_t;
 
 KHASH_MAP_DECLARE_INT(tex, gltexture_t *);
@@ -258,5 +260,31 @@ int samplerParameterfv(glsampler_t* sampler, GLenum pname, const GLfloat *param)
 int getSamplerParameterfv(glsampler_t* sampler, GLenum pname, GLfloat *params);
 
 void init_sampler(glsampler_t* sampler);
+
+// GL_UNPACK_SWAP_BYTES (texture.c): a copy of the application's pixels with their bytes swapped, in the same unpack layout,
+// or NULL when there is nothing to swap. is3d: the transfer uses GL_UNPACK_IMAGE_HEIGHT / SKIP_IMAGES.
+void* gl4es_unpack_swapped(GLsizei w, GLsizei h, GLsizei d, int is3d, GLenum format, GLenum type, const GLvoid* data);
+// GL_PACK_SWAP_BYTES (texture_read.c): swaps, in place, the pixels a read just wrote at data (application pointer or pack PBO offset)
+void gl4es_pack_swap(GLsizei w, GLsizei h, GLenum format, GLenum type, GLvoid* data);
+
+// Entry-point prologue for uploads. GLES has no GL_UNPACK_SWAP_BYTES, so the call is replayed once on a swapped copy, with the
+// swap off and the unpack PBO detached (the copy is client memory), and both put back afterwards. Internal GL4ES uploads of
+// GL4ES's own buffers run with the swap off and never reach here with it on. Inside a display list the pointer is recorded as
+// it is (GL4ES keeps list pixels by reference), so nothing is swapped there.
+#define GL4ES_UNPACK_SWAP_REPLAY(w, h, d, is3d, call)                                                                 \
+    if (glstate->texture.unpack_swap_bytes && !glstate->list.compiling) {                                             \
+        void* swapped_ = gl4es_unpack_swapped((w), (h), (d), (is3d), format, type, data);                             \
+        if (swapped_) {                                                                                               \
+            glbuffer_t* pbo_ = glstate->vao->unpack;                                                                  \
+            glstate->vao->unpack = NULL;                                                                              \
+            glstate->texture.unpack_swap_bytes = GL_FALSE;                                                            \
+            data = swapped_;                                                                                          \
+            call;                                                                                                     \
+            glstate->texture.unpack_swap_bytes = GL_TRUE;                                                             \
+            glstate->vao->unpack = pbo_;                                                                              \
+            free(swapped_);                                                                                           \
+            return;                                                                                                   \
+        }                                                                                                             \
+    }
 
 #endif // _GL4ES_TEXTURE_H_

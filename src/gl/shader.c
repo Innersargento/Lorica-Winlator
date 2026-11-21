@@ -1,4 +1,5 @@
 #include "shader.h"
+#include "hybrid.h"
 
 #include "../glx/hardext.h"
 #include "debug.h"
@@ -7,6 +8,14 @@
 #include "glstate.h"
 #include "loader.h"
 #include "shaderconv.h"
+#include "logs.h"
+
+#ifndef NOEGL
+// glx/gl31_bridge.c: GLSL >= 1.30 -> GLSL ES through GLADIATOR (hybrid contexts only), NULL if it does not apply
+extern char* gl4es_gl31_convert_shader(const char* src, unsigned type);
+// same, with GLADIATOR's emulated clip distances (fs_cd: FS discards on them; *cd_n: how many a VS writes)
+extern char* gl4es_gl31_convert_shader_ex(const char* src, unsigned type, unsigned flags, int fs_cd, int* cd_n);
+#endif
 
 //#define DEBUG
 #ifdef DEBUG
@@ -20,7 +29,8 @@ KHASH_MAP_IMPL_INT(shaderlist, shader_t *);
 GLuint APIENTRY_GL4ES gl4es_glCreateShader(GLenum shaderType) {
     DBG(printf("glCreateShader(%s)\n", PrintEnum(shaderType));)
     // sanity check
-    if (shaderType!=GL_VERTEX_SHADER && shaderType!=GL_FRAGMENT_SHADER) {
+    if (shaderType!=GL_VERTEX_SHADER && shaderType!=GL_FRAGMENT_SHADER
+        && !(isShaderStage(shaderType) && gl4es_hybrid())) {
         DBG(printf("Invalid shader type\n");)
         errorShim(GL_INVALID_ENUM);
         return 0;
@@ -125,6 +135,54 @@ void APIENTRY_GL4ES gl4es_glCompileShader(GLuint shader) {
     if(gles_glCompileShader) {
         gles_glCompileShader(glshader->id);
         errorGL();
+        #ifndef NOEGL
+        // Hybrid context, GLSL <= 1.20 that did not compile as GL4ES's GLSL ES 1.00 (sampler3D, sampler2DShadow,
+        // array constructors...): the same source through GLADIATOR, as GLSL ES 3.x. The program then uses one
+        // dialect for all its stages, chosen when it links (program.c).
+        if(!glshader->gladiator && !glshader->old && gl4es_hybrid()
+           && (glshader->type==GL_VERTEX_SHADER || glshader->type==GL_FRAGMENT_SHADER)) {
+            LOAD_GLES2(glGetShaderiv);
+            GLint st = 0;
+            gles_glGetShaderiv(glshader->id, GL_COMPILE_STATUS, &st);
+            if(!st)
+                gladiatorConvertShader(shader, 2, 0);
+        }
+        #endif
+        if(glshader->gladiator) {
+            LOAD_GLES2(glGetShaderiv);
+            LOAD_GLES2(glGetShaderInfoLog);
+            GLint st = 0; char lg[2000]; lg[0] = 0;
+            gles_glGetShaderiv(glshader->id, GL_COMPILE_STATUS, &st);
+            if(!st) {
+                gles_glGetShaderInfoLog(glshader->id, sizeof(lg), NULL, lg);
+                LOGD("LIBGL: shader %d (GLADIATOR) failed to compile: %s\n", glshader->id, lg);
+                // the lines of the GLSL ES that was compiled which the driver rejected (+-1), numbered like its messages:
+                // "ERROR: unit:line:". A "#line 1 N" starts unit N, a plain "#line 1" unit 0.
+                if(glshader->converted) {
+                    int eu[16], el[16], ne = 0;
+                    for(const char* q = lg; (q = strstr(q, "ERROR: ")) && ne < 16; ) {
+                        int u, l;
+                        q += 7;
+                        if(sscanf(q, "%d:%d:", &u, &l) == 2) { eu[ne] = u; el[ne] = l; ne++; }
+                    }
+                    const char* p = glshader->converted;
+                    int ln = 1, unit = 0;
+                    while(*p) {
+                        const char* e = strchr(p, '\n');
+                        int len = e ? (int)(e - p) : (int)strlen(p);
+                        if(len >= 7 && !strncmp(p, "#line 1", 7) && (len == 7 || p[7] == ' ' || p[7] == '\r')) { ln = 0; unit = (len > 8) ? atoi(p + 8) : 0; }
+                        for(int k = 0; k < ne; k++)
+                            if(eu[k] == unit && ln >= el[k] - 1 && ln <= el[k] + 1) {
+                                LOGD("LIBGL:   %d:%3d| %.*s\n", unit, ln, len > 300 ? 300 : len, p);
+                                break;
+                            }
+                        ++ln;
+                        if(!e) break;
+                        p = e + 1;
+                    }
+                }
+            }
+        }
         if(globals4es.logshader) {
             // get compile status and print shaders sources if compile fail...
             LOAD_GLES2(glGetShaderiv);
@@ -172,8 +230,21 @@ void APIENTRY_GL4ES gl4es_glShaderSource(GLuint shader, GLsizei count, const GLc
     LOAD_GLES2(glShaderSource);
     if (gles_glShaderSource) {
         // adapt shader if needed (i.e. not an es2 context and shader is not #version 100)
-        if(glstate->glsl->es2 && !strncmp(glshader->source, "#version 100", 12))
+        char* gladiator_es = NULL;
+        #ifndef NOEGL
+        // hybrid context: GLSL >= 1.30 is converted to GLSL ES by GLADIATOR, GL4ES compiles the result as a native ES shader
+        glshader->gl31_cd = 0;
+        glshader->gl31_flags = 0;
+        gladiator_es = gl4es_gl31_convert_shader_ex(glshader->source, glshader->type, 0, 0,
+                                                    glshader->type==GL_VERTEX_SHADER ? &glshader->gl31_cd : NULL);
+        #endif
+        glshader->gladiator = gladiator_es ? 1 : 0;
+        if(gladiator_es)
+            glshader->converted = gladiator_es;
+        else if(glstate->glsl->es2 && !strncmp(glshader->source, "#version 100", 12))
             glshader->converted = strdup(glshader->source);
+        else if(isShaderStage(glshader->type))
+            glshader->converted = strdup(glshader->source);   // GLADIATOR could not convert it; GL4ES has no geometry/tess path
         else
             glshader->converted = ConvertShader(glshader->source, glshader->type==GL_VERTEX_SHADER?1:0, &glshader->need);
         // send source to GLES2 hardware if any
@@ -206,8 +277,68 @@ void accumShaderNeeds(GLuint shader, shaderconv_need_t *need) {
     #undef GO
     #undef GO2
 }
+int isShaderGladiator(GLuint shader) {
+    CHECK_SHADER(int, shader)
+    return glshader->gladiator;
+}
+// A GLADIATOR fragment shader linked with a vertex shader that writes `cd` emulated clip distances: convert it again
+// so it reads and discards on them (GLADIATOR's own link does the same in its contexts). Returns 1 if recompiled.
+int matchShaderClipDistances(GLuint shader, int cd) {
+    CHECK_SHADER(int, shader)
+    if(!glshader->gladiator || glshader->type!=GL_FRAGMENT_SHADER || glshader->gl31_cd==cd)
+        return 0;
+    return gladiatorConvertShader(shader, glshader->gl31_flags, cd);
+}
+
+int isShaderStage(GLenum type) {
+    return type==0x8DD9 /* GL_GEOMETRY_SHADER */ || type==0x8E88 /* GL_TESS_CONTROL_SHADER */
+        || type==0x8E87 /* GL_TESS_EVALUATION_SHADER */;
+}
+
+// Converts the shader's source with GLADIATOR (flags: see gl4es_gl31_convert_shader_ex; fs_cd: emulated clip distances
+// a fragment shader discards on) and compiles it. On success the shader is GLADIATOR's from then on; on failure it is
+// left as it was. Returns 1 if the new source compiled.
+int gladiatorConvertShader(GLuint shader, unsigned flags, int fs_cd) {
+    CHECK_SHADER(int, shader)
+#ifndef NOEGL
+    if(!glshader->source || glshader->old)
+        return 0;
+    int cd = 0;
+    char* es = gl4es_gl31_convert_shader_ex(glshader->source, glshader->type, flags, fs_cd,
+                                            glshader->type==GL_VERTEX_SHADER ? &cd : NULL);
+    if(!es)
+        return 0;
+    LOAD_GLES2(glShaderSource);
+    LOAD_GLES2(glCompileShader);
+    LOAD_GLES2(glGetShaderiv);
+    GLint st = 0;
+    gles_glShaderSource(glshader->id, 1, (const GLchar * const*)&es, NULL);
+    gles_glCompileShader(glshader->id);
+    gles_glGetShaderiv(glshader->id, GL_COMPILE_STATUS, &st);
+    if(!st && !glshader->gladiator && glshader->converted) {
+        // keep the GL4ES version that was there (the caller reports the failure as it was)
+        gles_glShaderSource(glshader->id, 1, (const GLchar * const*)&glshader->converted, NULL);
+        gles_glCompileShader(glshader->id);
+        free(es);
+        return 0;
+    }
+    free(glshader->converted);
+    glshader->converted = es;
+    glshader->gladiator = 1;
+    glshader->gl31_flags = flags;
+    glshader->gl31_cd = (glshader->type==GL_VERTEX_SHADER) ? cd : fs_cd;
+    return st ? 1 : 0;
+#else
+    (void)flags; (void)fs_cd;
+    return 0;
+#endif
+}
 int isShaderCompatible(GLuint shader, shaderconv_need_t *need) {
     CHECK_SHADER(int, shader)
+    // a shader converted by GLADIATOR is native GLSL ES 3.x: it does not take part in GL4ES's fixed-function varying
+    // negotiation, and reconverting its source with ConvertShader would throw that conversion away
+    if(glshader->gladiator)
+        return 1;
     if(!glshader->converted)
         return 0;
     #define GO(A) if(need->need_##A > glshader->need.need_##A) return 0;
@@ -224,7 +355,7 @@ void redoShader(GLuint shader, shaderconv_need_t *need) {
     if(!gles_glShaderSource)
         return;
     CHECK_SHADER(void, shader)
-    if(!glshader->converted)
+    if(!glshader->converted || glshader->gladiator)
         return;
     // test, if no changes, no need to reconvert & recompile...
     if (memcmp(&glshader->need, need, sizeof(shaderconv_need_t))==0)

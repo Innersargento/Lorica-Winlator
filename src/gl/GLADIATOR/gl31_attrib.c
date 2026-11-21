@@ -77,6 +77,10 @@ void gl31_glVertexAttrib4Nsv(GLuint i, const GLshort* v)
 {
     a4f(i, nrm_signed(v[0], 32767.0), nrm_signed(v[1], 32767.0), nrm_signed(v[2], 32767.0), nrm_signed(v[3], 32767.0));
 }
+void gl31_glVertexAttrib4Niv(GLuint i, const GLint* v)
+{
+    a4f(i, nrm_signed(v[0], 2147483647.0), nrm_signed(v[1], 2147483647.0), nrm_signed(v[2], 2147483647.0), nrm_signed(v[3], 2147483647.0));
+}
 void gl31_glVertexAttrib4Nusv(GLuint i, const GLushort* v)
 {
     a4f(i, v[0] / 65535.f, v[1] / 65535.f, v[2] / 65535.f, v[3] / 65535.f);

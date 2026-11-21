@@ -18,4 +18,8 @@ void APIENTRY_GL4ES gl4es_glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint6
 
 unsigned long long get_clock();
 
+// GL_SAMPLES_PASSED: adds the pixel area of a fixed-function draw to the active query (no-op otherwise).
+// itype/indices: element type and client-memory indices, or 0/NULL for glDrawArrays.
+void gl4es_occl_count_draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const void* indices);
+
 #endif // _GL4ES_QUERIES_H_

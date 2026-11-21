@@ -349,7 +349,8 @@ void gl4es_blitTexture(GLuint texture,
     LOAD_GLES(glEnable);
     LOAD_GLES(glDisable);
 
-    realize_textures(1);
+    // only sync the bindings: the blit samples its own texture, so the application's ones get no automatic mipmaps here
+    realize_textures(0);
 
     gl4es_glPushAttrib(GL_TEXTURE_BIT | GL_ENABLE_BIT | GL_TRANSFORM_BIT | GL_COLOR_BUFFER_BIT | GL_CURRENT_BIT);
 

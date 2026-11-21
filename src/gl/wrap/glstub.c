@@ -28,11 +28,11 @@ STUB(void glBlendFuncSeparatei(GLuint buf, GLenum srcRGB, GLenum dstRGB, GLenum 
 STUB(void,glClearAccum,(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha));
 //STUB(void,glColorMaterial,(GLenum face, GLenum mode));
 STUB(void,glCopyPixels,(GLint x, GLint y, GLsizei width, GLsizei height, GLenum type));
-STUB(void,glDrawBuffer,(GLenum mode));
+// glDrawBuffer: implemented in framebuffers.c
 STUB(void,glEdgeFlag,(GLboolean flag));
 STUB(void,glIndexf,(GLfloat c));
 STUB(void,glPolygonStipple,(const GLubyte *mask));
-STUB(void,glReadBuffer,(GLenum mode));
+// glReadBuffer: implemented in framebuffers.c
 //STUB(void glSecondaryColor3f(GLfloat r, GLfloat g, GLfloat b));
 STUB(void,glColorTable,(GLenum target, GLenum internalformat, GLsizei width, GLenum format, GLenum type, const GLvoid *table));
 

@@ -51,7 +51,12 @@ static int classify(GLenum target, int* slot, GLenum* be, int* ok)
         case GL_ANY_SAMPLES_PASSED_CONSERVATIVE: *slot = Q_ANY_CONS;  *be = target; return 1;
         case GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN:
                                                  *slot = Q_TF_WRITTEN; *be = target; return 1;
-        case GL_PRIMITIVES_GENERATED:            *slot = Q_PRIMS_GEN; *be = 0; *ok = 0; return 1;
+        case GL_PRIMITIVES_GENERATED:
+            /* ES 3.2 / EXT_geometry_shader la tienen (mismo valor): cuenta lo que sale de la ultima etapa de vertices,
+             * con teselacion y geometry. Sin ella se cuenta por draw en la CPU (sin parches ni etapas). */
+            *slot = Q_PRIMS_GEN;
+            if (gl31_caps.geometry) { *be = target; } else { *be = 0; *ok = 0; }
+            return 1;
         case GL_TIME_ELAPSED:
             *slot = Q_TIME;
             if (gl31_caps.timer) { *be = target; } else { *be = 0; *ok = 0; }
@@ -307,7 +312,7 @@ static void supported_version(int* maj, int* min)
     if (gl31_caps.geometry && gl31_caps.es31 && gl31_caps.tess && gl31_caps.cube_array &&
         gl31_caps.sample_shading && gl31_caps.draw_buf_indexed) {
         M = 4; m = 2;                      /* 4.0 + 4.1 + 4.2 (requisitos de ES 3.1 ya incluidos) */
-        if (gl31_caps.texture_view && gl31_caps.copy_image && gl31_caps.ms_array) m = 3;
+        if ((gl31_caps.texture_view || gl31_caps.copy_image) && gl31_caps.copy_image && gl31_caps.ms_array) m = 3;  /* vista nativa o copiada */
     }
     *maj = M; *min = m;
 }
@@ -320,6 +325,10 @@ void gl31_set_context_version(int major, int minor, int profile)
 {
     g_ctx_major = major; g_ctx_minor = minor; g_ctx_profile = profile;
 }
+
+/* GL_CONTEXT_FLAGS pedidos al crear el contexto (GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT 1, DEBUG 2) */
+static int g_ctx_flags = 0;
+void gl31_set_context_flags(int flags) { g_ctx_flags = flags; }
 
 void gl31_advertised_version(int* major, int* minor)
 {
@@ -339,10 +348,15 @@ void gl31_advertised_version(int* major, int* minor)
 
 int gl31_advertised_minor(void) { int m; gl31_advertised_version(NULL, &m); return m; }
 
-typedef struct { const char* name; int (*ok)(void); } ext_t;
+/* ---- tabla de extensiones (modelo: src/mesa/main/extensions_table.h) ----
+ * Cada entrada ata un nombre a la capacidad que lo hace verdadero (ok) y, cuando la extension define funciones, a esas
+ * funciones (nombres sin sufijo; los sufijos ARB se resuelven al nombre base en el despacho). Solo se anuncia lo que es
+ * verdad: la condicion se cumple Y todas sus funciones resuelven en gl31_get_proc_address. Nada se anuncia por nombre. */
+typedef struct { const char* name; int (*ok)(void); const char* const* funcs; } ext_t;
 static int x_always(void)  { return 1; }
 static int x_texbuf(void)  { return gl31_caps.tex_buffer; }
 static int x_ms(void)      { return gl31_caps.multisample_tex; }
+static int x_msstore(void) { return gl31_caps.multisample_tex && gl31_caps.ms_array; }
 static int x_prov(void)    { return gl31_caps.provoking_vertex; }
 static int x_clamp(void)   { return gl31_caps.depth_clamp; }
 static int x_aniso(void)   { return gl31_caps.aniso; }
@@ -351,87 +365,162 @@ static int x_es31(void)    { return gl31_caps.es31; }
 static int x_tess(void)    { return gl31_caps.tess; }
 static int x_cubea(void)   { return gl31_caps.cube_array; }
 static int x_sshade(void)  { return gl31_caps.sample_shading; }
-static int x_view(void)    { return gl31_caps.texture_view; }
+static int x_view(void)    { return gl31_caps.texture_view || gl31_caps.copy_image; }   /* sin OES/EXT_texture_view: copia */
 static int x_copy(void)    { return gl31_caps.copy_image; }
 static int x_debug(void)   { return 1; }                  /* KHR_debug se acepta aunque sea sin efecto */
 static int x_geom(void)    { return gl31_caps.geometry; }
 static int x_dual(void)    { return gl31_caps.dual_src; }
 static int x_timer(void)   { return gl31_caps.timer || gl31_vkq_ready(); }
+static int x_border(void)  { return gl31_caps.border_clamp; }
+/* S3TC y RGTC: nativos si el backend los tiene; si no, el upload se descomprime en CPU (tc_run en gl31_texture.c) */
+static int x_s3tc(void)    { return 1; }
+static int x_rgtc(void)    { return 1; }
+static int x_bptc(void)    { return 1; }       /* nativo, o decodificado en CPU (gl31_bptc.c) */
+static int x_fbuf(void)    { return gl31_caps.float_buffer; } /* render a color float */
+static int x_dbi(void)     { return gl31_caps.draw_buf_indexed; }   /* blend por buffer de verdad, no solo guardado */
+static int x_bstore(void)  { return gl31_buffer_storage_path() != 0; }   /* EXT_buffer_storage o memoria de Vulkan */
 static int x_v33(void)     { int M, m; gl31_advertised_version(&M, &m); return M > 3 || m >= 3; }
 static int x_v4(void)      { int M; gl31_advertised_version(&M, NULL); return M >= 4; }
 
+#define F(...) (const char* const[]){ __VA_ARGS__, NULL }
 static const ext_t k_ext[] = {
-    { "GL_ARB_vertex_array_object",       x_always },
-    { "GL_ARB_uniform_buffer_object",     x_always },
-    { "GL_ARB_copy_buffer",               x_always },
-    { "GL_ARB_sampler_objects",           x_always },
-    { "GL_ARB_map_buffer_range",          x_always },
-    { "GL_ARB_texture_storage",           x_always },
-    { "GL_ARB_draw_instanced",            x_always },
-    { "GL_ARB_instanced_arrays",          x_always },
-    { "GL_ARB_framebuffer_object",        x_always },
-    { "GL_ARB_sync",                      x_always },
-    { "GL_ARB_draw_elements_base_vertex", x_always },   /* nativo o emulado */
-    { "GL_ARB_seamless_cube_map",         x_always },   /* ES siempre es seamless */
-    { "GL_ARB_texture_rectangle",         x_always },   /* emulado sobre 2D */
-    { "GL_ARB_texture_buffer_object",     x_texbuf },
-    { "GL_ARB_texture_multisample",       x_ms },
-    { "GL_ARB_provoking_vertex",          x_prov },
-    { "GL_ARB_depth_clamp",               x_clamp },
-    { "GL_EXT_texture_filter_anisotropic", x_aniso },
-    { "GL_EXT_clip_cull_distance",        x_clipd },
+    /* GL 1.x - 2.x que ES 3 tiene en el nucleo */
+    { "GL_ARB_texture_cube_map",          x_always, NULL },
+    { "GL_ARB_texture_mirrored_repeat",   x_always, NULL },
+    { "GL_ARB_texture_non_power_of_two",  x_always, NULL },
+    { "GL_ARB_depth_texture",             x_always, NULL },
+    { "GL_ARB_shadow",                    x_always, NULL },
+    { "GL_ARB_texture_border_clamp",      x_border, NULL },
+    { "GL_ARB_texture_compression",       x_always, F("glCompressedTexImage2D", "glCompressedTexSubImage2D", "glGetCompressedTexImage") },
+    { "GL_EXT_texture_compression_s3tc",  x_s3tc,   NULL },
+    { "GL_ARB_pixel_buffer_object",       x_always, NULL },
+    { "GL_ARB_texture_float",             x_always, NULL },
+    { "GL_ARB_half_float_pixel",          x_always, NULL },
+    { "GL_ARB_half_float_vertex",         x_always, NULL },
+    { "GL_ARB_texture_rg",                x_always, NULL },
+    { "GL_ARB_depth_buffer_float",        x_always, NULL },
+    { "GL_EXT_packed_float",              x_always, NULL },
+    { "GL_EXT_texture_shared_exponent",   x_always, NULL },
+    { "GL_EXT_texture_snorm",             x_always, NULL },
+    { "GL_ARB_texture_compression_rgtc",  x_rgtc,   NULL },
+    { "GL_ARB_texture_compression_bptc",  x_bptc,   NULL },
+    { "GL_ARB_color_buffer_float",        x_fbuf,   F("glClampColor") },
+    /* GL 3.x */
+    { "GL_ARB_vertex_array_object",       x_always, F("glGenVertexArrays", "glBindVertexArray", "glDeleteVertexArrays", "glIsVertexArray") },
+    { "GL_ARB_uniform_buffer_object",     x_always, F("glGetUniformBlockIndex", "glUniformBlockBinding", "glGetActiveUniformBlockiv", "glBindBufferRange", "glBindBufferBase") },
+    { "GL_ARB_copy_buffer",               x_always, F("glCopyBufferSubData") },
+    { "GL_ARB_sampler_objects",           x_always, F("glGenSamplers", "glBindSampler", "glSamplerParameteri", "glDeleteSamplers") },
+    { "GL_ARB_map_buffer_range",          x_always, F("glMapBufferRange", "glFlushMappedBufferRange") },
+    { "GL_ARB_texture_storage",           x_always, F("glTexStorage2D", "glTexStorage3D") },
+    { "GL_ARB_draw_instanced",            x_always, F("glDrawArraysInstanced", "glDrawElementsInstanced") },
+    { "GL_ARB_instanced_arrays",          x_always, F("glVertexAttribDivisor") },
+    { "GL_ARB_framebuffer_object",        x_always, F("glGenFramebuffers", "glBindFramebuffer", "glFramebufferTexture2D", "glBlitFramebuffer", "glRenderbufferStorageMultisample", "glGenerateMipmap") },
+    { "GL_ARB_sync",                      x_always, F("glFenceSync", "glClientWaitSync", "glWaitSync", "glDeleteSync") },
+    { "GL_ARB_draw_elements_base_vertex", x_always, F("glDrawElementsBaseVertex", "glDrawRangeElementsBaseVertex", "glDrawElementsInstancedBaseVertex") },   /* nativo o emulado */
+    { "GL_ARB_seamless_cube_map",         x_always, NULL },   /* ES siempre es seamless */
+    { "GL_ARB_texture_rectangle",         x_always, NULL },   /* emulado sobre 2D */
+    { "GL_ARB_texture_buffer_object",     x_texbuf, F("glTexBuffer") },
+    { "GL_ARB_texture_multisample",       x_ms,     F("glTexImage2DMultisample", "glGetMultisamplefv", "glSampleMaski") },
+    { "GL_ARB_provoking_vertex",          x_prov,   F("glProvokingVertex") },
+    { "GL_ARB_depth_clamp",               x_clamp,  NULL },
+    { "GL_EXT_texture_filter_anisotropic", x_aniso, NULL },
+    { "GL_ARB_texture_filter_anisotropic", x_aniso, NULL },
+    { "GL_EXT_clip_cull_distance",        x_clipd,  NULL },
     /* GL 4.x (solo si se anuncia >= 4.0 o el backend lo tiene) */
-    { "GL_ARB_geometry_shader4",          x_geom },
-    { "GL_ARB_tessellation_shader",       x_tess },
-    { "GL_ARB_texture_cube_map_array",    x_cubea },
-    { "GL_ARB_sample_shading",            x_sshade },
-    { "GL_ARB_draw_indirect",             x_es31 },
-    { "GL_ARB_texture_gather",            x_es31 },
-    { "GL_ARB_transform_feedback2",       x_always },
-    { "GL_ARB_get_program_binary",        x_always },
-    { "GL_ARB_separate_shader_objects",   x_es31 },
-    { "GL_ARB_shader_image_load_store",   x_es31 },
-    { "GL_ARB_shader_atomic_counters",    x_es31 },
-    { "GL_ARB_compute_shader",            x_es31 },
-    { "GL_ARB_shader_storage_buffer_object", x_es31 },
-    { "GL_ARB_program_interface_query",   x_es31 },
-    { "GL_ARB_vertex_attrib_binding",     x_es31 },
-    { "GL_ARB_framebuffer_no_attachments", x_es31 },
-    { "GL_ARB_multi_draw_indirect",       x_es31 },       /* emulado con un bucle */
-    { "GL_ARB_base_instance",             x_v4 },          /* nativo o emulado */
-    { "GL_ARB_texture_view",              x_view },
-    { "GL_ARB_copy_image",                x_copy },
-    { "GL_ARB_invalidate_subdata",        x_always },
-    { "GL_ARB_ES3_compatibility",         x_always },
-    { "GL_ARB_ES2_compatibility",         x_always },
-    { "GL_KHR_debug",                     x_debug },
+    { "GL_ARB_geometry_shader4",          x_geom,   NULL },
+    { "GL_ARB_tessellation_shader",       x_tess,   F("glPatchParameteri") },
+    { "GL_ARB_texture_cube_map_array",    x_cubea,  NULL },
+    { "GL_ARB_sample_shading",            x_sshade, F("glMinSampleShading") },
+    { "GL_ARB_draw_indirect",             x_es31,   F("glDrawArraysIndirect", "glDrawElementsIndirect") },
+    { "GL_ARB_texture_gather",            x_es31,   NULL },
+    { "GL_ARB_transform_feedback2",       x_always, F("glBindTransformFeedback", "glGenTransformFeedbacks", "glPauseTransformFeedback", "glResumeTransformFeedback", "glDrawTransformFeedback") },
+    { "GL_ARB_get_program_binary",        x_always, F("glGetProgramBinary", "glProgramBinary", "glProgramParameteri") },
+    { "GL_ARB_separate_shader_objects",   x_es31,   F("glUseProgramStages", "glCreateShaderProgramv", "glGenProgramPipelines", "glBindProgramPipeline", "glProgramUniform1f") },
+    { "GL_ARB_shader_image_load_store",   x_es31,   F("glBindImageTexture", "glMemoryBarrier") },
+    { "GL_ARB_shader_atomic_counters",    x_es31,   F("glGetActiveAtomicCounterBufferiv") },
+    { "GL_ARB_compute_shader",            x_es31,   F("glDispatchCompute", "glDispatchComputeIndirect") },
+    { "GL_ARB_shader_storage_buffer_object", x_es31, F("glShaderStorageBlockBinding") },
+    { "GL_ARB_program_interface_query",   x_es31,   F("glGetProgramInterfaceiv", "glGetProgramResourceIndex", "glGetProgramResourceName", "glGetProgramResourceiv") },
+    { "GL_ARB_vertex_attrib_binding",     x_es31,   F("glBindVertexBuffer", "glVertexAttribFormat", "glVertexAttribBinding", "glVertexBindingDivisor") },
+    { "GL_ARB_framebuffer_no_attachments", x_es31,  F("glFramebufferParameteri", "glGetFramebufferParameteriv") },
+    { "GL_ARB_multi_draw_indirect",       x_es31,   F("glMultiDrawArraysIndirect", "glMultiDrawElementsIndirect") },   /* emulado con un bucle */
+    { "GL_ARB_base_instance",             x_v4,     F("glDrawArraysInstancedBaseInstance", "glDrawElementsInstancedBaseInstance") },   /* nativo o emulado */
+    { "GL_ARB_texture_view",              x_view,   F("glTextureView") },
+    { "GL_ARB_copy_image",                x_copy,   F("glCopyImageSubData") },
+    { "GL_ARB_invalidate_subdata",        x_always, F("glInvalidateFramebuffer", "glInvalidateSubFramebuffer") },
+    { "GL_ARB_ES3_compatibility",         x_always, NULL },
+    { "GL_ARB_ES2_compatibility",         x_always, F("glReleaseShaderCompiler", "glGetShaderPrecisionFormat", "glDepthRangef", "glClearDepthf") },
+    { "GL_KHR_debug",                     x_debug,  F("glDebugMessageControl", "glDebugMessageInsert", "glDebugMessageCallback", "glGetDebugMessageLog", "glPushDebugGroup", "glObjectLabel") },
+    { "GL_ARB_debug_output",              x_debug,  F("glDebugMessageControl", "glDebugMessageInsert", "glDebugMessageCallback", "glGetDebugMessageLog") },
+    { "GL_ARB_internalformat_query",      x_always, F("glGetInternalformativ") },
+    { "GL_ARB_texture_storage_multisample", x_msstore, F("glTexStorage2DMultisample", "glTexStorage3DMultisample") },
+    { "GL_ARB_texture_buffer_range",      x_texbuf, F("glTexBufferRange") },
+    { "GL_ARB_clear_buffer_object",       x_always, F("glClearBufferData", "glClearBufferSubData") },
+    { "GL_ARB_multi_bind",                x_es31,   F("glBindBuffersBase", "glBindBuffersRange", "glBindTextures", "glBindSamplers", "glBindImageTextures", "glBindVertexBuffers") },
+    { "GL_ARB_draw_buffers_blend",        x_dbi,    F("glBlendFunci", "glBlendFuncSeparatei", "glBlendEquationi", "glBlendEquationSeparatei") },
+    { "GL_ARB_buffer_storage",            x_bstore, F("glBufferStorage") },
+    { "GL_ARB_shading_language_packing",  x_es31,   NULL },   /* packUnorm4x8 & co. en GLSL ES 3.10 */
+    { "GL_ARB_shader_image_size",         x_es31,   NULL },
+    { "GL_ARB_arrays_of_arrays",          x_es31,   NULL },
     /* GL 3.3 */
-    { "GL_ARB_explicit_attrib_location",  x_v33 },
-    { "GL_ARB_occlusion_query2",          x_v33 },
-    { "GL_ARB_texture_swizzle",           x_v33 },
-    { "GL_ARB_texture_rgb10_a2ui",        x_v33 },
-    { "GL_ARB_shader_bit_encoding",       x_v33 },
-    { "GL_ARB_vertex_type_2_10_10_10_rev", x_v33 },
-    { "GL_ARB_blend_func_extended",       x_dual },
-    { "GL_ARB_timer_query",               x_timer },
-    { "GL_ARB_clip_control",              x_always },
+    { "GL_ARB_explicit_attrib_location",  x_v33,    NULL },
+    { "GL_ARB_occlusion_query2",          x_v33,    NULL },
+    { "GL_ARB_texture_swizzle",           x_v33,    NULL },
+    { "GL_EXT_texture_swizzle",           x_v33,    NULL },
+    { "GL_ARB_texture_rgb10_a2ui",        x_v33,    NULL },
+    { "GL_ARB_shader_bit_encoding",       x_v33,    NULL },
+    { "GL_ARB_vertex_type_2_10_10_10_rev", x_v33,   NULL },
+    { "GL_ARB_blend_func_extended",       x_dual,   F("glBindFragDataLocationIndexed", "glGetFragDataIndex") },
+    { "GL_ARB_timer_query",               x_timer,  F("glQueryCounter", "glGetQueryObjecti64v", "glGetQueryObjectui64v") },
+    { "GL_ARB_clip_control",              x_always, F("glClipControl") },
+    /* GL 4.4 / 4.5 que se pueden cumplir de verdad sobre ES 3.x (el resto de 4.5, ver documentacion/DOCUMENTACION.md) */
+    { "GL_ARB_ES3_1_compatibility",       x_es31,   F("glMemoryBarrierByRegion") },
+    { "GL_ARB_conditional_render_inverted", x_v33,  F("glBeginConditionalRender") },
+    { "GL_ARB_seamless_cubemap_per_texture", x_always, NULL },   /* ES siempre filtra sin costuras: el parametro se acepta */
+    { "GL_ARB_get_texture_sub_image",     x_v33,    F("glGetTextureSubImage", "glGetCompressedTextureSubImage") },
+    { "GL_ARB_clear_texture",             x_v33,    F("glClearTexImage", "glClearTexSubImage") },
     /* GL 4.5 (solo DSA; ver documentacion/DOCUMENTACION.md) */
-    { "GL_ARB_direct_state_access",       x_v33 },
+    { "GL_ARB_direct_state_access",       x_v33,    F("glCreateBuffers", "glNamedBufferData", "glCreateTextures", "glTextureStorage2D", "glCreateFramebuffers", "glCreateVertexArrays") },
 };
+#undef F
 #define N_EXT_ALL ((int)(sizeof(k_ext) / sizeof(k_ext[0])))
+
+/* las funciones de una entrada resuelven (la tabla de GLADIATOR es estatica: se calcula una vez) */
+static int ext_funcs_ok(int i)
+{
+    static signed char cache[N_EXT_ALL];     /* 0 sin calcular, 1 si, -1 no */
+    if (!cache[i]) {
+        const char* const* f = k_ext[i].funcs;
+        cache[i] = 1;
+        for (; f && *f; f++)
+            if (!gl31_get_proc_address(*f)) { cache[i] = -1; gl31_stub_warn(k_ext[i].name); break; }
+    }
+    return cache[i] > 0;
+}
+
+static int ext_ok(int i) { return k_ext[i].ok() && ext_funcs_ok(i); }
 
 static int ext_count(void)
 {
     int i, n = 0;
-    for (i = 0; i < N_EXT_ALL; i++) if (k_ext[i].ok()) n++;
+    for (i = 0; i < N_EXT_ALL; i++) if (ext_ok(i)) n++;
     return n;
+}
+
+/* ¿la extension esta anunciada en GL_EXTENSIONS? (el preprocesador GLSL define GL_xxx igual que un driver real) */
+int gl31_ext_advertised(const char* name)
+{
+    int i;
+    for (i = 0; i < N_EXT_ALL; i++)
+        if (!strcmp(k_ext[i].name, name)) return ext_ok(i);
+    return 0;
 }
 
 static const char* ext_at(int index)
 {
     int i, n = 0;
     for (i = 0; i < N_EXT_ALL; i++)
-        if (k_ext[i].ok()) { if (n++ == index) return k_ext[i].name; }
+        if (ext_ok(i)) { if (n++ == index) return k_ext[i].name; }
     return NULL;
 }
 
@@ -447,7 +536,8 @@ const GLubyte* gl31_glGetString(GLenum name)
 {
     static GL31_TLS char renderer[192];
     static GL31_TLS char version[64];
-    static GL31_TLS char exts[4096];
+    static GL31_TLS char glslver[8];
+    static GL31_TLS char exts[8192];
     const GLubyte* be;
     int i, n, w;
 
@@ -469,8 +559,12 @@ const GLubyte* gl31_glGetString(GLenum name)
             {
                 int M, m;
                 gl31_advertised_version(&M, &m);
-                if (M >= 4) return (const GLubyte*)(m >= 3 ? "4.30" : m == 2 ? "4.20" : m == 1 ? "4.10" : "4.00");
-                return (const GLubyte*)(m >= 3 ? "3.30" : m == 2 ? "1.50" : "1.40");
+                /* como Mesa: 3.0->1.30, 3.1->1.40, 3.2->1.50; desde 3.3 el mismo numero que GL */
+                if (M > 3 || (M == 3 && m >= 3)) {
+                    snprintf(glslver, sizeof glslver, "%d.%d0", M, m);
+                    return (const GLubyte*)glslver;
+                }
+                return (const GLubyte*)(M < 3 ? "1.20" : m >= 2 ? "1.50" : m == 1 ? "1.40" : "1.30");
             }
         case GL_EXTENSIONS: {
             size_t len = 0;
@@ -507,7 +601,8 @@ static int local_integer(GLenum pname, GLint* out)
         case GL_MINOR_VERSION:           gl31_advertised_version(NULL, out); return 1;
         case GL_NUM_EXTENSIONS:          *out = ext_count(); return 1;
         case GL_CONTEXT_PROFILE_MASK:    *out = g_ctx_profile ? g_ctx_profile : GL_CONTEXT_CORE_PROFILE_BIT; return 1;
-        case GL_CONTEXT_FLAGS:           *out = 0; return 1;
+        case GL_CONTEXT_FLAGS:           *out = g_ctx_flags; return 1;
+        case 0x8DF9 /* GL_NUM_SHADER_BINARY_FORMATS */: *out = 0; return 1;   /* gl31_glShaderBinary no acepta ninguno */
         case 0x825B:                     /* GL_MAX_VIEWPORTS: ES solo tiene uno */
             *out = 1; return 1;
         case GL_MAX_TEXTURE_BUFFER_SIZE:
@@ -516,6 +611,17 @@ static int local_integer(GLenum pname, GLint* out)
         case GL_MAX_RECTANGLE_TEXTURE_SIZE:
             BE(glGetIntegerv)(GL_MAX_TEXTURE_SIZE, out);
             return 1;
+        case GL_MAX_CLIP_DISTANCES: {      /* nativo si el backend los tiene; si no, se emulan (hasta 8) */
+            GLint v = 0;
+            while (BE(glGetError)() != GL_NO_ERROR) {}
+            BE(glGetIntegerv)(GL_MAX_CLIP_DISTANCES, &v);
+            if (BE(glGetError)() != GL_NO_ERROR || v <= 0) v = 8;
+            *out = v;
+            return 1;
+        }
+        /* formatos comprimidos: los del backend mas los que Lorica descomprime en CPU (S3TC, RGTC, BPTC) */
+        case GL_NUM_COMPRESSED_TEXTURE_FORMATS: *out = gl31_compressed_formats(NULL); return 1;
+        case GL_COMPRESSED_TEXTURE_FORMATS:     gl31_compressed_formats(out); return 1;
         default: break;
     }
     s = gl31_state();
@@ -597,6 +703,8 @@ void gl31_glGetFloatv(GLenum pname, GLfloat* data)
         case GL_POINT_SIZE:                *data = gl31_state()->point_size; return;
         case GL_POINT_FADE_THRESHOLD_SIZE: *data = gl31_state()->point_fade_threshold; return;
         case 0x8C37:                       *data = gl31_state()->min_sample_shading; return;   /* MIN_SAMPLE_SHADING_VALUE */
+        case 0x0B12:                       BE(glGetFloatv)(0x846D, data); return;   /* GL_POINT_SIZE_RANGE = ALIASED_POINT_SIZE_RANGE de ES */
+        case 0x0B22:                       BE(glGetFloatv)(0x846E, data); return;   /* GL_LINE_WIDTH_RANGE = ALIASED_LINE_WIDTH_RANGE de ES */
         default:                           BE(glGetFloatv)(pname, data);
     }
 }
@@ -608,7 +716,7 @@ static int float_count(GLenum pname)
     switch (pname) {
         case GL_VIEWPORT: case GL_SCISSOR_BOX: case GL_COLOR_CLEAR_VALUE: case GL_BLEND_COLOR:
             return 4;
-        case GL_DEPTH_RANGE: case GL_ALIASED_LINE_WIDTH_RANGE:
+        case GL_DEPTH_RANGE: case GL_ALIASED_LINE_WIDTH_RANGE: case 0x0B12: case 0x0B22:
             return 2;
         default:
             return 1;
@@ -638,10 +746,16 @@ int gl31_cond_skip(void) { return g_cond_skip; }
 void gl31_glBeginConditionalRender(GLuint id, GLenum mode)
 {
     GLuint avail = 1, result = 1;
+    int inverted = 0;
     switch (mode) {
         case GL_QUERY_WAIT: case GL_QUERY_NO_WAIT:
         case GL_QUERY_BY_REGION_WAIT: case GL_QUERY_BY_REGION_NO_WAIT:
             break;
+        /* ARB_conditional_render_inverted: se dibuja cuando la query dio 0 y se omite cuando dio algo */
+        case 0x8E17: mode = GL_QUERY_WAIT; inverted = 1; break;                 /* GL_QUERY_WAIT_INVERTED */
+        case 0x8E18: mode = GL_QUERY_NO_WAIT; inverted = 1; break;              /* GL_QUERY_NO_WAIT_INVERTED */
+        case 0x8E19: mode = GL_QUERY_BY_REGION_WAIT; inverted = 1; break;       /* GL_QUERY_BY_REGION_WAIT_INVERTED */
+        case 0x8E1A: mode = GL_QUERY_BY_REGION_NO_WAIT; inverted = 1; break;    /* GL_QUERY_BY_REGION_NO_WAIT_INVERTED */
         default: gl31_set_error(GL_INVALID_ENUM); return;
     }
     if (g_cond_active) { gl31_set_error(GL_INVALID_OPERATION); return; }
@@ -654,7 +768,7 @@ void gl31_glBeginConditionalRender(GLuint id, GLenum mode)
         if (no_wait) BE(glGetQueryObjectuiv)(id, GL_QUERY_RESULT_AVAILABLE, &avail);
         if (avail) {           /* NO_WAIT con resultado pendiente: GL permite dibujar */
             BE(glGetQueryObjectuiv)(id, GL_QUERY_RESULT, &result);
-            g_cond_skip = (result == 0);
+            g_cond_skip = inverted ? (result != 0) : (result == 0);
         }
     }
     g_cond_active = 1;

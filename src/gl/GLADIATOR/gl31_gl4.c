@@ -100,6 +100,25 @@ void gl31_glDebugMessageCallback(GLDEBUGPROC callback, const void* user)
     if (gl31_caps.debug) BE(glDebugMessageCallback)(callback, user);
 }
 
+/* glGetPointerv: en el perfil core solo quedan los dos punteros de KHR_debug */
+void gl31_glGetPointerv(GLenum pname, void** params)
+{
+    if (!params) return;
+    switch (pname) {
+        case GL_DEBUG_CALLBACK_FUNCTION:   *params = (void*)g_dbg_cb; break;
+        case GL_DEBUG_CALLBACK_USER_PARAM: *params = (void*)g_dbg_user; break;
+        default: gl31_set_error(GL_INVALID_ENUM); break;
+    }
+}
+
+/* GL 4.1 / ARB_ES2_compatibility: GL_NUM_SHADER_BINARY_FORMATS es 0, asi que ningun formato es valido */
+void gl31_glShaderBinary(GLsizei count, const GLuint* shaders, GLenum binaryformat, const void* binary, GLsizei length)
+{
+    (void)shaders; (void)binaryformat; (void)binary;
+    if (count < 0 || length < 0) { gl31_set_error(GL_INVALID_VALUE); return; }
+    gl31_set_error(GL_INVALID_ENUM);
+}
+
 void gl31_glDebugMessageControl(GLenum source, GLenum type, GLenum severity, GLsizei count,
                                 const GLuint* ids, GLboolean enabled)
 {

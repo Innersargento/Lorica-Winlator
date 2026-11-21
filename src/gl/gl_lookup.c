@@ -3,6 +3,7 @@
 #include "wrap/stub.h"
 #include "directstate.h"
 #include "framebuffers.h"
+#include "hybrid.h"
 #include "init.h"
 #include "line.h"
 #include "loader.h"
@@ -35,20 +36,16 @@ void APIENTRY_GL4ES gl4es_Stub(void *x) {}
 #endif
 
 #ifndef NOEGL
-// GLADIATOR dispatch (glx/gl31_bridge.c): non-NULL only for a core GL>=3.1 context with an ES 3.x backend
-extern void* gl4es_gl31_proc_lookup(const char* name);
+// GLADIATOR (glx/gl31_bridge.c): combines GL4ES's entry point for `name` with GLADIATOR's; when both layers
+// implement it, the result is a dispatch stub that picks the layer of the context current at call time.
+extern void* gl4es_gl31_resolve(const char* name, void* own);
 #endif
 
 static void APIENTRY_GL4ES lorica_noop_provoking_vertex(GLenum mode) { (void)mode; }
 
-void* APIENTRY_GL4ES gl4es_GetProcAddress(const char *name) {
-    DBG(printf("glGetProcAddress(\"%s\")", name);)
-    #ifndef NOEGL
-    {
-        void* gl31fn = gl4es_gl31_proc_lookup(name);
-        if(gl31fn) return gl31fn;
-    }
-    #endif
+// GL4ES's own entry points only
+static void* gl4es_own_proc(const char *name) {
+    if(!name) return NULL;
     // Legacy (GL4ES) contexts have no glProvokingVertex; Wine's wined3d still calls it when the
     // reported version allows it and would jump to NULL. A no-op keeps it from crashing.
     if(name && strcmp(name, "glProvokingVertex") == 0) return (void*)lorica_noop_provoking_vertex;
@@ -102,6 +99,9 @@ void* APIENTRY_GL4ES gl4es_GetProcAddress(const char *name) {
     _EXT(glUnmapNamedBuffer);
     _EXT(glGetNamedBufferSubData);
     _EXT(glGetNamedBufferPointerv);
+    // uniform / storage buffer binding points (hybrid contexts; ids translated to real GLES buffers)
+    _EX(glBindBufferBase);
+    _EX(glBindBufferRange);
     // GL_ARB_vertex_array_object
     _EX(glGenVertexArrays);
     _EX(glBindVertexArray);
@@ -318,6 +318,8 @@ void* APIENTRY_GL4ES gl4es_GetProcAddress(const char *name) {
     }
     _EX(glStencilMaskSeparate);
     _EXT(glStencilMaskSeparate);
+    MAP("glStencilOpSeparateATI", gl4es_glStencilOpSeparate);
+    _EX(glStencilFuncSeparateATI);
     _EX(glCallList);
     _EX(glCallLists);
     _EX(glClearDepth);
@@ -743,6 +745,10 @@ void* APIENTRY_GL4ES gl4es_GetProcAddress(const char *name) {
         _ARB(glGetQueryObjectiv);
         _ARB(glGetQueryObjectuiv);
         _ARB(glQueryCounter);
+
+        // GL_EXT_timer_query
+        _EXT(glGetQueryObjecti64v);
+        _EXT(glGetQueryObjectui64v);
     }
 
     // GL_ARB_multisample
@@ -890,6 +896,20 @@ void* APIENTRY_GL4ES gl4es_GetProcAddress(const char *name) {
     _EX(glProgramUniformMatrix2fv);
     _EX(glProgramUniformMatrix3fv);
     _EX(glProgramUniformMatrix4fv);
+    // GLSL ES 3.x uniform types (hybrid contexts): GL4ES owns the program and its uniform cache
+    _EX(glGetUniformuiv);
+    _EX(glUniform1ui); _EX(glUniform2ui); _EX(glUniform3ui); _EX(glUniform4ui);
+    _EX(glUniform1uiv); _EX(glUniform2uiv); _EX(glUniform3uiv); _EX(glUniform4uiv);
+    _EX(glProgramUniform1ui); _EX(glProgramUniform2ui); _EX(glProgramUniform3ui); _EX(glProgramUniform4ui);
+    _EX(glProgramUniform1uiv); _EX(glProgramUniform2uiv); _EX(glProgramUniform3uiv); _EX(glProgramUniform4uiv);
+    _EXT(glProgramUniform1ui); _EXT(glProgramUniform2ui); _EXT(glProgramUniform3ui); _EXT(glProgramUniform4ui);
+    _EXT(glProgramUniform1uiv); _EXT(glProgramUniform2uiv); _EXT(glProgramUniform3uiv); _EXT(glProgramUniform4uiv);
+    _EX(glUniformMatrix2x3fv); _EX(glUniformMatrix2x4fv); _EX(glUniformMatrix3x2fv);
+    _EX(glUniformMatrix3x4fv); _EX(glUniformMatrix4x2fv); _EX(glUniformMatrix4x3fv);
+    _EX(glProgramUniformMatrix2x3fv); _EX(glProgramUniformMatrix2x4fv); _EX(glProgramUniformMatrix3x2fv);
+    _EX(glProgramUniformMatrix3x4fv); _EX(glProgramUniformMatrix4x2fv); _EX(glProgramUniformMatrix4x3fv);
+    _EXT(glProgramUniformMatrix2x3fv); _EXT(glProgramUniformMatrix2x4fv); _EXT(glProgramUniformMatrix3x2fv);
+    _EXT(glProgramUniformMatrix3x4fv); _EXT(glProgramUniformMatrix4x2fv); _EXT(glProgramUniformMatrix4x3fv);
     // EXT version of Shaders functions
     _EXT(glAttachShader);
     _EXT(glBindAttribLocation);
@@ -1068,9 +1088,29 @@ void* APIENTRY_GL4ES gl4es_GetProcAddress(const char *name) {
     _EX(glGetSamplerParameterIuiv);
 
     // IPointer
-    //_EX(glVertexAttribIPointer);
+    _EX(glVertexAttribIPointer);   // implemented in vertexattrib.c (and exported): glGetProcAddress must agree with dlsym
 
-    DBG(printf("NULL\n");)
-    if (!globals4es.silentstub) LOGD("GL4ES GetProcAddress: %s not found.\n", name);
+    // hybrid mode (hybrid.c): entry points GLADIATOR also has, done here because they meet GL4ES's objects
+    // (buffer ids, query objects, the lazily bound program). In core contexts the dispatch picks GLADIATOR's.
+    _EX(glTexBuffer); _ARB(glTexBuffer); _EXT(glTexBuffer);
+    _EX(glTexBufferRange); _EXT(glTexBufferRange);
+    _EX(glTextureBuffer); _EX(glTextureBufferRange);
+    _EX(glBeginTransformFeedback); _EXT(glBeginTransformFeedback);
+    _EX(glBeginConditionalRender); MAP("glBeginConditionalRenderNV", gl4es_glBeginConditionalRender);
+    _EX(glEndConditionalRender); MAP("glEndConditionalRenderNV", gl4es_glEndConditionalRender);
+
     return NULL;
+}
+
+void* APIENTRY_GL4ES gl4es_GetProcAddress(const char *name) {
+    DBG(printf("glGetProcAddress(\"%s\")", name);)
+    void* p = gl4es_own_proc(name);
+    #ifndef NOEGL
+    p = gl4es_gl31_resolve(name, p);
+    #endif
+    if(!p) {
+        DBG(printf("NULL\n");)
+        if (!globals4es.silentstub) LOGD("GL4ES GetProcAddress: %s not found.\n", name);
+    }
+    return p;
 }

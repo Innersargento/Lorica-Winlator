@@ -35,6 +35,7 @@ static int pre_draw(GLenum mode, GLsizei count)
     gl31_tex_sync_for_draw();             /* elige 1D/2D/RECT segun el sampler del programa */
     gl31_lu_sync();                       /* tamano de punto, clip control, clip distances... */
     gl31_ssbo_sync();                     /* glShaderStorageBlockBinding */
+    gl31_ubo_fit(s->program);             /* bloques uniform mas grandes que su rango ligado */
     return 1;
 }
 
@@ -225,6 +226,26 @@ static void emit(const draw_t* d)
     shift_attribs(d->basevertex, d->binst, 0);
 }
 
+static void emit(const draw_t* d);
+
+/* Diagnostico (LIBGL_DEBUG): error del backend tras cada draw; un error previo al draw se reporta aparte. */
+static void emit_chk(const draw_t* d)
+{
+    GLenum e;
+    static int npre, nerr;
+    if (!gl31_diag()) { emit(d); return; }
+    e = BE(glGetError)();
+    if (e && npre < 20) { npre++; gl31_log("LORICA DRAW: error 0x%x pending before the draw", e); }
+    emit(d);
+    e = BE(glGetError)();
+    if (e && (++nerr <= 40 || (nerr % 500) == 0)) {
+        GLint prog = 0;
+        BE(glGetIntegerv)(GL_CURRENT_PROGRAM, &prog);
+        gl31_log("LORICA DRAW: error 0x%x #%d program=%d fbo=%u mode=0x%x count=%d indexed=%d type=0x%x", e, nerr, prog,
+                 gl31_state()->draw_fbo, d->mode, d->count, d->indexed, d->type);
+    }
+}
+
 static void core_draw(const draw_t* d)
 {
     GLenum om = d->mode;
@@ -243,7 +264,7 @@ static void core_draw(const draw_t* d)
                 set_restart_fixed(GL_TRUE);              /* las ranuras vacias son 0xFFFFFFFF */
                 r.indexed = 1; r.ranged = 0; r.mode = om; r.count = oc; r.type = GL_UNSIGNED_INT; r.indices = NULL;
                 if (!d->indexed) r.basevertex = 0;
-                emit(&r);
+                emit_chk(&r);
                 BE(glBindBuffer)(GL_ELEMENT_ARRAY_BUFFER, (GLuint)saved);
             }
             gl31_xfb_account(d->mode, d->count, d->inst < 0 ? 1 : d->inst);
@@ -254,7 +275,7 @@ static void core_draw(const draw_t* d)
     if (op != IDX_NONE && unavailable && op != IDX_RESTART)
         gl31_stub_warn(op == IDX_PROVOKE ? "glProvokingVertex(FIRST_VERTEX_CONVENTION)" : "glPolygonMode(LINE/POINT)");
     if (d->indexed) apply_restart(d->type);
-    emit(d);
+    emit_chk(d);
     gl31_xfb_account(d->mode, d->count, d->inst < 0 ? 1 : d->inst);
 }
 
@@ -478,4 +499,11 @@ void gl31_glMultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indi
     if (!stride) stride = 20;                       /* DrawElementsIndirectCommand */
     for (i = 0; i < drawcount; i++)
         BE(glDrawElementsIndirect)(mode, type, (const void*)((uintptr_t)indirect + (uintptr_t)i * (uintptr_t)stride));
+}
+
+/* El glDrawElementsBaseVertex del driver GLES (ES 3.2 o EXT/OES_draw_elements_base_vertex), NULL si no lo hay: GL4ES lo usa
+ * directamente para sus draws con basevertex en lugar de copiar y reescribir los indices en la CPU. */
+void* gl31_native_basevertex_fn(void)
+{
+    return gl31_caps.base_vertex ? (void*)gl31_be.glDrawElementsBaseVertex : (void*)0;
 }

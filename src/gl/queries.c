@@ -74,6 +74,29 @@ static int is_occlusion_target(GLenum t) {
         || t == GL_ANY_SAMPLES_PASSED_CONSERVATIVE;
 }
 
+#ifndef NOEGL
+extern int  gl4es_backend_es3(void);                                 /* glx/gl31_bridge.c */
+extern void gl4es_glx_current_es_version(int* major, int* minor);    /* glx/glx.c */
+#endif
+/* Primitive counters the GLES backend has: TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN (ES 3.0) and PRIMITIVES_GENERATED
+ * (ES 3.2 / EXT_geometry_shader, same value). They count on the GPU, after every vertex stage; without them GL4ES has
+ * no count at all (0). Kept in the same backend-query table as the occlusion queries, with their own target. */
+static int prim_backend_target(GLenum t) {
+#ifndef NOEGL
+    int M = 0, m = 0;
+    if (t == GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN) return gl4es_backend_es3();
+    if (t == GL_PRIMITIVES_GENERATED) {
+        gl4es_glx_current_es_version(&M, &m);
+        return M > 3 || (M == 3 && m >= 2);
+    }
+#else
+    (void)t;
+#endif
+    return 0;
+}
+static int backend_target(GLenum t) { return is_occlusion_target(t) || prim_backend_target(t); }
+static GLenum backend_query_target(GLenum t) { return is_occlusion_target(t) ? GL_ANY_SAMPLES_PASSED : t; }
+
 static int occl_by_q(glquery_t* q) {
     int i;
     if (!q) return -1;
@@ -119,7 +142,7 @@ static int occl_poll(int i) {
 /* GL_QUERY_RESULT_AVAILABLE real (Cube2 y otros lo usan para NO bloquear la GPU). */
 static int query_available(glquery_t* q) {
     int i;
-    if (!is_occlusion_target(q->target)) return 1;
+    if (!backend_target(q->target)) return 1;
     i = occl_by_q(q);
     if (i < 0) return 1;                  /* sin backend (LIBGL_OCCL=0) */
     return occl_poll(i);
@@ -154,6 +177,16 @@ static GLuint64 occl_result(glquery_t* q) {
 
 static GLuint64 query_result(glquery_t* q) {
     if (is_occlusion_target(q->target)) return occl_result(q);
+    if (prim_backend_target(q->target)) {
+        int i = occl_by_q(q);
+        if (i >= 0) {
+            if (!s_occl[i].has) {             /* GL_QUERY_RESULT bloquea */
+                load_query_funcs();
+                if (s_beGetuiv) { s_beGetuiv(s_occl[i].be_id, GL_QUERY_RESULT, &s_occl[i].cached); s_occl[i].has = 1; }
+            }
+            return s_occl[i].cached;
+        }
+    }
     return (q->target==GL_TIME_ELAPSED) ? q->start : q->num;
 }
 
@@ -241,6 +274,84 @@ float gl4es_occl_tri_area(const float* a, const float* b, const float* c, const 
     n = ov_clip(t1, n, t2, 1, rect[1]+rect[3],  -1); if (n < 3) return 0.f;
     sa = ov_area(t2, n);
     return sa < 0 ? -sa : sa;
+}
+
+/* ---- GL_SAMPLES_PASSED: conteo por software para los draws de funcion fija ----
+ * ES solo tiene ANY_SAMPLES_PASSED. Mientras hay una query SAMPLES_PASSED activa, cada draw de funcion fija suma el
+ * area en pixeles de sus triangulos (MVP de GL4ES, recorte near y viewport, culling). occl_result anula el total a 0 si
+ * el backend dice que nada paso el test de profundidad. Con un programa de la app (gl_Position desconocido) no se
+ * suma nada y queda el valor de LIBGL_OCCL_FALLBACK. */
+#include "matrix.h"
+#include "enum_info.h"
+#define OCCL_MAX_PRIMS 65536   /* tope de trabajo por draw (una query suele cubrir cajas, no la escena) */
+
+static int occl_fetch(const vertexattrib_t* a, GLuint i, float out[3])
+{
+    GLsizei stride;
+    const char* p;
+    int j, n;
+    out[0] = out[1] = out[2] = 0.f;
+    if (!a->pointer) return 0;
+    stride = a->stride ? a->stride : a->size * gl_sizeof(a->type);
+    p = (const char*)a->pointer + (size_t)i * stride;
+    n = a->size < 3 ? a->size : 3;
+    for (j = 0; j < n; j++) {
+        switch (a->type) {
+            case GL_FLOAT:  out[j] = ((const GLfloat*)p)[j]; break;
+            case GL_DOUBLE: out[j] = (float)((const GLdouble*)p)[j]; break;
+            case GL_SHORT:  out[j] = ((const GLshort*)p)[j]; break;
+            case GL_INT:    out[j] = (float)((const GLint*)p)[j]; break;
+            case GL_BYTE:   out[j] = ((const GLbyte*)p)[j]; break;
+            default: return 0;
+        }
+    }
+    return 1;
+}
+
+static GLuint occl_index(GLenum itype, const void* indices, GLint first, GLsizei i)
+{
+    if (!indices) return (GLuint)(first + i);
+    switch (itype) {
+        case GL_UNSIGNED_BYTE:  return ((const GLubyte*)indices)[i];
+        case GL_UNSIGNED_SHORT: return ((const GLushort*)indices)[i];
+        default:                return ((const GLuint*)indices)[i];
+    }
+}
+
+void gl4es_occl_count_draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const void* indices)
+{
+    glquery_t* q = gl4es_occl_active();
+    const vertexattrib_t* a;
+    float rect[4], area = 0.f;
+    GLenum cull;
+    int ccw, i, ntri;
+    if (!q || count <= 0) return;
+    if (glstate->glsl->program) return;              /* shader de la app: la posicion final no se conoce */
+    a = &glstate->vao->vertexattrib[ATT_VERTEX];
+    if (!a->enabled || !a->pointer) return;
+    if (mode == GL_POINTS) { gl4es_occl_add_samples((GLuint)count); return; }
+    if (mode < GL_TRIANGLES) return;                 /* lineas: despreciable para las cajas de una query */
+    rect[0] = glstate->raster.viewport.x;     rect[1] = glstate->raster.viewport.y;
+    rect[2] = glstate->raster.viewport.width; rect[3] = glstate->raster.viewport.height;
+    cull = glstate->enable.cull_face ? glstate->face.cull : 0;
+    ccw = glstate->face.front != GL_CW;
+    ntri = (mode == GL_TRIANGLES) ? count / 3 : count - 2;
+    if (ntri > OCCL_MAX_PRIMS) ntri = OCCL_MAX_PRIMS;
+    {
+        const GLfloat* mvp = getMVPMat();
+        for (i = 0; i < ntri; i++) {
+            GLsizei k0, k1, k2;
+            float v0[3], v1[3], v2[3];
+            if (mode == GL_TRIANGLES)           { k0 = 3*i; k1 = 3*i+1; k2 = 3*i+2; }
+            else if (mode == GL_TRIANGLE_FAN)   { k0 = 0;   k1 = i+1;   k2 = i+2; }
+            else /* strip: el orden alterna */  { k0 = i;   k1 = (i&1) ? i+2 : i+1; k2 = (i&1) ? i+1 : i+2; }
+            if (!occl_fetch(a, occl_index(itype, indices, first, k0), v0)) return;
+            occl_fetch(a, occl_index(itype, indices, first, k1), v1);
+            occl_fetch(a, occl_index(itype, indices, first, k2), v2);
+            area += gl4es_occl_tri_area(v0, v1, v2, mvp, rect, cull, ccw);
+        }
+    }
+    if (area > 0.f) gl4es_occl_add_samples((GLuint)(area + 0.5f));
 }
 
 #ifdef _WIN32
@@ -386,9 +497,9 @@ void APIENTRY_GL4ES gl4es_glBeginQuery(GLenum target, GLuint id) {
 	query->active = 1;
 	query->start = get_clock() - glstate->queries.start;
 
-    if (is_occlusion_target(target)) {
+    if (backend_target(target)) {
         load_query_funcs();
-        if (occl_backend_enabled() && s_beGenQueries && s_beBeginQuery) {
+        if ((occl_backend_enabled() || !is_occlusion_target(target)) && s_beGenQueries && s_beBeginQuery) {
             int i = occl_by_q(query);
             if (i >= 0) s_occl[i].has = 0;
             GLuint be_id = (i >= 0) ? s_occl[i].be_id : 0;
@@ -397,7 +508,7 @@ void APIENTRY_GL4ES gl4es_glBeginQuery(GLenum target, GLuint id) {
                 if (i < 0 && occl_new(query, be_id) < 0) {      /* tabla llena */
                     if (s_beDeleteQueries) s_beDeleteQueries(1, &be_id);
                 } else {
-                    s_beBeginQuery(GL_ANY_SAMPLES_PASSED, be_id);
+                    s_beBeginQuery(backend_query_target(target), be_id);
                 }
             }
         }
@@ -428,10 +539,10 @@ void APIENTRY_GL4ES gl4es_glEndQuery(GLenum target) {
     query->active = 0;
 	query->start = (get_clock() - glstate->queries.start) - query->start;
 
-    if (is_occlusion_target(target)) {
+    if (backend_target(target)) {
         if (occl_by_q(query) >= 0) {
             load_query_funcs();
-            if (s_beEndQuery) s_beEndQuery(GL_ANY_SAMPLES_PASSED);
+            if (s_beEndQuery) s_beEndQuery(backend_query_target(target));
         }
     }
 

@@ -117,6 +117,9 @@ AliasExport(void,glPointParameterfv,ARB,(GLenum pname, const GLfloat * params));
 AliasExport(void,glPointParameterfv,EXT,(GLenum pname, const GLfloat * params));
 
 void APIENTRY_GL4ES gl4es_glPointSize(GLfloat size) {
+    // recorded in a display list, and draws the pending glBegin/glEnd batch first: that batch was specified with the
+    // previous size
+    PUSH_IF_COMPILING(glPointSize);
     if(size<=0.0f) {
         errorShim(GL_INVALID_VALUE);
         return;

@@ -1055,6 +1055,14 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need)
     Tmp = gl4es_inplace_replace(Tmp, &tmpsize, "gl_MaxClipPlanes", "_gl4es_MaxClipPlanes");
   }
 
+  // A vertex shader that does not write gl_PointSize: desktop GL rasterizes its points with the glPointSize size
+  // (GL_PROGRAM_POINT_SIZE only matters when the shader writes it); GLES leaves the size undefined, 1 pixel on most
+  // drivers, so point sprites came out as single pixels with a constant gl_PointCoord. The size comes from
+  // gl_Point.size, which the runtime already feeds (builtin_pointsprite).
+  if(isVertex && !strstr(Tmp, "gl_PointSize") && strstr(Tmp, "main")) {
+    Tmp = gl4es_inplace_replace(Tmp, &tmpsize, "main", "_gl4es_main_ps");
+    Tmp = gl4es_append(Tmp, &tmpsize, "\nvoid main() { _gl4es_main_ps(); gl_PointSize = gl_Point.size; }\n");
+  }
   if(strstr(Tmp, "gl_PointParameters") || strstr(Tmp, "gl_Point"))
     {
       Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, headline), gl4es_PointSpriteSource, Tmp, &tmpsize);
@@ -1301,6 +1309,42 @@ int isBuiltinMatrix(const char* name) {
         }
     }
     return ret;
+}
+
+// Contract with GLADIATOR (hybrid mode, compatibility built-ins in GLSL >= 1.30; see gl31_glsl_set_compat_builtins).
+// GL4ES owns the fixed-function state, so it says how each attribute / state uniform is named and declared in the
+// GLSL ES 3.00 source that GL4ES then compiles natively; its runtime feeds them by name (hasBuiltinAttrib binds the
+// attribute locations before linking, builtin_CheckUniform records the uniforms). The gl_TextureMatrix_N entries are
+// GL4ES's own non-standard spelling and are not offered.
+int gl4es_compat_builtin(const char* name, int vertex, char* repl, size_t replen, char* decl, size_t decllen)
+{
+    if(!name || strncmp(name, "gl_", 3))
+        return 0;
+    if(vertex) {
+        const builtin_attrib_t* t = (hardext.maxvattrib>8)?builtin_attrib:builtin_attrib_compressed;
+        int n = (hardext.maxvattrib>8)?(int)(sizeof(builtin_attrib)/sizeof(builtin_attrib_t))
+                                      :(int)(sizeof(builtin_attrib_compressed)/sizeof(builtin_attrib_t));
+        for (int i=0; i<n; i++)
+            if(!strcmp(t[i].glname, name)) {
+                snprintf(repl, replen, "%s", t[i].name);
+                snprintf(decl, decllen, "in highp %s %s;\n", t[i].type, t[i].name);
+                return 1;
+            }
+    }
+    int n = sizeof(builtin_matrix)/sizeof(builtin_matrix_t);
+    for (int i=0; i<n; i++) {
+        if(!strncmp(builtin_matrix[i].glname, "gl_TextureMatrix_", 17))
+            continue;
+        if(!strcmp(builtin_matrix[i].glname, name)) {
+            snprintf(repl, replen, "%s", builtin_matrix[i].name);
+            if(builtin_matrix[i].texarray)
+                snprintf(decl, decllen, "uniform highp %s %s[%d];\n", builtin_matrix[i].type, builtin_matrix[i].name, MAX_TEX);
+            else
+                snprintf(decl, decllen, "uniform highp %s %s;\n", builtin_matrix[i].type, builtin_matrix[i].name);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 const char* hasBuiltinAttrib(const char* vertexShader, int Att) {

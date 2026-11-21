@@ -63,6 +63,8 @@ static void detect_capabilities(void)
             gl31_caps.has_astc = 1;
         else if (has_ext(e, "GL_EXT_texture_compression_bptc", NULL))
             gl31_caps.has_bptc = 1;
+        else if (has_ext(e, "GL_EXT_texture_compression_rgtc", NULL))
+            gl31_caps.has_rgtc = 1;
         else if (has_ext(e, "GL_BASIS_EXT", NULL))
             gl31_caps.has_basis = 1;
         else if (has_ext(e, "GL_EXT_texture_buffer", "GL_OES_texture_buffer"))
@@ -75,6 +77,12 @@ static void detect_capabilities(void)
             gl31_caps.half_float = 1;
         else if (has_ext(e, "GL_EXT_color_buffer_float", NULL))
             gl31_caps.float_buffer = 1;
+        else if (has_ext(e, "GL_OES_texture_float_linear", NULL))
+            gl31_caps.float_linear = 1;
+        else if (has_ext(e, "GL_EXT_texture_norm16", NULL))
+            gl31_caps.norm16 = 1;
+        else if (has_ext(e, "GL_EXT_render_snorm", NULL))
+            gl31_caps.render_snorm = 1;
         else if (has_ext(e, "GL_EXT_texture_border_clamp", "GL_OES_texture_border_clamp"))
             gl31_caps.border_clamp = 1;
         else if (has_ext(e, "GL_EXT_texture_filter_anisotropic", NULL))
@@ -142,7 +150,8 @@ static void detect_capabilities(void)
         gl31_caps.tess = 1;
         gl31_caps.cube_array = 1;
         gl31_caps.sample_shading = 1;
-        gl31_caps.texture_view = 1;
+        /* texture_view NO es core en ES 3.2: solo con GL_OES/EXT_texture_view (arriba). Algunos drivers devuelven un
+         * puntero para "glTextureView" igual, que no hace nada (la vista se queda vacia y se muestrea negro). */
         gl31_caps.copy_image = 1;
         gl31_caps.debug = 1;
     }
@@ -276,7 +285,9 @@ int gl31_init(gl31_loader_fn loader)
         LOAD_OPT(glBlendFuncSeparatei);
     }
     if (gl31_caps.texture_view) {
-        LOAD_OPT(glTextureView);
+        /* solo existe por extension: el nombre con sufijo primero (el sin sufijo puede ser un stub del loader) */
+        gl31_be.glTextureView = (__typeof__(gl31_be.glTextureView))loader("glTextureViewOES");
+        if (!gl31_be.glTextureView) gl31_be.glTextureView = (__typeof__(gl31_be.glTextureView))loader("glTextureViewEXT");
         if (!gl31_be.glTextureView) gl31_caps.texture_view = 0;
     }
     if (gl31_caps.copy_image) {
@@ -340,6 +351,9 @@ int gl31_init(gl31_loader_fn loader)
 
     if (getenv("LIBGL_DEBUG") || getenv("LORICA_DEBUG"))
         fprintf(stderr, "[caps] es=%d.%d glsl=%d geom=%d es31=%d tess=%d cube=%d ss=%d dbi=%d tv=%d ci=%d ms=%d\n", gl31_caps.es_major, gl31_caps.es_minor, gl31_caps.glsl_es, gl31_caps.geometry, gl31_caps.es31, gl31_caps.tess, gl31_caps.cube_array, gl31_caps.sample_shading, gl31_caps.draw_buf_indexed, gl31_caps.texture_view, gl31_caps.copy_image, gl31_caps.ms_array);
+    if (getenv("LIBGL_DEBUG") || getenv("LORICA_DEBUG"))
+        gl31_log("LORICA caps formats: norm16=%d render_snorm=%d cb_half_float=%d cb_float=%d float_linear=%d",
+                gl31_caps.norm16, gl31_caps.render_snorm, gl31_caps.half_float, gl31_caps.float_buffer, gl31_caps.float_linear);
     gl31_query_reset();
     gl31_state_init();
     return 0;

@@ -212,9 +212,8 @@ void initialize_gl4es() {
       case 45:
         break;
       default:
-        // default 3.2 (lo maximo que soporta Lorica). Las apps que no pueden
-        // con 3.x lo bajan via LIBGL_GL=NN en su prefix del launcher.
-        globals4es.gl = (globals4es.es==1) ? 15 : 21;
+        // 4.3 por defecto (1.5 con ES 1.1); LIBGL_GL=NN la cambia
+        globals4es.gl = (globals4es.es==1) ? 15 : 43;
         break;
     }
 
@@ -228,7 +227,7 @@ void initialize_gl4es() {
           case 40: case 41: case 42: case 43: case 44: case 45:
             break;
           default:
-            compat = (globals4es.es==1) ? 15 : 21;
+            compat = (globals4es.es==1) ? 15 : 43;
             break;
         }
         if(compat > globals4es.gl) compat = globals4es.gl;

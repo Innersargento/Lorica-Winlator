@@ -1,4 +1,7 @@
 #include "program.h"
+#ifndef NOEGL
+extern void gl4es_gl31_ubo_invalidate(void);   // glx/gl31_bridge.c
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +12,7 @@
 #include "glstate.h"
 #include "loader.h"
 #include "shaderconv.h"
+#include "logs.h"
 #include "fpe_shader.h"
 
 //#define DEBUG
@@ -524,6 +528,28 @@ static void clear_program(program_t *glprogram)
     glprogram->cache.size = 0;  // reset cache buffer
 }
 
+// Components per location of an attribute type and how many locations it takes (matCxR: C columns of R components)
+static int attrib_components(GLenum type, int* slots)
+{
+    *slots = 1;
+    switch(type) {
+        case 0x1406: case 0x1404: case 0x1405: return 1;                    // float, int, uint
+        case 0x8B50: case 0x8B53: case 0x8DC6: return 2;                    // vec2, ivec2, uvec2
+        case 0x8B51: case 0x8B54: case 0x8DC7: return 3;
+        case 0x8B52: case 0x8B55: case 0x8DC8: return 4;
+        case 0x8B5A: *slots = 2; return 2;                                  // mat2
+        case 0x8B5B: *slots = 3; return 3;                                  // mat3
+        case 0x8B5C: *slots = 4; return 4;                                  // mat4
+        case 0x8B65: *slots = 2; return 3;                                  // mat2x3
+        case 0x8B66: *slots = 2; return 4;                                  // mat2x4
+        case 0x8B67: *slots = 3; return 2;                                  // mat3x2
+        case 0x8B68: *slots = 3; return 4;                                  // mat3x4
+        case 0x8B69: *slots = 4; return 2;                                  // mat4x2
+        case 0x8B6A: *slots = 4; return 3;                                  // mat4x3
+    }
+    return 4;   // unknown: still an attribute in use
+}
+
 static void fill_program(program_t *glprogram)
 {
     LOAD_GLES(glGetError);
@@ -608,7 +634,7 @@ static void fill_program(program_t *glprogram)
         uniform_t *m;
         khint_t k;
         kh_foreach(glprogram->uniform, k, m,
-            if(m->type == GL_SAMPLER_2D || m->type == GL_SAMPLER_CUBE)
+            if(is_uniform_sampler(m->type))
                 memset((char*)glprogram->cache.cache+m->cache_offs, 0xff, m->cache_size);
         )
     }
@@ -642,7 +668,13 @@ static void fill_program(program_t *glprogram)
                 glattribloc->index = id;
                 glattribloc->real_index = i;
                 int builtin = builtin_CheckVertexAttrib(glprogram, name, id);
-                glprogram->va_size[id] = n_uniform(type); // same as uniform
+                // every location the attribute occupies (matrix columns, array elements) is "used"; n_uniform()
+                // knew neither the uint types of GLSL ES 3.00 nor matrices, so those attributes were never sent
+                {
+                    int slots = 1, comps = attrib_components(type, &slots);
+                    for (int s=0; s<slots*(size>0?size:1) && id+s<MAX_VATTRIB; s++)
+                        glprogram->va_size[id+s] = comps;
+                }
                 DBG(printf(" attrib #%d : \"%s\"%s type=%s size=%d\n", id, glattribloc->name, builtin?" (builtin) ":"", PrintEnum(glattribloc->type), glattribloc->size);)
             }
         }
@@ -732,8 +764,36 @@ void APIENTRY_GL4ES gl4es_glLinkProgram(GLuint program) {
     FLUSH_BEGINEND;
     CHECK_PROGRAM(void, program)
     noerrorShim();
+#ifndef NOEGL
+    gl4es_gl31_ubo_invalidate();    // the uniform blocks of a relinked program may change (hybrid contexts validate them per draw)
+#endif
 
     clear_program(glprogram);
+
+#ifndef NOEGL
+    // Shaders converted by GLADIATOR (hybrid contexts). GLSL ES 1.00 (GL4ES) and 3.x (GLADIATOR) stages do not link
+    // together, so a program uses one dialect: if any stage is GLADIATOR's, the GL4ES ones are converted by GLADIATOR
+    // too. And the vertex-stage wrapper (point size, glClipControl, clip distances) goes on the vertex shader only
+    // when no geometry / tessellation stage follows it, as GLADIATOR's own glLinkProgram does.
+    {
+        int staged = 0, any_glad = 0;
+        for (int i=0; i<glprogram->attach_size; i++) {
+            shader_t* sh = getShader(glprogram->attach[i]);
+            if(!sh) continue;
+            if(isShaderStage(sh->type)) staged = 1;
+            if(sh->gladiator) any_glad = 1;
+        }
+        if(any_glad)
+            for (int i=0; i<glprogram->attach_size; i++) {
+                shader_t* sh = getShader(glprogram->attach[i]);
+                if(!sh || sh->old || (sh->type!=GL_VERTEX_SHADER && sh->type!=GL_FRAGMENT_SHADER)) continue;
+                if(!sh->gladiator)
+                    gladiatorConvertShader(sh->id, (staged?1u:0u)|2u, 0);
+                else if(sh->type==GL_VERTEX_SHADER && (int)(sh->gl31_flags&1u)!=staged)
+                    gladiatorConvertShader(sh->id, (sh->gl31_flags&~1u)|(staged?1u:0u), 0);
+            }
+    }
+#endif
 
     // check if attached shaders are compatible in term of varying...
     shaderconv_need_t needs = {0};
@@ -758,10 +818,24 @@ void APIENTRY_GL4ES gl4es_glLinkProgram(GLuint program) {
         memcpy(glprogram->default_need, &needs, sizeof(shaderconv_need_t));
         glprogram->default_fragment = 1;
         GLenum vtx = gl4es_glCreateShader(GL_FRAGMENT_SHADER);
+        if(glprogram->last_vert && isShaderGladiator(glprogram->last_vert->id)) {
+            // vertex-only program written for GLSL >= 1.30: an empty fragment stage with the same "#version N es" as the vertex one
+            char dummy[160];
+            int esv = 300;
+            if(glprogram->last_vert->converted) sscanf(glprogram->last_vert->converted, "#version %d es", &esv);
+            snprintf(dummy, sizeof(dummy), "#version %d es\nprecision mediump float;\nout vec4 lorica_o;\nvoid main() { lorica_o = vec4(0.0); }\n", esv);
+            const char* dsrc = dummy;
+            gl4es_glShaderSource(vtx, 1, &dsrc, NULL);
+        } else
         gl4es_glShaderSource(vtx, 1, fpe_FragmentShader(&needs, NULL), NULL);
         gl4es_glCompileShader(vtx);
         gl4es_glAttachShader(glprogram->id, vtx);
     }
+    // emulated clip distances (GLADIATOR, backend without EXT_clip_cull_distance): the fragment shaders discard on
+    // the ones the vertex shader writes
+    if(glprogram->last_vert && glprogram->last_vert->gladiator)
+        for (int i=0; i<glprogram->attach_size; i++)
+            matchShaderClipDistances(glprogram->attach[i], glprogram->last_vert->gl31_cd);
     int compatible = 1;
     // now is everyone ok?
     for (int i=0; i<glprogram->attach_size && compatible; i++) {
@@ -776,7 +850,7 @@ void APIENTRY_GL4ES gl4es_glLinkProgram(GLuint program) {
     }
     // check if Built-in VA are used, and if so, bind them to their proper location
     if(glprogram->last_vert)
-        for (int i=0; i<ATT_MAX; ++i) {
+        for (int i=0; i<ATT_MAX && i<hardext.maxvattrib; ++i) {   // ATT_MAX (24) can exceed the hardware's attributes
             const char* attribute = hasBuiltinAttrib(glprogram->last_vert->converted, i);
             if(attribute)
                 gl4es_glBindAttribLocation(glprogram->id, i, attribute);
@@ -791,6 +865,17 @@ void APIENTRY_GL4ES gl4es_glLinkProgram(GLuint program) {
         // Get Link Status
         gles_glGetProgramiv(glprogram->id, GL_LINK_STATUS, &glprogram->linked);
         DBG(printf(" link status = %d\n", glprogram->linked);)
+        {   // programs that carry a shader converted by GLADIATOR (traced when they fail to link)
+            int hy = 0;
+            for (int i=0; i<glprogram->attach_size; i++) if(isShaderGladiator(glprogram->attach[i])) hy = 1;
+            glprogram->gladiator = hy;
+            if(hy && !glprogram->linked) {
+                LOAD_GLES2(glGetProgramInfoLog);
+                char lg[600]; lg[0] = 0;
+                if(gles_glGetProgramInfoLog) gles_glGetProgramInfoLog(glprogram->id, sizeof(lg), NULL, lg);
+                LOGD("LIBGL: program %d (GLADIATOR) failed to link (error 0x%x): %s\n", glprogram->id, err, lg);
+            }
+        }
         if(glprogram->linked) {
             fill_program(glprogram);
             noerrorShimNoPurge();

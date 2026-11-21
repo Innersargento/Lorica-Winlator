@@ -6,6 +6,7 @@
  * TextureSubImage3D/GetTextureImage solo sin compresion, sin GetTextureSubImage). */
 #include "gl31.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* =====================================================================
  * Texturas
@@ -224,6 +225,112 @@ void gl31_glGetTextureImage(GLuint t, GLint l, GLenum f, GLenum ty, GLsizei bufS
     END_TEX();
 }
 
+
+/* ---- ARB_get_texture_sub_image: una region de un nivel; en un cube map z = cara inicial y d = numero de caras ---- */
+void gl31_glGetTextureSubImage(GLuint t, GLint l, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
+                               GLenum f, GLenum ty, GLsizei bufSize, void* pixels)
+{
+    WITH_TEX(t);
+    (void)bufSize;
+    if (tb_.target == GL_TEXTURE_CUBE_MAP) {
+        GLint i;
+        size_t step = image_bytes(w, h, f, ty);
+        if (z < 0 || d < 0 || z + d > 6) gl31_set_error(GL_INVALID_VALUE);
+        else if (!step) gl31_set_error(GL_INVALID_ENUM);
+        else
+            for (i = 0; i < d; i++)
+                gl31_glGetTexSubImage(GL_TEXTURE_CUBE_MAP_POSITIVE_X + (GLenum)(z + i), l, x, y, 0, w, h, 1, f, ty,
+                                      (unsigned char*)pixels + step * (size_t)i);
+    } else {
+        gl31_glGetTexSubImage(tb_.target, l, x, y, z, w, h, d, f, ty, pixels);
+    }
+    END_TEX();
+}
+
+void gl31_glGetCompressedTextureSubImage(GLuint t, GLint l, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
+                                         GLsizei bufSize, void* pixels)
+{
+    (void)t; (void)l; (void)x; (void)y; (void)z; (void)w; (void)h; (void)d; (void)bufSize; (void)pixels;
+    gl31_stub_warn("glGetCompressedTextureSubImage: ES no puede leer texturas comprimidas");
+    gl31_set_error(GL_INVALID_OPERATION);
+}
+
+/* ---- ARB_clear_texture: se rellena la region con el pixel dado (o con ceros) usando glTexSubImage ---- */
+static void clear_region(GLenum target, GLint l, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
+                         GLenum f, GLenum ty, const void* data)
+{
+    gl31_state_t* st = gl31_state();
+    int packed;
+    size_t tb = type_bytes(ty, &packed), px, n, i;
+    unsigned char* buf;
+    GLint sa = st->unpack_alignment, srl = st->unpack_row_length, ssr = st->unpack_skip_rows, ssp = st->unpack_skip_pixels;
+    GLint sih = st->unpack_image_height, ssi = st->unpack_skip_images;
+    if (w < 0 || h < 0 || d < 0) { gl31_set_error(GL_INVALID_VALUE); return; }
+    if (!w || !h || !d) return;
+    if (!tb || (!packed && !format_comps(f))) { gl31_set_error(GL_INVALID_ENUM); return; }
+    if (st->pixel_unpack_buffer) { gl31_set_error(GL_INVALID_OPERATION); return; }
+    px = packed ? tb : tb * format_comps(f);
+    n = (size_t)w * (size_t)h * (size_t)d;
+    buf = (unsigned char*)calloc(n, px);
+    if (!buf) { gl31_set_error(GL_OUT_OF_MEMORY); return; }
+    if (data) for (i = 0; i < n; i++) memcpy(buf + i * px, data, px);
+    gl31_glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    gl31_glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    gl31_glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+    gl31_glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    gl31_glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
+    gl31_glPixelStorei(GL_UNPACK_SKIP_IMAGES, 0);
+    switch (target) {
+        case GL_TEXTURE_1D:
+            gl31_glTexSubImage1D(target, l, x, w, f, ty, buf);
+            break;
+        case GL_TEXTURE_CUBE_MAP: {
+            GLint k;
+            if (z < 0 || z + d > 6) { gl31_set_error(GL_INVALID_VALUE); break; }
+            for (k = 0; k < d; k++)
+                gl31_glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + (GLenum)(z + k), l, x, y, w, h, f, ty, buf);
+            break;
+        }
+        case GL_TEXTURE_2D: case GL_TEXTURE_1D_ARRAY: case GL_TEXTURE_RECTANGLE:
+            gl31_glTexSubImage2D(target, l, x, y, w, h, f, ty, buf);
+            break;
+        default:
+            gl31_glTexSubImage3D(target, l, x, y, z, w, h, d, f, ty, buf);
+            break;
+    }
+    gl31_glPixelStorei(GL_UNPACK_ALIGNMENT, sa);
+    gl31_glPixelStorei(GL_UNPACK_ROW_LENGTH, srl);
+    gl31_glPixelStorei(GL_UNPACK_SKIP_ROWS, ssr);
+    gl31_glPixelStorei(GL_UNPACK_SKIP_PIXELS, ssp);
+    gl31_glPixelStorei(GL_UNPACK_IMAGE_HEIGHT, sih);
+    gl31_glPixelStorei(GL_UNPACK_SKIP_IMAGES, ssi);
+    free(buf);
+}
+
+void gl31_glClearTexSubImage(GLuint t, GLint l, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
+                             GLenum f, GLenum ty, const void* data)
+{
+    WITH_TEX(t);
+    clear_region(tb_.target, l, x, y, z, w, h, d, f, ty, data);
+    END_TEX();
+}
+
+void gl31_glClearTexImage(GLuint t, GLint l, GLenum f, GLenum ty, const void* data)
+{
+    GLint w = 0, h = 1, d = 1;
+    GLenum q;
+    WITH_TEX(t);
+    q = (tb_.target == GL_TEXTURE_CUBE_MAP) ? GL_TEXTURE_CUBE_MAP_POSITIVE_X : tb_.target;
+    gl31_glGetTexLevelParameteriv(q, l, GL_TEXTURE_WIDTH, &w);
+    if (tb_.target != GL_TEXTURE_1D) gl31_glGetTexLevelParameteriv(q, l, GL_TEXTURE_HEIGHT, &h);
+    if (tb_.target == GL_TEXTURE_3D || tb_.target == GL_TEXTURE_2D_ARRAY || tb_.target == GL_TEXTURE_CUBE_MAP_ARRAY)
+        gl31_glGetTexLevelParameteriv(q, l, GL_TEXTURE_DEPTH, &d);
+    if (tb_.target == GL_TEXTURE_CUBE_MAP) d = 6;
+    if (w <= 0) gl31_set_error(GL_INVALID_OPERATION);
+    else clear_region(tb_.target, l, 0, 0, 0, w, h, d, f, ty, data);
+    END_TEX();
+}
+
 void gl31_glGetCompressedTextureImage(GLuint t, GLint l, GLsizei bufSize, void* pixels)
 {
     WITH_TEX(t);
@@ -333,16 +440,38 @@ void gl31_glCopyNamedBufferSubData(GLuint rb, GLuint wb, GLintptr ro, GLintptr w
 /* =====================================================================
  * Framebuffers y renderbuffers
  * ===================================================================== */
-typedef struct { GLuint draw, read; } fbind_t;
+/* Ademas del estado de GLADIATOR se guarda lo que el backend tenia enlazado de verdad. En un contexto core coinciden
+ * (salvo el FBO proxy, que gl31_fbo_be_draw resuelve). En modo hibrido los enlaces los hace GL4ES y GLADIATOR no los
+ * ve: restaurar su propio estado (0) dejaba el backend en el framebuffer por defecto y GL4ES seguia creyendo enlazado
+ * su FBO (los draws siguientes iban al framebuffer equivocado, glReadBuffer(COLOR_ATTACHMENTi) fallaba). */
+typedef struct { GLuint draw, read; GLint be_draw, be_read; int foreign; } fbind_t;
 
-static void fb_push(fbind_t* b, GLuint fbo)
+static void fb_save(fbind_t* b)
 {
     gl31_state_t* s = gl31_state();
     b->draw = s->draw_fbo; b->read = s->read_fbo;
+    b->be_draw = b->be_read = -1;
+    BE(glGetIntegerv)(0x8CA6 /* GL_DRAW_FRAMEBUFFER_BINDING */, &b->be_draw);
+    BE(glGetIntegerv)(0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &b->be_read);
+    /* el backend no tiene lo que GLADIATOR cree haber enlazado: lo enlazo otra capa */
+    b->foreign = b->be_draw >= 0 && b->be_read >= 0 &&
+                 ((GLuint)b->be_draw != gl31_fbo_be_draw(b->draw) || (GLuint)b->be_read != b->read);
+}
+static void fb_push(fbind_t* b, GLuint fbo)
+{
+    fb_save(b);
     gl31_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 }
 static void fb_pop(const fbind_t* b)
 {
+    if (b->foreign) {
+        /* otra capa (GL4ES) enlazo el backend: se le devuelve exactamente lo que tenia */
+        gl31_state_t* s = gl31_state();
+        s->draw_fbo = b->draw; s->read_fbo = b->read;
+        BE(glBindFramebuffer)(GL_READ_FRAMEBUFFER, (GLuint)b->be_read);
+        BE(glBindFramebuffer)(GL_DRAW_FRAMEBUFFER, (GLuint)b->be_draw);
+        return;
+    }
     gl31_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, b->draw);
     gl31_glBindFramebuffer(GL_READ_FRAMEBUFFER, b->read);
 }
@@ -424,8 +553,7 @@ void gl31_glBlitNamedFramebuffer(GLuint rfbo, GLuint dfbo, GLint sx0, GLint sy0,
                                  GLint dx0, GLint dy0, GLint dx1, GLint dy1, GLbitfield mask, GLenum filter)
 {
     fbind_t b;
-    gl31_state_t* s = gl31_state();
-    b.draw = s->draw_fbo; b.read = s->read_fbo;
+    fb_save(&b);
     gl31_glBindFramebuffer(GL_READ_FRAMEBUFFER, rfbo);
     gl31_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dfbo);
     gl31_glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter);

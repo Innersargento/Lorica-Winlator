@@ -159,6 +159,14 @@ void APIENTRY_GL4ES gl4es_glStencilOpSeparate(GLenum face, GLenum sfail, GLenum 
     }
 }
 AliasExport(void,glStencilOpSeparate,,(GLenum face, GLenum sfail, GLenum zfail, GLenum zpass));
+// GL_ATI_separate_stencil (id Tech 4 two-sided stencil shadows): glStencilOpSeparateATI is glStencilOpSeparate; the function
+// call takes both faces at once (frontfunc, backfunc, ref, mask)
+AliasExport(void,glStencilOpSeparate,ATI,(GLenum face, GLenum sfail, GLenum zfail, GLenum zpass));
+void APIENTRY_GL4ES gl4es_glStencilFuncSeparateATI(GLenum frontfunc, GLenum backfunc, GLint ref, GLuint mask) {
+    gl4es_glStencilFuncSeparate(GL_FRONT, frontfunc, ref, mask);
+    gl4es_glStencilFuncSeparate(GL_BACK, backfunc, ref, mask);
+}
+AliasExport(void,glStencilFuncSeparateATI,,(GLenum frontfunc, GLenum backfunc, GLint ref, GLuint mask));
 
 void APIENTRY_GL4ES gl4es_glClearStencil(GLint s) {
     if(!glstate->list.pending) 

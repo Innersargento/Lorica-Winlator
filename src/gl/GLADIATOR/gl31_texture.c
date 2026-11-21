@@ -16,6 +16,7 @@
  * GLES 3.0 no tiene glGetTexLevelParameter ni texturas proxy, asi que se lleva
  * una tabla con las dimensiones/formato de cada nivel (hasta MAX_LV). */
 #include "gl31.h"
+#include "../pixel_swap.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,7 +121,8 @@
 /* slots logicos de binding por unidad */
 enum { S_1D, S_2D, S_RECT, S_3D, S_CUBE, S_1DARR, S_2DARR, S_BUF, S_2DMS, S_2DMSARR, S_CUBEARR, S_COUNT };
 
-typedef struct { GLsizei w, h, d; GLenum ifmt; } lvl_t;   /* 1D array: h = capas */
+/* 1D array: h = capas. ifmt = formato real del backend; app = el que pidio la app si es otro (gl31_storage_format) */
+typedef struct { GLsizei w, h, d; GLenum ifmt, app; } lvl_t;
 typedef struct {
     GLuint id;
     GLenum target;          /* target de desktop con el que se enlazo por primera vez (0 = ninguno) */
@@ -128,6 +130,7 @@ typedef struct {
     GLfloat bf[4];          /* TEXTURE_BORDER_COLOR (copia propia) */
     GLint   bi[4];
     int     bi_valid;       /* 1 = el ultimo valor se dio como entero (Iiv/Iuiv) */
+    int     immutable;      /* 1 = creada con glTexStorage: re-especificar un nivel da GL_INVALID_OPERATION */
 } tex_t;
 typedef struct { GLenum target; GLint level; lvl_t l; } proxy_t;
 
@@ -268,6 +271,15 @@ static tex_t* cur_tex(GLenum target)
     id = g_bound[g_active_unit][s];
     return id ? tex_get(id) : NULL;
 }
+
+/* almacenamiento inmutable (glTexStorage*): re-especificar un nivel es GL_INVALID_OPERATION (GL 4.2 / ARB_texture_storage).
+ * El driver ES lo exige, pero no todos lo cumplen, asi que se lleva la cuenta aqui. */
+static int tex_is_immutable(GLenum target)
+{
+    tex_t* t = cur_tex(target);
+    return t && t->immutable;
+}
+#define RETURN_IF_IMMUTABLE(target) do { if (tex_is_immutable(target)) { gl31_set_error(GL_INVALID_OPERATION); return; } } while (0)
 
 /* ---------- sombra de texturas comprimidas (glGetCompressedTexImage) ----------
  * ES no puede leer una textura comprimida. Cada nivel comprimido (por cara en cubos) guarda una copia de sus
@@ -699,13 +711,24 @@ static void record_level(GLenum target, GLint level, GLsizei w, GLsizei h, GLsiz
     if (level < 0 || level >= MAX_LV) return;
     t = cur_tex(target);
     if (!t) return;
-    t->lv[level].w = w; t->lv[level].h = h; t->lv[level].d = d; t->lv[level].ifmt = ifmt;
+    t->lv[level].w = w; t->lv[level].h = h; t->lv[level].d = d; t->lv[level].ifmt = ifmt; t->lv[level].app = 0;
     cs_ensure(t->id, cs_face(target), level, w, h, d, ifmt);
+}
+
+/* formato que pidio la app para los niveles [level, level+n) si el backend guarda otro */
+static void record_app(GLenum target, GLint level, GLsizei n, GLenum app)
+{
+    tex_t* t = cur_tex(target);
+    GLint l;
+    if (!t) return;
+    for (l = level; l < level + n && l < MAX_LV; l++)
+        if (l >= 0 && t->lv[l].ifmt != app) t->lv[l].app = app;
 }
 
 static void record_storage(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h, GLsizei d)
 {
     int l;
+    { tex_t* t = cur_tex(target); if (t) t->immutable = 1; }
     for (l = 0; l < levels && l < MAX_LV; l++) {
         GLsizei lw = w >> l, lh = h >> l, ld = d;
         if (target == GL_TEXTURE_3D) ld = d >> l;
@@ -730,6 +753,9 @@ static GLenum resolve_ifmt(GLint ifmt, GLenum type)
         case GL_COMPRESSED_RED:  f = GL_RED; break;
         case GL_COMPRESSED_RG:   f = GL_RG; break;
         case GL_DEPTH_COMPONENT32: return GL_DEPTH_COMPONENT32F;
+        /* EXT_texture_sRGB sin tamano: ES 3 solo admite los con tamano */
+        case 0x8C40: case 0x8C48: return GL_SRGB8;            /* SRGB, COMPRESSED_SRGB */
+        case 0x8C42: case 0x8C49: return GL_SRGB8_ALPHA8;     /* SRGB_ALPHA, COMPRESSED_SRGB_ALPHA */
     }
     if (type == GL_FLOAT) {
         switch (f) {
@@ -760,6 +786,8 @@ static GLenum resolve_ifmt(GLint ifmt, GLenum type)
 static GLenum map_ifmt(GLenum f)
 {
     if (f == GL_DEPTH_COMPONENT32) return GL_DEPTH_COMPONENT32F;
+    if (f == 0x8C40 || f == 0x8C48) return GL_SRGB8;
+    if (f == 0x8C42 || f == 0x8C49) return GL_SRGB8_ALPHA8;
     return f;
 }
 
@@ -769,6 +797,15 @@ typedef struct {
     unsigned char r, g, b, a, d, s, shared;
     GLenum type;     /* tipo de los canales de color (o de profundidad) */
 } fmtinfo_t;
+
+#define F_R16          0x822A
+#define F_RG16         0x822C
+#define F_RGB16        0x8054
+#define F_RGBA16       0x805B
+#define F_R16_SNORM    0x8F98
+#define F_RG16_SNORM   0x8F99
+#define F_RGB16_SNORM  0x8F9A
+#define F_RGBA16_SNORM 0x8F9B
 
 #define T_UN GL_UNSIGNED_NORMALIZED
 #define T_SN GL_SIGNED_NORMALIZED
@@ -808,6 +845,11 @@ static const fmtinfo_t k_fmt[] = {
     { GL_DEPTH_COMPONENT24, 0,0,0,0,24,0,0, T_UN }, { GL_DEPTH_COMPONENT32F, 0,0,0,0,32,0,0, T_FL },
     { GL_DEPTH24_STENCIL8, 0,0,0,0,24,8,0, T_UN }, { GL_DEPTH32F_STENCIL8, 0,0,0,0,32,8,0, T_FL },
     { GL_DEPTH_STENCIL, 0,0,0,0,24,8,0, T_UN },
+    /* 16 bits normalizados (desktop; en ES con EXT_texture_norm16) */
+    { F_R16, 16,0,0,0,0,0,0, T_UN }, { F_RG16, 16,16,0,0,0,0,0, T_UN },
+    { F_RGB16, 16,16,16,0,0,0,0, T_UN }, { F_RGBA16, 16,16,16,16,0,0,0, T_UN },
+    { F_R16_SNORM, 16,0,0,0,0,0,0, T_SN }, { F_RG16_SNORM, 16,16,0,0,0,0,0, T_SN },
+    { F_RGB16_SNORM, 16,16,16,0,0,0,0, T_SN }, { F_RGBA16_SNORM, 16,16,16,16,0,0,0, T_SN },
 };
 #define N_FMT ((int)(sizeof k_fmt / sizeof k_fmt[0]))
 
@@ -829,7 +871,8 @@ static int pair_for_ifmt(GLenum rf, GLenum* format, GLenum* type)
     if (fi->type == T_FL) *type = fi->r > 16 ? GL_FLOAT : GL_HALF_FLOAT;
     if (fi->type == T_IN) *type = GL_INT;
     if (fi->type == T_UI) *type = GL_UNSIGNED_INT;
-    if (fi->type == T_SN) *type = GL_BYTE;
+    if (fi->type == T_SN) *type = fi->r == 16 ? GL_SHORT : GL_BYTE;
+    if (fi->type == T_UN && fi->r == 16) *type = GL_UNSIGNED_SHORT;
     if (fi->type == T_IN || fi->type == T_UI)
         *format = nc == 1 ? GL_RED_INTEGER : nc == 2 ? GL_RG_INTEGER : nc == 3 ? GL_RGB_INTEGER : GL_RGBA_INTEGER;
     else
@@ -840,6 +883,72 @@ static int pair_for_ifmt(GLenum rf, GLenum* format, GLenum* type)
     else if (rf == GL_RGB10_A2) *type = GL_UNSIGNED_INT_2_10_10_10_REV;
     else if (rf == GL_RGB10_A2UI) *type = GL_UNSIGNED_INT_2_10_10_10_REV;
     return 1;
+}
+
+/* ---------- formato de almacenamiento segun lo que el backend puede muestrear Y renderizar ----------
+ * Desktop tiene formatos que ES no tiene, o tiene sin poder renderizar en ellos: 16 bits normalizados (EXT_texture_norm16),
+ * SNORM (renderizables solo con EXT_render_snorm) y los RGB de 3 componentes (RGB16, RGB8_SNORM, RGB16F, RGB32F: ES no
+ * renderiza ninguno). Como hacen Mesa/ANGLE con los formatos emulados, se guarda el formato pedido si el backend lo puede
+ * muestrear y renderizar, y si no el mas parecido con al menos la misma precision (RGB -> RGBA, el alfa queda en 1 al subir;
+ * UNORM16/SNORM sin soporte -> float). Las subidas que no casan con el par formato/tipo que ES exige para ese almacenamiento
+ * se convierten en CPU (upload_prepare). */
+GLenum gl31_storage_format(GLenum f)
+{
+    const int n16 = gl31_caps.norm16, sn = gl31_caps.render_snorm;
+    const int f32 = gl31_caps.float_buffer && gl31_caps.float_linear;   /* 32F renderizable y filtrable */
+    switch (f) {
+        case F_R16:            return n16 ? F_R16 : (f32 ? GL_R32F : GL_R16F);
+        case F_RG16:           return n16 ? F_RG16 : (f32 ? GL_RG32F : GL_RG16F);
+        case F_RGB16:
+        case F_RGBA16:         return n16 ? F_RGBA16 : GL_RGBA16F;
+        case GL_R8_SNORM:      return sn ? GL_R8_SNORM : GL_R16F;
+        case GL_RG8_SNORM:     return sn ? GL_RG8_SNORM : GL_RG16F;
+        case GL_RGB8_SNORM:
+        case GL_RGBA8_SNORM:   return sn ? GL_RGBA8_SNORM : GL_RGBA16F;
+        case F_R16_SNORM:      return (n16 && sn) ? F_R16_SNORM : (f32 ? GL_R32F : GL_R16F);
+        case F_RG16_SNORM:     return (n16 && sn) ? F_RG16_SNORM : (f32 ? GL_RG32F : GL_RG16F);
+        case F_RGB16_SNORM:
+        case F_RGBA16_SNORM:   return (n16 && sn) ? F_RGBA16_SNORM : (f32 ? GL_RGBA32F : GL_RGBA16F);
+        case GL_RGB16F:        return GL_RGBA16F;
+        case GL_RGB32F:        return f32 ? GL_RGBA32F : GL_RGBA16F;
+    }
+    return f;
+}
+
+/* almacenamientos cuyas subidas se validan contra los pares de ES (los demas pasan tal cual, como antes) */
+static int fmt_managed(GLenum rf)
+{
+    const fmtinfo_t* fi = fmt_lookup(rf);
+    if (!fi || fi->d || fi->shared || rf == GL_R11F_G11F_B10F) return 0;
+    if (rf == GL_RGB10_A2) return 1;
+    return fi->type == T_FL || fi->type == T_SN || (fi->type == T_UN && fi->r == 16);
+}
+
+static int fmt_comps(const fmtinfo_t* fi) { return (fi->r != 0) + (fi->g != 0) + (fi->b != 0) + (fi->a != 0); }
+
+/* par formato/tipo que ES acepta para subir a `rf` (tabla 3.2 de ES 3.0 + EXT_texture_norm16) */
+static int es_pair_ok(GLenum rf, GLenum format, GLenum type)
+{
+    const fmtinfo_t* fi = fmt_lookup(rf);
+    int nc;
+    if (!fi) return 1;
+    nc = fmt_comps(fi);
+    if (format != (nc == 1 ? GL_RED : nc == 2 ? GL_RG : nc == 3 ? GL_RGB : GL_RGBA)) return 0;
+    if (rf == GL_RGB10_A2) return type == GL_UNSIGNED_INT_2_10_10_10_REV;
+    switch (fi->type) {
+        case T_FL: return type == GL_FLOAT || (fi->r == 16 && type == GL_HALF_FLOAT);
+        case T_SN: return type == (fi->r == 16 ? GL_SHORT : GL_BYTE);
+        case T_UN: return type == (fi->r == 16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE);
+    }
+    return 1;
+}
+
+/* par con el que se sube a `rf` lo convertido en CPU (los float siempre como FLOAT) */
+static void canon_pair(GLenum rf, GLenum* format, GLenum* type)
+{
+    const fmtinfo_t* fi = fmt_lookup(rf);
+    if (!pair_for_ifmt(rf, format, type)) { *format = GL_RGBA; *type = GL_UNSIGNED_BYTE; return; }
+    if (fi && fi->type == T_FL) *type = GL_FLOAT;
 }
 
 /* ---------- ambiguedad entre targets que comparten el slot del backend ---------- */
@@ -1025,7 +1134,8 @@ static int is_lod_param(GLenum p) { return p == GL_TEXTURE_MIN_LOD || p == GL_TE
 /* sin equivalente en ES (BORDER_COLOR se maneja aparte) */
 static int ignored_param(GLenum p)
 {
-    return p == GL_TEXTURE_LOD_BIAS || p == GL_DEPTH_TEXTURE_MODE || p == GL_GENERATE_MIPMAP;
+    /* GL_TEXTURE_CUBE_MAP_SEAMLESS por textura (ARB_seamless_cubemap_per_texture): ES siempre filtra sin costuras */
+    return p == GL_TEXTURE_LOD_BIAS || p == GL_DEPTH_TEXTURE_MODE || p == GL_GENERATE_MIPMAP || p == GL_TEXTURE_CUBE_MAP_SEAMLESS;
 }
 
 /* restricciones de GL_TEXTURE_RECTANGLE; 1 = valido */
@@ -1269,7 +1379,7 @@ void gl31_glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLi
         case GL_TEXTURE_WIDTH:           *params = l->w; return;
         case GL_TEXTURE_HEIGHT:          *params = l->h; return;
         case GL_TEXTURE_DEPTH:           *params = l->d; return;
-        case GL_TEXTURE_INTERNAL_FORMAT: *params = (GLint)l->ifmt; return;
+        case GL_TEXTURE_INTERNAL_FORMAT: *params = (GLint)(l->app ? l->app : l->ifmt); return;   /* el que pidio la app */
         case GL_TEXTURE_BORDER:          *params = 0; return;
         default: break;
     }
@@ -1324,10 +1434,23 @@ void gl31_glTexStorage1D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w)
     if (target == GL_PROXY_TEXTURE_1D) { proxy_set(target, 0, w, 1, 1, map_ifmt(ifmt)); return; }
     if (target != GL_TEXTURE_1D) { gl31_set_error(GL_INVALID_ENUM); return; }
     if (levels < 1 || w < 1 || levels > max_levels(w, 1, 1)) { gl31_set_error(GL_INVALID_VALUE); return; }
-    ifmt = map_ifmt(ifmt);
-    BE(glTexStorage2D)(GL_TEXTURE_2D, levels, ifmt, w, 1);
-    record_storage(GL_TEXTURE_1D, levels, ifmt, w, 1, 1);
+    {   GLenum app = map_ifmt(ifmt);
+        ifmt = gl31_storage_format(app);
+        BE(glTexStorage2D)(GL_TEXTURE_2D, levels, ifmt, w, 1);
+        record_storage(GL_TEXTURE_1D, levels, ifmt, w, 1, 1);
+        record_app(GL_TEXTURE_1D, 0, levels, app);
+    }
 }
+
+/* transcodificacion de comprimidos sin soporte del backend (definida mas abajo, con los uploads comprimidos) */
+typedef struct { GLenum ifmt, fmt, type; int bpp, block; } tc_fmt_t;
+static int tc_lookup(GLenum f, tc_fmt_t* o);
+#ifndef GL_COMPRESSED_RED_RGTC1
+#define GL_COMPRESSED_RED_RGTC1        0x8DBB
+#define GL_COMPRESSED_SIGNED_RED_RGTC1 0x8DBC
+#define GL_COMPRESSED_RG_RGTC2         0x8DBD
+#define GL_COMPRESSED_SIGNED_RG_RGTC2  0x8DBE
+#endif
 
 void gl31_glTexStorage2D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h)
 {
@@ -1348,9 +1471,14 @@ void gl31_glTexStorage2D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, 
         return;
     }
     ifmt = map_ifmt(ifmt);
-    if (target == GL_TEXTURE_1D_ARRAY) BE(glTexStorage3D)(GL_TEXTURE_2D_ARRAY, levels, ifmt, w, 1, h);
-    else                               BE(glTexStorage2D)(gl31_tex_be_target(target), levels, ifmt, w, h);
-    record_storage(target, levels, ifmt, w, h, 1);
+    { tc_fmt_t t; if (tc_lookup(ifmt, &t)) ifmt = t.ifmt; }   /* S3TC/RGTC sin soporte: almacenamiento sin comprimir */
+    {   GLenum app = ifmt;
+        ifmt = gl31_storage_format(app);
+        if (target == GL_TEXTURE_1D_ARRAY) BE(glTexStorage3D)(GL_TEXTURE_2D_ARRAY, levels, ifmt, w, 1, h);
+        else                               BE(glTexStorage2D)(gl31_tex_be_target(target), levels, ifmt, w, h);
+        record_storage(target, levels, ifmt, w, h, 1);
+        record_app(target, 0, levels, app);
+    }
 }
 
 void gl31_glTexStorage3D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h, GLsizei d)
@@ -1371,6 +1499,16 @@ void gl31_glTexStorage3D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, 
         return;
     }
     ifmt = map_ifmt(ifmt);
+    { tc_fmt_t t; if (tc_lookup(ifmt, &t)) ifmt = t.ifmt; }
+    {   GLenum app = ifmt;
+        ifmt = gl31_storage_format(app);
+        if (app != ifmt) {
+            BE(glTexStorage3D)(target, levels, ifmt, w, h, d);
+            record_storage(target, levels, ifmt, w, h, d);
+            record_app(target, 0, levels, app);
+            return;
+        }
+    }
     BE(glTexStorage3D)(target, levels, ifmt, w, h, d);
     record_storage(target, levels, ifmt, w, h, d);
 }
@@ -1476,10 +1614,12 @@ typedef struct {
     void* buf;
     int   fail, restore, gpu;
     GLint a, rl, sr, sp, ih, si;
+    void* sw;       /* GL_UNPACK_SWAP_BYTES: the swapped copy of the application's pixels */
+    int   sw_pbo;   /* the copy replaced the unpack PBO, which stays unbound in the backend until bgra_done */
 } bgra_t;
 
 static const void* bgra_prepare_cpu(GLenum* format, GLenum* type, GLsizei w, GLsizei h, GLsizei d,
-                                    const void* pixels, bgra_t* b)
+                                    const void* pixels, bgra_t* b, GLuint pbo)
 {
     gl31_state_t* s = gl31_state();
     size_t rl, ih, stride, row, k, j, i;
@@ -1489,8 +1629,8 @@ static const void* bgra_prepare_cpu(GLenum* format, GLenum* type, GLsizei w, GLs
     memset(b, 0, sizeof *b);
     if (*format != GL_BGRA) return pixels;
     if (*type == GL_UNSIGNED_INT_8_8_8_8_REV) *type = GL_UNSIGNED_BYTE;
-    if (*type != GL_UNSIGNED_BYTE || s->pixel_unpack_buffer) {
-        gl31_stub_warn(s->pixel_unpack_buffer ? "GL_BGRA con PIXEL_UNPACK_BUFFER"
+    if (*type != GL_UNSIGNED_BYTE || pbo) {
+        gl31_stub_warn(pbo ? "GL_BGRA con PIXEL_UNPACK_BUFFER"
                                               : "GL_BGRA con tipo distinto de UNSIGNED_BYTE");
         gl31_set_error(GL_INVALID_OPERATION);
         b->fail = 1;
@@ -1585,8 +1725,8 @@ static int bgra_gpu_prog(void)
 
 void gl31_texture_gpu_shutdown(void) { g_bg_prog = g_bg_in = g_bg_out = 0; g_bg_in_cap = g_bg_out_cap = 0; g_bg_state = 0; }
 
-static const void* bgra_prepare(GLenum* format, GLenum* type, GLsizei w, GLsizei h, GLsizei d,
-                                const void* pixels, bgra_t* b)
+static const void* bgra_prepare_fmt(GLenum* format, GLenum* type, GLsizei w, GLsizei h, GLsizei d,
+                                    const void* pixels, bgra_t* b, GLuint pbo)
 {
     gl31_state_t* s = gl31_state();
     size_t rl, ih, stride, need, n, outbytes;
@@ -1595,13 +1735,13 @@ static const void* bgra_prepare(GLenum* format, GLenum* type, GLsizei w, GLsizei
     GLint sv_ssbo = 0, sv_id0 = 0, sv_id1 = 0;
     GLint64 sv_s0 = 0, sv_z0 = 0, sv_s1 = 0, sv_z1 = 0;
 
-    if (*format != GL_BGRA || !bgra_gpu_prog()) return bgra_prepare_cpu(format, type, w, h, d, pixels, b);
+    if (*format != GL_BGRA || !bgra_gpu_prog()) return bgra_prepare_cpu(format, type, w, h, d, pixels, b, pbo);
     if (*type == GL_UNSIGNED_INT_8_8_8_8_REV) *type = GL_UNSIGNED_BYTE;
-    if (*type != GL_UNSIGNED_BYTE) return bgra_prepare_cpu(format, type, w, h, d, pixels, b);
+    if (*type != GL_UNSIGNED_BYTE) return bgra_prepare_cpu(format, type, w, h, d, pixels, b, pbo);
     memset(b, 0, sizeof *b);
     *format = GL_RGBA;
     if (w <= 0 || h <= 0 || d <= 0) return pixels;
-    if (!s->pixel_unpack_buffer && !pixels) return pixels;
+    if (!pbo && !pixels) return pixels;
 
     rl = s->unpack_row_length > 0 ? (size_t)s->unpack_row_length : (size_t)w;
     ih = s->unpack_image_height > 0 ? (size_t)s->unpack_image_height : (size_t)h;
@@ -1619,8 +1759,8 @@ static const void* bgra_prepare(GLenum* format, GLenum* type, GLsizei w, GLsizei
     BE(glGetInteger64i_v)(GL_SHADER_STORAGE_BUFFER_START, 1, &sv_s1);
     BE(glGetInteger64i_v)(GL_SHADER_STORAGE_BUFFER_SIZE, 1, &sv_z1);
 
-    if (s->pixel_unpack_buffer) {
-        src_buf = s->pixel_unpack_buffer;
+    if (pbo) {
+        src_buf = pbo;
         src_off = (GLintptr)(intptr_t)pixels;
     } else {                                       /* memoria de la app: una copia a un buffer de GPU */
         size_t cap = (need + 16u + 255u) & ~(size_t)255u;
@@ -1675,6 +1815,55 @@ static const void* bgra_prepare(GLenum* format, GLenum* type, GLsizei w, GLsizei
     return (const void*)0;
 }
 
+/* Every pixel upload goes through here: GL_UNPACK_SWAP_BYTES first, then BGRA.
+ * GL_UNPACK_SWAP_BYTES does not exist in ES. With it on and a type of 16 or 32-bit elements, the application's pixels (from
+ * memory or from the unpack PBO) are copied in their own layout with each element's bytes swapped (pixel_swap.h), and the
+ * copy goes on as client memory; the backend's unpack PBO stays unbound until bgra_done. is3d: the transfer uses
+ * GL_UNPACK_IMAGE_HEIGHT / SKIP_IMAGES. */
+static const void* bgra_prepare(GLenum* format, GLenum* type, GLsizei w, GLsizei h, GLsizei d, int is3d,
+                                const void* pixels, bgra_t* b)
+{
+    gl31_state_t* s = gl31_state();
+    GLuint pbo = s->pixel_unpack_buffer;
+    void* sw = NULL;
+    const void* px;
+    if (s->unpack_swap_bytes && pxs_elem_size(*type) > 1 && w > 0 && h > 0 && d > 0 && (pixels || pbo)) {
+        pxs_layout_t L;
+        size_t span;
+        L.align = s->unpack_alignment;
+        L.row_length = s->unpack_row_length;
+        L.skip_pixels = s->unpack_skip_pixels;
+        L.skip_rows = s->unpack_skip_rows;
+        L.image_height = is3d ? s->unpack_image_height : 0;
+        L.skip_images = is3d ? s->unpack_skip_images : 0;
+        span = pxs_span(w, h, d, *format, *type, &L);
+        if (span) {
+            const void* src = pixels;
+            void* mapped = NULL;
+            if (pbo) {
+                mapped = BE(glMapBufferRange)(GL_PIXEL_UNPACK_BUFFER, (GLintptr)(intptr_t)pixels, (GLsizeiptr)span, GL_MAP_READ_BIT);
+                if (!mapped) { memset(b, 0, sizeof *b); gl31_set_error(GL_INVALID_OPERATION); b->fail = 1; return NULL; }
+                src = mapped;
+            }
+            sw = pxs_swapped_copy(src, w, h, d, *format, *type, &L);
+            if (mapped) BE(glUnmapBuffer)(GL_PIXEL_UNPACK_BUFFER);
+            if (!sw) { memset(b, 0, sizeof *b); gl31_set_error(GL_OUT_OF_MEMORY); b->fail = 1; return NULL; }
+            if (pbo) BE(glBindBuffer)(GL_PIXEL_UNPACK_BUFFER, 0);
+            pixels = sw;
+        }
+    }
+    px = bgra_prepare_fmt(format, type, w, h, d, pixels, b, sw ? 0 : pbo);
+    b->sw = sw;                         /* after: the BGRA stage clears *b */
+    b->sw_pbo = (sw && pbo);
+    if (b->fail) {                      /* callers skip bgra_done on failure */
+        if (b->sw_pbo) BE(glBindBuffer)(GL_PIXEL_UNPACK_BUFFER, pbo);
+        free(sw);
+        b->sw = NULL;
+        b->sw_pbo = 0;
+    }
+    return px;
+}
+
 static void bgra_done(bgra_t* b)
 {
     if (b->restore) {
@@ -1685,19 +1874,216 @@ static void bgra_done(bgra_t* b)
         BE(glPixelStorei)(GL_UNPACK_IMAGE_HEIGHT, b->ih);
         BE(glPixelStorei)(GL_UNPACK_SKIP_IMAGES, b->si);
     }
-    if (b->gpu) BE(glBindBuffer)(GL_PIXEL_UNPACK_BUFFER, gl31_state()->pixel_unpack_buffer);
+    if (b->gpu || b->sw_pbo) BE(glBindBuffer)(GL_PIXEL_UNPACK_BUFFER, gl31_state()->pixel_unpack_buffer);
     free(b->buf);
+    free(b->sw);
+}
+
+/* ---- conversion en CPU de una subida al par que ES exige para el almacenamiento (gl31_storage_format) ----
+ * Desktop convierte cualquier formato/tipo de la app al formato interno (normalizando los enteros, rellenando G/B con 0
+ * y A con 1); ES solo acepta un par fijo por formato. Se decodifica cada pixel a RGBA float respetando GL_UNPACK_* (y
+ * SWAP_BYTES, y el PBO de unpack) y se codifica en el par de canon_pair. */
+#ifndef GL_BGR
+#define GL_BGR 0x80E0
+#endif
+
+static float cv_half(unsigned short h)
+{
+    unsigned s = (h >> 15) & 1u, e = (h >> 10) & 31u, m = h & 1023u;
+    float v;
+    if (e == 0) v = (float)m * (1.0f / 16777216.0f);                 /* subnormal: m * 2^-24 */
+    else if (e == 31) v = m ? 0.0f : 65504.0f;                       /* NaN -> 0, inf -> max */
+    else { v = (float)(m | 1024u) * (1.0f / 1024.0f); v *= (e >= 15) ? (float)(1u << (e - 15)) : 1.0f / (float)(1u << (15 - e)); }
+    return s ? -v : v;
+}
+
+/* componentes y bytes por elemento del par de la app; 2 = tipo empaquetado de 32 bits; 0 = el conversor no lo admite */
+static int cv_src(GLenum format, GLenum type, int* nc, int* esz)
+{
+    switch (format) {
+        case GL_RED: case GL_ALPHA: case GL_LUMINANCE: *nc = 1; break;
+        case GL_RG: case GL_LUMINANCE_ALPHA:           *nc = 2; break;
+        case GL_RGB: case GL_BGR:                      *nc = 3; break;
+        case GL_RGBA: case GL_BGRA:                    *nc = 4; break;
+        default: return 0;
+    }
+    switch (type) {
+        case GL_UNSIGNED_BYTE: case GL_BYTE:                       *esz = 1; return 1;
+        case GL_UNSIGNED_SHORT: case GL_SHORT: case GL_HALF_FLOAT: *esz = 2; return 1;
+        case GL_UNSIGNED_INT: case GL_INT: case GL_FLOAT:          *esz = 4; return 1;
+        case GL_UNSIGNED_INT_2_10_10_10_REV:                       *esz = 4; return *nc == 4 ? 2 : 0;
+    }
+    return 0;
+}
+
+static float cv_elem(const unsigned char* p, GLenum type, int swap)
+{
+    unsigned char b[4];
+    size_t n = (type == GL_UNSIGNED_BYTE || type == GL_BYTE) ? 1 : (type == GL_UNSIGNED_SHORT || type == GL_SHORT || type == GL_HALF_FLOAT) ? 2 : 4;
+    size_t k;
+    for (k = 0; k < n; k++) b[k] = p[swap ? n - 1 - k : k];
+    switch (type) {
+        case GL_UNSIGNED_BYTE:  return (float)b[0] / 255.0f;
+        case GL_BYTE:           { float v = (float)(signed char)b[0] / 127.0f; return v < -1.0f ? -1.0f : v; }
+        case GL_UNSIGNED_SHORT: { unsigned short u; memcpy(&u, b, 2); return (float)u / 65535.0f; }
+        case GL_SHORT:          { short u; float v; memcpy(&u, b, 2); v = (float)u / 32767.0f; return v < -1.0f ? -1.0f : v; }
+        case GL_HALF_FLOAT:     { unsigned short u; memcpy(&u, b, 2); return cv_half(u); }
+        case GL_UNSIGNED_INT:   { GLuint u; memcpy(&u, b, 4); return (float)((double)u / 4294967295.0); }
+        case GL_INT:            { GLint u; float v; memcpy(&u, b, 4); v = (float)((double)u / 2147483647.0); return v < -1.0f ? -1.0f : v; }
+        default:                { float f; memcpy(&f, b, 4); return f; }
+    }
+}
+
+static int cv_round(float v) { return (int)(v >= 0.0f ? v + 0.5f : v - 0.5f); }
+
+/* bloque de la app -> bloque empaquetado en el par canonico de `rf` (malloc). NULL si el par no se admite o falta memoria. */
+static void* cv_convert(GLenum rf, GLenum format, GLenum type, GLsizei w, GLsizei h, GLsizei d, int is3d, const void* pixels,
+                        size_t* span_out)
+{
+    gl31_state_t* s = gl31_state();
+    const fmtinfo_t* fo = fmt_lookup(rf);
+    int nc, esz, kind = cv_src(format, type, &nc, &esz), no, osz, swap;
+    size_t psz, rl, rowb, stride, ih, si, k, j, i;
+    unsigned char* out;
+    unsigned char* o;
+    if (!kind || !fo) return NULL;
+    no = fmt_comps(fo);
+    osz = rf == GL_RGB10_A2 ? 4 : fo->type == T_FL ? 4 : fo->r == 16 ? 2 : 1;
+    psz = kind == 2 ? 4u : (size_t)nc * (size_t)esz;
+    rl = s->unpack_row_length > 0 ? (size_t)s->unpack_row_length : (size_t)w;
+    rowb = rl * psz;
+    stride = ((size_t)esz >= (size_t)s->unpack_alignment) ? rowb
+           : ((rowb + (size_t)s->unpack_alignment - 1) / (size_t)s->unpack_alignment) * (size_t)s->unpack_alignment;
+    ih = (is3d && s->unpack_image_height > 0) ? (size_t)s->unpack_image_height : (size_t)h;
+    si = is3d ? (size_t)s->unpack_skip_images : 0;
+    *span_out = ((si + (size_t)d - 1) * ih + (size_t)s->unpack_skip_rows + (size_t)h - 1) * stride +
+                ((size_t)s->unpack_skip_pixels + (size_t)w) * psz;
+    if (!pixels) return NULL;
+    swap = s->unpack_swap_bytes && esz > 1;
+    out = (unsigned char*)malloc((size_t)w * (size_t)h * (size_t)d * (size_t)(rf == GL_RGB10_A2 ? 1 : no) * (size_t)osz);
+    if (!out) return NULL;
+    o = out;
+    for (k = 0; k < (size_t)d; k++)
+        for (j = 0; j < (size_t)h; j++) {
+            const unsigned char* p = (const unsigned char*)pixels + ((si + k) * ih + (size_t)s->unpack_skip_rows + j) * stride +
+                                     (size_t)s->unpack_skip_pixels * psz;
+            for (i = 0; i < (size_t)w; i++, p += psz) {
+                float c[4] = { 0.0f, 0.0f, 0.0f, 1.0f }, v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                int q;
+                if (kind == 2) {
+                    GLuint u; unsigned char bb[4];
+                    for (q = 0; q < 4; q++) bb[q] = p[swap ? 3 - q : q];
+                    memcpy(&u, bb, 4);
+                    c[0] = (float)(u & 1023u) / 1023.0f; c[1] = (float)((u >> 10) & 1023u) / 1023.0f;
+                    c[2] = (float)((u >> 20) & 1023u) / 1023.0f; c[3] = (float)(u >> 30) / 3.0f;
+                } else {
+                    for (q = 0; q < nc; q++) c[q] = cv_elem(p + (size_t)q * (size_t)esz, type, swap);
+                }
+                switch (format) {
+                    case GL_RED:             v[0] = c[0]; break;
+                    case GL_ALPHA:           v[3] = c[0]; break;
+                    case GL_LUMINANCE:       v[0] = v[1] = v[2] = c[0]; break;
+                    case GL_LUMINANCE_ALPHA: v[0] = v[1] = v[2] = c[0]; v[3] = c[1]; break;
+                    case GL_RG:              v[0] = c[0]; v[1] = c[1]; break;
+                    case GL_RGB:             v[0] = c[0]; v[1] = c[1]; v[2] = c[2]; break;
+                    case GL_BGR:             v[0] = c[2]; v[1] = c[1]; v[2] = c[0]; break;
+                    case GL_BGRA:            v[0] = c[2]; v[1] = c[1]; v[2] = c[0]; v[3] = c[3]; break;
+                    default:                 v[0] = c[0]; v[1] = c[1]; v[2] = c[2]; v[3] = c[3]; break;
+                }
+                if (rf == GL_RGB10_A2) {
+                    GLuint u = 0;
+                    for (q = 0; q < 4; q++) {
+                        float x = v[q] < 0.0f ? 0.0f : v[q] > 1.0f ? 1.0f : v[q];
+                        u |= (GLuint)cv_round(x * (q == 3 ? 3.0f : 1023.0f)) << (10 * q);
+                    }
+                    memcpy(o, &u, 4); o += 4;
+                    continue;
+                }
+                for (q = 0; q < no; q++) {
+                    float x = v[q];
+                    if (fo->type == T_FL) { memcpy(o, &x, 4); o += 4; }
+                    else if (fo->type == T_SN) {
+                        x = x < -1.0f ? -1.0f : x > 1.0f ? 1.0f : x;
+                        if (osz == 2) { short z = (short)cv_round(x * 32767.0f); memcpy(o, &z, 2); o += 2; }
+                        else { *o++ = (unsigned char)(signed char)cv_round(x * 127.0f); }
+                    } else {
+                        x = x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x;
+                        if (osz == 2) { unsigned short z = (unsigned short)cv_round(x * 65535.0f); memcpy(o, &z, 2); o += 2; }
+                        else { *o++ = (unsigned char)cv_round(x * 255.0f); }
+                    }
+                }
+            }
+        }
+    return out;
+}
+
+/* almacenamiento real de un nivel ya especificado (0 si no se conoce) */
+static GLenum level_fmt(GLenum target, GLint level)
+{
+    tex_t* t = cur_tex(target);
+    return (t && level >= 0 && level < MAX_LV) ? t->lv[level].ifmt : 0;
+}
+
+/* Subida a un nivel cuyo almacenamiento real es `rf`: si el par de la app no vale en ES para ese almacenamiento (RGB+USHORT
+ * en un RGBA16, BYTE en un RGBA16F...), se sube convertido; si no, sigue el camino de siempre (SWAP_BYTES, BGRA). */
+static const void* upload_prepare(GLenum rf, GLenum* format, GLenum* type, GLsizei w, GLsizei h, GLsizei d, int is3d,
+                                  const void* pixels, bgra_t* b)
+{
+    gl31_state_t* s = gl31_state();
+    GLuint pbo = s->pixel_unpack_buffer;
+    GLenum of, ot;
+    size_t span = 0;
+    const void* src = pixels;
+    void* mapped = NULL;
+    void* cv;
+    if (!fmt_managed(rf) || es_pair_ok(rf, *format, *type))
+        return bgra_prepare(format, type, w, h, d, is3d, pixels, b);
+    memset(b, 0, sizeof *b);
+    canon_pair(rf, &of, &ot);
+    if ((!pixels && !pbo) || w <= 0 || h <= 0 || d <= 0) {   /* sin datos: basta con un par valido */
+        *format = of; *type = ot;
+        return pixels;
+    }
+    cv_convert(rf, *format, *type, w, h, d, is3d, NULL, &span);
+    if (!span) {
+        static int warned;
+        if (!warned++) gl31_log("LORICA TEX: no conversion from 0x%x/0x%x to storage 0x%x, uploaded as is", *format, *type, rf);
+        return bgra_prepare(format, type, w, h, d, is3d, pixels, b);
+    }
+    if (pbo) {
+        mapped = BE(glMapBufferRange)(GL_PIXEL_UNPACK_BUFFER, (GLintptr)(intptr_t)pixels, (GLsizeiptr)span, GL_MAP_READ_BIT);
+        if (!mapped) { gl31_set_error(GL_INVALID_OPERATION); b->fail = 1; return NULL; }
+        src = mapped;
+    }
+    cv = cv_convert(rf, *format, *type, w, h, d, is3d, src, &span);
+    if (mapped) BE(glUnmapBuffer)(GL_PIXEL_UNPACK_BUFFER);
+    if (!cv) { gl31_set_error(GL_OUT_OF_MEMORY); b->fail = 1; return NULL; }
+    /* el bloque ya esta empaquetado: desempaquetado por defecto y sin PBO hasta bgra_done */
+    b->buf = cv;
+    b->a = s->unpack_alignment; b->rl = s->unpack_row_length; b->sr = s->unpack_skip_rows;
+    b->sp = s->unpack_skip_pixels; b->ih = s->unpack_image_height; b->si = s->unpack_skip_images;
+    BE(glPixelStorei)(GL_UNPACK_ALIGNMENT, 1);
+    BE(glPixelStorei)(GL_UNPACK_ROW_LENGTH, 0);
+    BE(glPixelStorei)(GL_UNPACK_SKIP_ROWS, 0);
+    BE(glPixelStorei)(GL_UNPACK_SKIP_PIXELS, 0);
+    BE(glPixelStorei)(GL_UNPACK_IMAGE_HEIGHT, 0);
+    BE(glPixelStorei)(GL_UNPACK_SKIP_IMAGES, 0);
+    b->restore = 1;
+    if (pbo) { BE(glBindBuffer)(GL_PIXEL_UNPACK_BUFFER, 0); b->sw_pbo = 1; }
+    *format = of; *type = ot;
+    return cv;
 }
 
 void gl31_glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint border,
                        GLenum format, GLenum type, const void* pixels)
 {
-    GLenum rf = resolve_ifmt(ifmt, type);
+    GLenum app = resolve_ifmt(ifmt, type), rf = gl31_storage_format(app);
     if (proxy_2d_family(target)) {
         if (border != 0) { gl31_set_error(GL_INVALID_VALUE); return; }
-        proxy_set(target, level, w, h, 1, rf);
+        proxy_set(target, level, w, h, 1, app);
         return;
     }
+    RETURN_IF_IMMUTABLE(target);
     if (!is_2d_target(target)) { gl31_set_error(GL_INVALID_ENUM); return; }
     if (border != 0 || w < 0 || h < 0 || !level_ok(level)) {
         if (border != 0 || w < 0 || h < 0) gl31_set_error(GL_INVALID_VALUE);
@@ -1708,27 +2094,40 @@ void gl31_glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsize
 
     {
         bgra_t bg;
-        const void* px = bgra_prepare(&format, &type, w, h, 1, pixels, &bg);
+        GLenum f0 = format, t0 = type;
+        const void* px = upload_prepare(rf, &format, &type, w, h, 1, 0, pixels, &bg);
         if (bg.fail) return;
+        if (gl31_diag()) while (BE(glGetError)() != GL_NO_ERROR) {}
         if (target == GL_TEXTURE_1D_ARRAY)
             BE(glTexImage3D)(GL_TEXTURE_2D_ARRAY, level, (GLint)rf, w, 1, h, 0, format, type, px);
         else
             BE(glTexImage2D)(gl31_tex_be_target(target), level, (GLint)rf, w, h, 0, format, type, px);
+        if (gl31_diag()) {
+            GLenum e = BE(glGetError)();
+            static int nerr;
+            if (e != GL_NO_ERROR && nerr < 40) {
+                nerr++;
+                gl31_log("LORICA TEX: error 0x%x in TexImage2D target 0x%x level %d %dx%d: internal format 0x%x (resolved 0x%x) -> storage 0x%x, pair 0x%x/0x%x sent as 0x%x/0x%x, data %p",
+                         e, target, level, w, h, ifmt, app, rf, f0, t0, format, type, pixels);
+            }
+        }
         bgra_done(&bg);
     }
     record_level(target, level, w, h, 1, rf);
+    record_app(target, level, 1, app);
 }
 
 void gl31_glTexImage3D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLsizei d,
                        GLint border, GLenum format, GLenum type, const void* pixels)
 {
-    GLenum rf = resolve_ifmt(ifmt, type);
+    GLenum app = resolve_ifmt(ifmt, type), rf = gl31_storage_format(app);
     if (target == GL_PROXY_TEXTURE_3D || target == GL_PROXY_TEXTURE_2D_ARRAY || target == GL_PROXY_TEXTURE_CUBE_MAP_ARRAY) {
         if (border != 0) { gl31_set_error(GL_INVALID_VALUE); return; }
-        proxy_set(target, level, w, h, d, rf);
+        proxy_set(target, level, w, h, d, app);
         return;
     }
     if (!is_3d_target(target)) { if (target == GL_TEXTURE_CUBE_MAP_ARRAY) warn_no_target(target); gl31_set_error(GL_INVALID_ENUM); return; }
+    RETURN_IF_IMMUTABLE(target);
     if (border != 0 || w < 0 || h < 0 || d < 0 || !level_ok(level) ||
         (target == GL_TEXTURE_CUBE_MAP_ARRAY && (w != h || d % 6))) {
         if (border != 0 || w < 0 || h < 0 || d < 0 || target == GL_TEXTURE_CUBE_MAP_ARRAY) gl31_set_error(GL_INVALID_VALUE);
@@ -1736,12 +2135,13 @@ void gl31_glTexImage3D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsize
     }
     {
         bgra_t bg;
-        const void* px = bgra_prepare(&format, &type, w, h, d, pixels, &bg);
+        const void* px = upload_prepare(rf, &format, &type, w, h, d, 1, pixels, &bg);
         if (bg.fail) return;
         BE(glTexImage3D)(target, level, (GLint)rf, w, h, d, 0, format, type, px);
         bgra_done(&bg);
     }
     record_level(target, level, w, h, d, rf);
+    record_app(target, level, 1, app);
 }
 
 void gl31_glTexSubImage2D(GLenum target, GLint level, GLint xo, GLint yo, GLsizei w, GLsizei h,
@@ -1752,7 +2152,7 @@ void gl31_glTexSubImage2D(GLenum target, GLint level, GLint xo, GLint yo, GLsize
     if (target == GL_TEXTURE_RECTANGLE && level != 0) { gl31_set_error(GL_INVALID_VALUE); return; }
     {
         bgra_t bg;
-        const void* px = bgra_prepare(&format, &type, w, h, 1, pixels, &bg);
+        const void* px = upload_prepare(level_fmt(target, level), &format, &type, w, h, 1, 0, pixels, &bg);
         if (bg.fail) return;
         if (target == GL_TEXTURE_1D_ARRAY)       /* yo/h son capa/numero de capas */
             BE(glTexSubImage3D)(GL_TEXTURE_2D_ARRAY, level, xo, 0, yo, w, 1, h, format, type, px);
@@ -1772,7 +2172,7 @@ void gl31_glTexSubImage3D(GLenum target, GLint level, GLint xo, GLint yo, GLint 
     }
     {
         bgra_t bg;
-        const void* px = bgra_prepare(&format, &type, w, h, d, pixels, &bg);
+        const void* px = upload_prepare(level_fmt(target, level), &format, &type, w, h, d, 1, pixels, &bg);
         if (bg.fail) return;
         BE(glTexSubImage3D)(target, level, xo, yo, zo, w, h, d, format, type, px);
         bgra_done(&bg);
@@ -1837,6 +2237,199 @@ void gl31_glCopyTexSubImage3D(GLenum target, GLint level, GLint xo, GLint yo, GL
     BE(glCopyTexSubImage3D)(target, level, xo, yo, zo, x, y, w, h);
 }
 
+/* ---- transcodificacion en CPU de formatos comprimidos que el backend no tiene ----
+ * GL 3.0 exige RGTC (BC4/BC5) y casi todos los juegos usan S3TC (BC1/2/3); muchos drivers ES (Samsung Xclipse, Mali)
+ * no tienen ninguno de los dos. Sin ellos el upload se descomprime aqui y se sube sin comprimir (BC4/5 -> R8/RG8 con o
+ * sin signo, BC1/2/3 -> RGBA8 o SRGB8_ALPHA8). La textura conserva su formato interno comprimido para las consultas, y
+ * la copia de bloques (cs_upload) sigue alimentando glGetCompressedTexImage. BPTC no tiene decodificador. */
+static int tc_lookup(GLenum f, tc_fmt_t* o)
+{
+    o->block = 16;
+    switch (f) {
+        case GL_COMPRESSED_RED_RGTC1:        if (gl31_caps.has_rgtc) return 0; o->ifmt = GL_R8;        o->fmt = GL_RED; o->type = GL_UNSIGNED_BYTE; o->bpp = 1; o->block = 8; return 1;
+        case GL_COMPRESSED_SIGNED_RED_RGTC1: if (gl31_caps.has_rgtc) return 0; o->ifmt = GL_R8_SNORM;  o->fmt = GL_RED; o->type = GL_BYTE;          o->bpp = 1; o->block = 8; return 1;
+        case GL_COMPRESSED_RG_RGTC2:         if (gl31_caps.has_rgtc) return 0; o->ifmt = GL_RG8;       o->fmt = GL_RG;  o->type = GL_UNSIGNED_BYTE; o->bpp = 2; return 1;
+        case GL_COMPRESSED_SIGNED_RG_RGTC2:  if (gl31_caps.has_rgtc) return 0; o->ifmt = GL_RG8_SNORM;  o->fmt = GL_RG;  o->type = GL_BYTE;          o->bpp = 2; return 1;
+        case 0x83F0: case 0x83F1:            /* GL_COMPRESSED_RGB(A)_S3TC_DXT1_EXT */
+            if (gl31_caps.has_s3tc) return 0; o->ifmt = GL_RGBA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; o->block = 8; return 1;
+        case 0x83F2: case 0x83F3:            /* DXT3, DXT5 */
+            if (gl31_caps.has_s3tc) return 0; o->ifmt = GL_RGBA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; return 1;
+        case 0x8C4C: case 0x8C4D:            /* GL_COMPRESSED_SRGB(_ALPHA)_S3TC_DXT1_EXT */
+            if (gl31_caps.has_s3tc) return 0; o->ifmt = GL_SRGB8_ALPHA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; o->block = 8; return 1;
+        case 0x8C4E: case 0x8C4F:            /* sRGB DXT3, DXT5 */
+            if (gl31_caps.has_s3tc) return 0; o->ifmt = GL_SRGB8_ALPHA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; return 1;
+        case 0x8E8C:                         /* GL_COMPRESSED_RGBA_BPTC_UNORM (BC7) */
+            if (gl31_caps.has_bptc) return 0; o->ifmt = GL_RGBA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; return 1;
+        case 0x8E8D:                         /* GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM */
+            if (gl31_caps.has_bptc) return 0; o->ifmt = GL_SRGB8_ALPHA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; return 1;
+        case 0x8E8E: case 0x8E8F:            /* GL_COMPRESSED_RGB_BPTC_SIGNED / UNSIGNED_FLOAT (BC6H): se sube como RGBA16F con alfa 1 */
+            if (gl31_caps.has_bptc) return 0; o->ifmt = GL_RGBA16F; o->fmt = GL_RGBA; o->type = GL_HALF_FLOAT; o->bpp = 8; return 1;
+        default: return 0;
+    }
+}
+
+void gl31_bptc_decode_bc7(const unsigned char* block, unsigned char* out);                        /* gl31_bptc.c */
+void gl31_bptc_decode_bc6h(const unsigned char* block, int is_signed, unsigned short* out);
+
+/* formatos comprimidos que acepta Lorica: los del backend mas los que descomprime en CPU (S3TC, RGTC, BPTC) */
+int gl31_compressed_formats(GLint* out)
+{
+    static const GLenum emu[] = { 0x83F0, 0x83F1, 0x83F2, 0x83F3, 0x8C4C, 0x8C4D, 0x8C4E, 0x8C4F,
+                                  GL_COMPRESSED_RED_RGTC1, GL_COMPRESSED_SIGNED_RED_RGTC1, GL_COMPRESSED_RG_RGTC2, GL_COMPRESSED_SIGNED_RG_RGTC2,
+                                  0x8E8C, 0x8E8D, 0x8E8E, 0x8E8F };
+    GLint nb = 0, i, n = 0;
+    GLint* be;
+    size_t k;
+    BE(glGetIntegerv)(GL_NUM_COMPRESSED_TEXTURE_FORMATS, &nb);
+    if (nb < 0) nb = 0;
+    be = (GLint*)calloc((size_t)nb + 1, sizeof(GLint));
+    if (be && nb) BE(glGetIntegerv)(GL_COMPRESSED_TEXTURE_FORMATS, be);
+    for (i = 0; i < nb && be; i++) { if (out) out[n] = be[i]; n++; }
+    for (k = 0; k < sizeof emu / sizeof emu[0]; k++) {
+        tc_fmt_t t;
+        int have = 0;
+        if (!tc_lookup(emu[k], &t)) continue;       /* el backend lo tiene de verdad (ya esta en su lista) */
+        for (i = 0; i < nb && be; i++) if ((GLenum)be[i] == emu[k]) have = 1;
+        if (!have) { if (out) out[n] = (GLint)emu[k]; n++; }
+    }
+    free(be);
+    return n;
+}
+
+/* BC4 de un canal: 16 valores de 8 bits (sgn: con signo) a out[i * stride] */
+static void tc_bc4(const unsigned char* b, int sgn, unsigned char* out, int stride)
+{
+    int pal[8], i;
+    unsigned long long bits = 0;
+    if (sgn) {
+        int e0 = (signed char)b[0], e1 = (signed char)b[1];
+        if (e0 < -127) e0 = -127;
+        if (e1 < -127) e1 = -127;
+        pal[0] = e0; pal[1] = e1;
+        if (e0 > e1) for (i = 1; i < 7; i++) pal[i + 1] = ((7 - i) * e0 + i * e1) / 7;
+        else { for (i = 1; i < 5; i++) pal[i + 1] = ((5 - i) * e0 + i * e1) / 5; pal[6] = -127; pal[7] = 127; }
+    } else {
+        int e0 = b[0], e1 = b[1];
+        pal[0] = e0; pal[1] = e1;
+        if (e0 > e1) for (i = 1; i < 7; i++) pal[i + 1] = ((7 - i) * e0 + i * e1 + 3) / 7;
+        else { for (i = 1; i < 5; i++) pal[i + 1] = ((5 - i) * e0 + i * e1 + 2) / 5; pal[6] = 0; pal[7] = 255; }
+    }
+    for (i = 0; i < 6; i++) bits |= (unsigned long long)b[2 + i] << (8 * i);
+    for (i = 0; i < 16; i++) out[i * stride] = (unsigned char)pal[(bits >> (3 * i)) & 7];
+}
+
+/* color BC1 a RGBA8 (16 texeles); four: siempre 4 colores (DXT3/5); a1: el indice 3 es transparente */
+static void tc_bc1(const unsigned char* b, int four, int a1, unsigned char* out)
+{
+    unsigned c0 = b[0] | (b[1] << 8), c1 = b[2] | (b[3] << 8), idx = b[4] | (b[5] << 8) | (b[6] << 16) | ((unsigned)b[7] << 24);
+    int p[4][4], k, i;
+    int r0 = ((c0 >> 11) & 31) * 255 / 31, g0 = ((c0 >> 5) & 63) * 255 / 63, bl0 = (c0 & 31) * 255 / 31;
+    int r1 = ((c1 >> 11) & 31) * 255 / 31, g1 = ((c1 >> 5) & 63) * 255 / 63, bl1 = (c1 & 31) * 255 / 31;
+    p[0][0] = r0; p[0][1] = g0; p[0][2] = bl0; p[0][3] = 255;
+    p[1][0] = r1; p[1][1] = g1; p[1][2] = bl1; p[1][3] = 255;
+    if (c0 > c1 || four) {
+        p[2][0] = (2 * r0 + r1) / 3; p[2][1] = (2 * g0 + g1) / 3; p[2][2] = (2 * bl0 + bl1) / 3; p[2][3] = 255;
+        p[3][0] = (r0 + 2 * r1) / 3; p[3][1] = (g0 + 2 * g1) / 3; p[3][2] = (bl0 + 2 * bl1) / 3; p[3][3] = 255;
+    } else {
+        p[2][0] = (r0 + r1) / 2; p[2][1] = (g0 + g1) / 2; p[2][2] = (bl0 + bl1) / 2; p[2][3] = 255;
+        p[3][0] = p[3][1] = p[3][2] = 0; p[3][3] = a1 ? 0 : 255;
+    }
+    for (i = 0; i < 16; i++) { k = (idx >> (2 * i)) & 3; out[i * 4] = p[k][0]; out[i * 4 + 1] = p[k][1]; out[i * 4 + 2] = p[k][2]; out[i * 4 + 3] = p[k][3]; }
+}
+
+/* Descomprime w x h x d texeles (bloques de 4x4 por capa) a un buffer empaquetado (fila = w * bpp). NULL si falta memoria. */
+static unsigned char* tc_decode(GLenum f, const tc_fmt_t* t, const unsigned char* src, GLsizei size, GLsizei w, GLsizei h, GLsizei d)
+{
+    int bw = (w + 3) / 4, bh = (h + 3) / 4, x, y, z, i, j;
+    size_t need = (size_t)bw * bh * d * t->block;
+    unsigned char* out;
+    unsigned char tmp[16 * 8];
+    if (w <= 0 || h <= 0 || d <= 0 || (size_t)size < need) return NULL;
+    out = (unsigned char*)malloc((size_t)w * h * d * t->bpp);
+    if (!out) return NULL;
+    for (z = 0; z < d; z++)
+        for (y = 0; y < bh; y++)
+            for (x = 0; x < bw; x++) {
+                const unsigned char* b = src + (((size_t)z * bh + y) * bw + x) * t->block;
+                switch (f) {
+                    case GL_COMPRESSED_RED_RGTC1:        tc_bc4(b, 0, tmp, 1); break;
+                    case GL_COMPRESSED_SIGNED_RED_RGTC1: tc_bc4(b, 1, tmp, 1); break;
+                    case GL_COMPRESSED_RG_RGTC2:         tc_bc4(b, 0, tmp, 2); tc_bc4(b + 8, 0, tmp + 1, 2); break;
+                    case GL_COMPRESSED_SIGNED_RG_RGTC2:  tc_bc4(b, 1, tmp, 2); tc_bc4(b + 8, 1, tmp + 1, 2); break;
+                    case 0x83F0: case 0x8C4C:            tc_bc1(b, 0, 0, tmp); break;
+                    case 0x83F1: case 0x8C4D:            tc_bc1(b, 0, 1, tmp); break;
+                    case 0x8E8C: case 0x8E8D:            gl31_bptc_decode_bc7(b, tmp); break;
+                    case 0x8E8E: case 0x8E8F:            gl31_bptc_decode_bc6h(b, f == 0x8E8E, (unsigned short*)tmp); break;
+                    case 0x83F2: case 0x8C4E:            /* DXT3: alfa explicito de 4 bits */
+                        tc_bc1(b + 8, 1, 0, tmp);
+                        for (i = 0; i < 16; i++) { int a = (b[i / 2] >> ((i & 1) * 4)) & 15; tmp[i * 4 + 3] = (unsigned char)(a * 17); }
+                        break;
+                    default:                              /* DXT5: alfa como BC4 */
+                        tc_bc1(b + 8, 1, 0, tmp);
+                        tc_bc4(b, 0, tmp + 3, 4);
+                        break;
+                }
+                for (j = 0; j < 4 && y * 4 + j < h; j++)
+                    for (i = 0; i < 4 && x * 4 + i < w; i++)
+                        memcpy(out + ((((size_t)z * h) + y * 4 + j) * w + x * 4 + i) * t->bpp, tmp + (j * 4 + i) * t->bpp, (size_t)t->bpp);
+            }
+    return out;
+}
+
+/* Lee los bloques de la app (memoria o PIXEL_UNPACK_BUFFER), los descomprime y llama a up() con el estado de
+ * desempaquetado del backend neutro (alineacion 1, sin PBO); despues lo restaura. 0 = no hay que transcodificar. */
+typedef void (*tc_upload_fn)(const tc_fmt_t* t, const void* px, void* ctx);
+static int tc_run(GLenum f, GLsizei w, GLsizei h, GLsizei d, GLsizei size, const void* data, tc_upload_fn up, void* ctx)
+{
+    gl31_state_t* s = gl31_state();
+    tc_fmt_t t;
+    const unsigned char* src = (const unsigned char*)data;
+    void* mapped = NULL;
+    unsigned char* px;
+    static int warned = 0;
+    if (!tc_lookup(f, &t)) return 0;
+    if (!warned++) gl31_stub_warn("textura comprimida S3TC/RGTC sin soporte del backend: se descomprime en CPU");
+    if (s->pixel_unpack_buffer) {
+        mapped = BE(glMapBufferRange)(GL_PIXEL_UNPACK_BUFFER, (GLintptr)(intptr_t)data, size, GL_MAP_READ_BIT);
+        if (!mapped) { gl31_set_error(GL_INVALID_OPERATION); return 1; }
+        src = (const unsigned char*)mapped;
+    }
+    px = src ? tc_decode(f, &t, src, size, w, h, d) : NULL;
+    if (mapped) BE(glUnmapBuffer)(GL_PIXEL_UNPACK_BUFFER);
+    if (!px && src && w > 0 && h > 0 && d > 0) { gl31_set_error(GL_INVALID_VALUE); return 1; }
+    if (s->pixel_unpack_buffer) BE(glBindBuffer)(GL_PIXEL_UNPACK_BUFFER, 0);
+    BE(glPixelStorei)(GL_UNPACK_ALIGNMENT, 1);
+    BE(glPixelStorei)(GL_UNPACK_ROW_LENGTH, 0);
+    BE(glPixelStorei)(GL_UNPACK_SKIP_ROWS, 0);
+    BE(glPixelStorei)(GL_UNPACK_SKIP_PIXELS, 0);
+    BE(glPixelStorei)(GL_UNPACK_IMAGE_HEIGHT, 0);
+    BE(glPixelStorei)(GL_UNPACK_SKIP_IMAGES, 0);
+    up(&t, px, ctx);
+    BE(glPixelStorei)(GL_UNPACK_ALIGNMENT, s->unpack_alignment);
+    BE(glPixelStorei)(GL_UNPACK_ROW_LENGTH, s->unpack_row_length);
+    BE(glPixelStorei)(GL_UNPACK_SKIP_ROWS, s->unpack_skip_rows);
+    BE(glPixelStorei)(GL_UNPACK_SKIP_PIXELS, s->unpack_skip_pixels);
+    BE(glPixelStorei)(GL_UNPACK_IMAGE_HEIGHT, s->unpack_image_height);
+    BE(glPixelStorei)(GL_UNPACK_SKIP_IMAGES, s->unpack_skip_images);
+    if (s->pixel_unpack_buffer) BE(glBindBuffer)(GL_PIXEL_UNPACK_BUFFER, s->pixel_unpack_buffer);
+    free(px);
+    return 1;
+}
+
+typedef struct { GLenum target; GLint level, xo, yo, zo; GLsizei w, h, d; int sub; } tc_ctx_t;
+static void tc_up2d(const tc_fmt_t* t, const void* px, void* c_)
+{
+    tc_ctx_t* c = (tc_ctx_t*)c_;
+    if (c->sub) BE(glTexSubImage2D)(c->target, c->level, c->xo, c->yo, c->w, c->h, t->fmt, t->type, px);
+    else        BE(glTexImage2D)(c->target, c->level, (GLint)t->ifmt, c->w, c->h, 0, t->fmt, t->type, px);
+}
+static void tc_up3d(const tc_fmt_t* t, const void* px, void* c_)
+{
+    tc_ctx_t* c = (tc_ctx_t*)c_;
+    if (c->sub) BE(glTexSubImage3D)(c->target, c->level, c->xo, c->yo, c->zo, c->w, c->h, c->d, t->fmt, t->type, px);
+    else        BE(glTexImage3D)(c->target, c->level, (GLint)t->ifmt, c->w, c->h, c->d, 0, t->fmt, t->type, px);
+}
+
 /* ---- comprimidas ---- */
 /* 1D_ARRAY y RECTANGLE no se admiten comprimidas aqui */
 static int compressed_2d_target(GLenum t) { return t == GL_TEXTURE_2D || is_face(t); }
@@ -1849,6 +2442,7 @@ void gl31_glCompressedTexImage2D(GLenum target, GLint level, GLenum ifmt, GLsize
         proxy_set(target, level, w, h, 1, ifmt);
         return;
     }
+    RETURN_IF_IMMUTABLE(target);
     if (!compressed_2d_target(target)) {
         if (is_2d_target(target)) gl31_stub_warn("glCompressedTexImage2D(RECTANGLE/1D_ARRAY)");
         gl31_set_error(GL_INVALID_ENUM);
@@ -1858,7 +2452,11 @@ void gl31_glCompressedTexImage2D(GLenum target, GLint level, GLenum ifmt, GLsize
         if (border != 0 || w < 0 || h < 0 || size < 0) gl31_set_error(GL_INVALID_VALUE);
         return;
     }
-    BE(glCompressedTexImage2D)(gl31_tex_be_target(target), level, ifmt, w, h, 0, size, data);
+    {
+        tc_ctx_t c = { gl31_tex_be_target(target), level, 0, 0, 0, w, h, 1, 0 };
+        if (!tc_run(ifmt, w, h, 1, size, data, tc_up2d, &c))
+            BE(glCompressedTexImage2D)(gl31_tex_be_target(target), level, ifmt, w, h, 0, size, data);
+    }
     record_level(target, level, w, h, 1, ifmt);
     cs_upload(target, level, 0, 0, 0, w, h, 1, ifmt, size, data);
 }
@@ -1876,7 +2474,11 @@ void gl31_glCompressedTexImage3D(GLenum target, GLint level, GLenum ifmt, GLsize
         if (border != 0 || w < 0 || h < 0 || d < 0 || size < 0) gl31_set_error(GL_INVALID_VALUE);
         return;
     }
-    BE(glCompressedTexImage3D)(target, level, ifmt, w, h, d, 0, size, data);
+    {
+        tc_ctx_t c = { target, level, 0, 0, 0, w, h, d, 0 };
+        if (!tc_run(ifmt, w, h, d, size, data, tc_up3d, &c))
+            BE(glCompressedTexImage3D)(target, level, ifmt, w, h, d, 0, size, data);
+    }
     record_level(target, level, w, h, d, ifmt);
     cs_upload(target, level, 0, 0, 0, w, h, d, ifmt, size, data);
 }
@@ -1889,7 +2491,11 @@ void gl31_glCompressedTexSubImage2D(GLenum target, GLint level, GLint xo, GLint 
         gl31_set_error(GL_INVALID_VALUE);
         return;
     }
-    BE(glCompressedTexSubImage2D)(gl31_tex_be_target(target), level, xo, yo, w, h, format, size, data);
+    {
+        tc_ctx_t c = { gl31_tex_be_target(target), level, xo, yo, 0, w, h, 1, 1 };
+        if (!tc_run(format, w, h, 1, size, data, tc_up2d, &c))
+            BE(glCompressedTexSubImage2D)(gl31_tex_be_target(target), level, xo, yo, w, h, format, size, data);
+    }
     cs_upload(target, level, xo, yo, 0, w, h, 1, format, size, data);
 }
 
@@ -1902,7 +2508,11 @@ void gl31_glCompressedTexSubImage3D(GLenum target, GLint level, GLint xo, GLint 
         gl31_set_error(GL_INVALID_VALUE);
         return;
     }
-    BE(glCompressedTexSubImage3D)(target, level, xo, yo, zo, w, h, d, format, size, data);
+    {
+        tc_ctx_t c = { target, level, xo, yo, zo, w, h, d, 1 };
+        if (!tc_run(format, w, h, d, size, data, tc_up3d, &c))
+            BE(glCompressedTexSubImage3D)(target, level, xo, yo, zo, w, h, d, format, size, data);
+    }
     cs_upload(target, level, xo, yo, zo, w, h, d, format, size, data);
 }
 
@@ -1920,7 +2530,18 @@ void gl31_glGenerateMipmap(GLenum target)
             gl31_set_error(GL_INVALID_ENUM);
             return;
     }
+    if (gl31_diag()) while (BE(glGetError)() != GL_NO_ERROR) {}
     BE(glGenerateMipmap)(gl31_tex_be_target(target));
+    if (gl31_diag()) {
+        GLenum e = BE(glGetError)();
+        static int nerr;
+        tex_t* dt = cur_tex(target);
+        if (e != GL_NO_ERROR && nerr < 40) {
+            nerr++;
+            gl31_log("LORICA TEX: error 0x%x in GenerateMipmap target 0x%x: level 0 %dx%d storage 0x%x app format 0x%x",
+                     e, target, dt ? dt->lv[0].w : 0, dt ? dt->lv[0].h : 0, dt ? dt->lv[0].ifmt : 0, dt ? dt->lv[0].app : 0);
+        }
+    }
 
     /* anotar la cadena resultante a partir del nivel 0 */
     t = cur_tex(target);
@@ -1934,6 +2555,7 @@ void gl31_glGenerateMipmap(GLenum target)
         GLsizei d = halves_d ? (p.d > 1 ? p.d >> 1 : 1) : p.d;
         if (w == p.w && h == p.h && d == p.d) break;       /* ya es 1x1(x1) */
         record_level(target, l, w, h, d, p.ifmt);
+        if (p.app) record_app(target, l, 1, p.app);
     }
 }
 
@@ -1943,12 +2565,13 @@ void gl31_glGenerateMipmap(GLenum target)
 void gl31_glTexImage1D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLint border,
                        GLenum format, GLenum type, const void* pixels)
 {
-    GLenum rf = resolve_ifmt(ifmt, type);
+    GLenum app = resolve_ifmt(ifmt, type), rf = gl31_storage_format(app);
     bgra_t bg;
+    RETURN_IF_IMMUTABLE(target);
     const void* px;
     if (target == GL_PROXY_TEXTURE_1D) {
         if (border != 0) { gl31_set_error(GL_INVALID_VALUE); return; }
-        proxy_set(target, level, w, 1, 1, rf);
+        proxy_set(target, level, w, 1, 1, app);
         return;
     }
     if (target != GL_TEXTURE_1D) { gl31_set_error(GL_INVALID_ENUM); return; }
@@ -1956,11 +2579,12 @@ void gl31_glTexImage1D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLint 
         if (border != 0 || w < 0) gl31_set_error(GL_INVALID_VALUE);
         return;
     }
-    px = bgra_prepare(&format, &type, w, 1, 1, pixels, &bg);
+    px = upload_prepare(rf, &format, &type, w, 1, 1, 0, pixels, &bg);
     if (bg.fail) return;
     BE(glTexImage2D)(GL_TEXTURE_2D, level, (GLint)rf, w, 1, 0, format, type, px);
     bgra_done(&bg);
     record_level(GL_TEXTURE_1D, level, w, 1, 1, rf);
+    record_app(GL_TEXTURE_1D, level, 1, app);
 }
 
 void gl31_glTexSubImage1D(GLenum target, GLint level, GLint xo, GLsizei w, GLenum format,
@@ -1970,7 +2594,7 @@ void gl31_glTexSubImage1D(GLenum target, GLint level, GLint xo, GLsizei w, GLenu
     const void* px;
     if (target != GL_TEXTURE_1D) { gl31_set_error(GL_INVALID_ENUM); return; }
     if (level < 0 || xo < 0 || w < 0) { gl31_set_error(GL_INVALID_VALUE); return; }
-    px = bgra_prepare(&format, &type, w, 1, 1, pixels, &bg);
+    px = upload_prepare(level_fmt(GL_TEXTURE_1D, level), &format, &type, w, 1, 1, 0, pixels, &bg);
     if (bg.fail) return;
     BE(glTexSubImage2D)(GL_TEXTURE_2D, level, xo, 0, w, 1, format, type, px);
     bgra_done(&bg);
@@ -2054,8 +2678,9 @@ void gl31_glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum ifmt, G
         return;
     }
     if (w < 1 || h < 1 || samples < 1) { gl31_set_error(GL_INVALID_VALUE); return; }
-    BE(glTexStorage2DMultisample)(GL_TEXTURE_2D_MULTISAMPLE, samples, rf, w, h, fixed);
-    record_level(GL_TEXTURE_2D_MULTISAMPLE, 0, w, h, 1, rf);
+    BE(glTexStorage2DMultisample)(GL_TEXTURE_2D_MULTISAMPLE, samples, gl31_storage_format(rf), w, h, fixed);
+    record_level(GL_TEXTURE_2D_MULTISAMPLE, 0, w, h, 1, gl31_storage_format(rf));
+    record_app(GL_TEXTURE_2D_MULTISAMPLE, 0, 1, rf);
 }
 
 void gl31_glTexImage3DMultisample(GLenum target, GLsizei samples, GLenum ifmt, GLsizei w, GLsizei h,
@@ -2075,8 +2700,9 @@ void gl31_glTexImage3DMultisample(GLenum target, GLsizei samples, GLenum ifmt, G
         return;
     }
     if (w < 1 || h < 1 || d < 1 || samples < 1) { gl31_set_error(GL_INVALID_VALUE); return; }
-    BE(glTexStorage3DMultisample)(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, samples, rf, w, h, d, fixed);
-    record_level(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, 0, w, h, d, rf);
+    BE(glTexStorage3DMultisample)(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, samples, gl31_storage_format(rf), w, h, d, fixed);
+    record_level(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, 0, w, h, d, gl31_storage_format(rf));
+    record_app(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, 0, 1, rf);
 }
 
 /* posiciones de muestra estandar (las mismas que fija Vulkan) para backends sin glGetMultisamplefv */
@@ -2277,6 +2903,80 @@ void gl31_glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, 
     BE(glDeleteFramebuffers)(1, &fbo);
 }
 
+
+/* ARB_get_texture_sub_image: una region de un nivel, capa a capa, con el camino de GPU de glGetTexImage (FBO + glReadPixels).
+ * La textura es la enlazada a `target` (glGetTextureSubImage la enlaza antes). Las comprimidas no se pueden leer en ES. */
+void gl31_glGetTexSubImage(GLenum target, GLint level, GLint x0, GLint y0, GLint z0, GLsizei w, GLsizei h, GLsizei d,
+                           GLenum format, GLenum type, void* pixels)
+{
+    gl31_state_t* st = gl31_state();
+    tex_t* t;
+    lvl_t l;
+    GLint prev_read = 0;
+    GLuint fbo = 0;
+    GLsizei z, depth;
+    size_t pix, rowbytes, slice, ih;
+    GLenum dsatt = GL_COLOR_ATTACHMENT0;
+    int dsf, s = slot_of(target);
+
+    if (s < 0 || s == S_BUF || s == S_2DMS || s == S_2DMSARR) { gl31_set_error(GL_INVALID_ENUM); return; }
+    if (level < 0 || level >= MAX_LV) { gl31_set_error(GL_INVALID_VALUE); return; }
+    t = cur_tex(target);
+    if (!t) { gl31_set_error(GL_INVALID_OPERATION); return; }
+    l = t->lv[level];
+    if (l.w <= 0) { gl31_set_error(GL_INVALID_OPERATION); return; }
+    depth = (s == S_3D || s == S_2DARR || s == S_CUBEARR) ? l.d : (s == S_1DARR ? l.h : 1);
+    if (w < 0 || h < 0 || d < 0 || x0 < 0 || y0 < 0 || z0 < 0 ||
+        x0 + w > l.w || y0 + h > (s == S_1DARR ? 1 : l.h) || z0 + d > (is_face(target) ? 1 : depth)) {
+        gl31_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (!w || !h || !d) return;
+    if (!pixels && !st->pixel_pack_buffer) return;
+    if (!fmt_lookup(l.ifmt)) {
+        gl31_stub_warn("glGetTextureSubImage(textura comprimida): ES no puede leerla");
+        gl31_set_error(GL_INVALID_OPERATION);
+        return;
+    }
+    pix = type_bytes(type) * format_comps(format);
+    if (!pix) pix = 4;
+    rowbytes = (st->pack_row_length > 0 ? (size_t)st->pack_row_length : (size_t)w) * pix;
+    if (st->pack_alignment > 1) {
+        size_t a = (size_t)st->pack_alignment;
+        rowbytes = ((rowbytes + a - 1) / a) * a;
+    }
+    ih = st->pack_image_height > 0 ? (size_t)st->pack_image_height : (size_t)h;
+    slice = rowbytes * ih;
+
+    dsf = (format == GL_DEPTH_COMPONENT || format == GL_STENCIL_INDEX || format == GL_DEPTH_STENCIL);
+    if (dsf) dsatt = (l.ifmt == GL_DEPTH24_STENCIL8 || l.ifmt == GL_DEPTH32F_STENCIL8 || l.ifmt == GL_DEPTH_STENCIL)
+                     ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+
+    BE(glGetIntegerv)(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+    BE(glGenFramebuffers)(1, &fbo);
+    BE(glBindFramebuffer)(GL_READ_FRAMEBUFFER, fbo);
+    for (z = 0; z < d; z++) {
+        unsigned char* dst = (unsigned char*)pixels + ((size_t)st->pack_skip_images + (size_t)z) * slice;
+        if (s == S_3D || s == S_2DARR || s == S_CUBEARR)
+            BE(glFramebufferTextureLayer)(GL_READ_FRAMEBUFFER, dsatt, t->id, level, z0 + z);
+        else if (s == S_1DARR)
+            BE(glFramebufferTextureLayer)(GL_READ_FRAMEBUFFER, dsatt, t->id, level, z0 + z);
+        else
+            BE(glFramebufferTexture2D)(GL_READ_FRAMEBUFFER, dsatt, is_face(target) ? target : GL_TEXTURE_2D, t->id, level);
+        if (z == 0) {
+            BE(glReadBuffer)(dsf ? GL_NONE : GL_COLOR_ATTACHMENT0);
+            if (BE(glCheckFramebufferStatus)(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                gl31_stub_warn("glGetTextureSubImage(formato no renderizable)");
+                gl31_set_error(GL_INVALID_OPERATION);
+                break;
+            }
+        }
+        if (!gl31_read_pixels_ex(x0, y0, w, h, format, type, dst)) break;
+    }
+    BE(glBindFramebuffer)(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+    BE(glDeleteFramebuffers)(1, &fbo);
+}
+
 /* La lectura de texturas comprimidas no tiene equivalente en ES. */
 void gl31_glGetCompressedTexImage(GLenum target, GLint level, void* img)
 {
@@ -2330,10 +3030,18 @@ void gl31_glTextureView(GLuint texture, GLenum target, GLuint orig, GLenum ifmt,
     tex_t *v, *o;
     GLenum be;
     GLuint i;
+    int copy = 0;
     if (!gl31_caps.texture_view) {
-        gl31_stub_warn("glTextureView (backend sin ES 3.2 / EXT_texture_view)");
-        gl31_set_error(GL_INVALID_OPERATION);
-        return;
+        /* Sin OES/EXT_texture_view: la vista es una copia (glCopyImageSubData) de los niveles y capas pedidos. Sirve
+         * para leer la vista (lo habitual: un subconjunto de mips o capas, o reinterpretar el formato); lo que se
+         * escriba despues en una no se ve en la otra. */
+        if (!gl31_caps.copy_image) {
+            gl31_stub_warn("glTextureView (backend sin OES/EXT_texture_view ni copy_image)");
+            gl31_set_error(GL_INVALID_OPERATION);
+            return;
+        }
+        gl31_stub_warn("glTextureView emulado con una copia (backend sin OES/EXT_texture_view)");
+        copy = 1;
     }
     be = gl31_tex_be_target(target);
     if (slot_of(target) < 0 || is_face(target) || !be) { gl31_set_error(GL_INVALID_ENUM); return; }
@@ -2347,7 +3055,28 @@ void gl31_glTextureView(GLuint texture, GLenum target, GLuint orig, GLenum ifmt,
     if (!v) { gl31_set_error(GL_OUT_OF_MEMORY); return; }
     if (v->target || v->lv[0].w) { gl31_set_error(GL_INVALID_OPERATION); return; }
     ifmt = map_ifmt(ifmt);
-    BE(glTextureView)(texture, be, orig, ifmt, minlevel, numlevels, minlayer, numlayers);
+    if (copy) {
+        GLenum obe = gl31_tex_be_target(o->target);
+        lvl_t* l0 = &o->lv[minlevel];
+        GLsizei layers = is_array_target(target) ? (GLsizei)numlayers : 1;
+        GLsizei depth3 = (be == GL_TEXTURE_3D) ? l0->d : layers;
+        GLuint prev = g_bound[g_active_unit][slot_of(target)];
+        if (!l0->w || !obe) { gl31_set_error(GL_INVALID_OPERATION); return; }
+        BE(glBindTexture)(be, texture);
+        if (be == GL_TEXTURE_2D || be == GL_TEXTURE_CUBE_MAP)
+            BE(glTexStorage2D)(be, (GLsizei)numlevels, ifmt, l0->w, l0->h);
+        else
+            BE(glTexStorage3D)(be, (GLsizei)numlevels, ifmt, l0->w, l0->h, be == GL_TEXTURE_CUBE_MAP_ARRAY ? layers : depth3);
+        for (i = 0; i < numlevels; i++) {
+            lvl_t* l = &o->lv[minlevel + i];
+            GLsizei d = (be == GL_TEXTURE_3D) ? l->d : (be == GL_TEXTURE_CUBE_MAP ? 6 : layers);
+            if (!l->w) break;
+            BE(glCopyImageSubData)(orig, obe, (GLint)(minlevel + i), 0, 0, (GLint)(be == GL_TEXTURE_3D ? 0 : minlayer),
+                                   texture, be, (GLint)i, 0, 0, 0, l->w, l->h, d > 0 ? d : 1);
+        }
+        BE(glBindTexture)(be, prev);
+    } else
+        BE(glTextureView)(texture, be, orig, ifmt, minlevel, numlevels, minlayer, numlayers);
     v->target = target;
     for (i = 0; i < numlevels; i++) {
         v->lv[i] = o->lv[minlevel + i];
@@ -2442,7 +3171,6 @@ static void ci_blit_fallback(GLuint sn, GLenum st, GLenum sbe, GLint sl, GLint s
                              GLuint dn, GLenum dt, GLenum dbe, GLint dl, GLint dx, GLint dy, GLint dz,
                              GLsizei w, GLsizei h, GLsizei d, int s1, int d1)
 {
-    gl31_state_t* gs = gl31_state();
     GLenum sf = ci_format_of(sn, st, sl), df = ci_format_of(dn, dt, dl);
     GLuint fb[2] = {0, 0};
     GLsizei k;
@@ -2450,6 +3178,7 @@ static void ci_blit_fallback(GLuint sn, GLenum st, GLenum sbe, GLint sl, GLint s
     GLenum att;
     GLbitfield mask;
     int ok = 1;
+    GLint be_read = 0, be_draw = 0;
     if (s1 || d1) { gl31_stub_warn("glCopyImageSubData(1D_ARRAY) sin backend ES 3.2"); gl31_set_error(GL_INVALID_OPERATION); return; }
     if (!sf || !df || ci_is_depth(sf) != ci_is_depth(df) || sf == 0) { gl31_set_error(GL_INVALID_OPERATION); return; }
     if (gl31_tex_is_compressed_fmt(sf) || gl31_tex_is_compressed_fmt(df)) {
@@ -2461,6 +3190,9 @@ static void ci_blit_fallback(GLuint sn, GLenum st, GLenum sbe, GLint sl, GLint s
         att = ci_has_stencil(sf) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
         mask = GL_DEPTH_BUFFER_BIT | (ci_has_stencil(sf) ? GL_STENCIL_BUFFER_BIT : 0);
     } else { att = GL_COLOR_ATTACHMENT0; mask = GL_COLOR_BUFFER_BIT; }
+    /* se devuelven los enlaces que tenia el backend (en modo hibrido los hace GL4ES, no GLADIATOR) */
+    BE(glGetIntegerv)(0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &be_read);
+    BE(glGetIntegerv)(0x8CA6 /* GL_DRAW_FRAMEBUFFER_BINDING */, &be_draw);
     BE(glGenFramebuffers)(2, fb);
     scissor = BE(glIsEnabled)(GL_SCISSOR_TEST);
     if (scissor) BE(glDisable)(GL_SCISSOR_TEST);
@@ -2477,8 +3209,8 @@ static void ci_blit_fallback(GLuint sn, GLenum st, GLenum sbe, GLint sl, GLint s
         }
         BE(glBlitFramebuffer)(sx, sy, sx + w, sy + h, dx, dy, dx + w, dy + h, mask, GL_NEAREST);
     }
-    BE(glBindFramebuffer)(GL_READ_FRAMEBUFFER, gs->read_fbo);
-    BE(glBindFramebuffer)(GL_DRAW_FRAMEBUFFER, gl31_fbo_be_draw(gs->draw_fbo));
+    BE(glBindFramebuffer)(GL_READ_FRAMEBUFFER, (GLuint)be_read);
+    BE(glBindFramebuffer)(GL_DRAW_FRAMEBUFFER, (GLuint)be_draw);
     if (scissor) BE(glEnable)(GL_SCISSOR_TEST);
     BE(glDeleteFramebuffers)(2, fb);
 }

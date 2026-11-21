@@ -1,4 +1,5 @@
 #include "texture.h"
+#include "hybrid.h"
 
 #include "../glx/hardext.h"
 #include "../glx/streaming.h"
@@ -15,6 +16,7 @@
 #include "matrix.h"
 #include "pixel.h"
 #include "raster.h"
+#include "pixel_swap.h"
 
 //#define DEBUG
 #ifdef DEBUG
@@ -903,9 +905,55 @@ GLenum minmag_float(GLenum filt) {
     }
 }
 
+// ---- GL_UNPACK_SWAP_BYTES / GL_PACK_SWAP_BYTES (GLES has neither; see pixel_swap.h) ----
+void* gl4es_unpack_swapped(GLsizei w, GLsizei h, GLsizei d, int is3d, GLenum format, GLenum type, const GLvoid* data)
+{
+    const char* base = (const char*)data;
+    pxs_layout_t L;
+    if (!glstate->texture.unpack_swap_bytes || pxs_elem_size(type) <= 1) return NULL;
+    if (glstate->vao->unpack) base = (const char*)glstate->vao->unpack->data + (uintptr_t)data;   // PBOs live in client memory
+    else if (!data) return NULL;
+    L.align = glstate->texture.unpack_align;
+    L.row_length = glstate->texture.unpack_row_length;
+    L.skip_pixels = glstate->texture.unpack_skip_pixels;
+    L.skip_rows = glstate->texture.unpack_skip_rows;
+    L.image_height = is3d ? (int)glstate->texture.unpack_image_height : 0;
+    L.skip_images = 0;   // GL4ES has no GL_UNPACK_SKIP_IMAGES state (ignored, as before)
+    return pxs_swapped_copy(base, w, h, d, format, type, &L);
+}
+
+void gl4es_pack_swap(GLsizei w, GLsizei h, GLenum format, GLenum type, GLvoid* data)
+{
+    char* base = (char*)data;
+    pxs_layout_t L;
+    if (!glstate->texture.pack_swap_bytes || pxs_elem_size(type) <= 1) return;
+    if (glstate->vao->pack) base = (char*)glstate->vao->pack->data + (uintptr_t)data;
+    else if (!data) return;
+    L.align = glstate->texture.pack_align;
+    L.row_length = glstate->texture.pack_row_length;
+    L.skip_pixels = glstate->texture.pack_skip_pixels;
+    L.skip_rows = glstate->texture.pack_skip_rows;
+    L.image_height = 0;
+    L.skip_images = 0;
+    pxs_swap_pixels(base, w, h, 1, format, type, &L);
+}
+
 void APIENTRY_GL4ES gl4es_glTexImage2D(GLenum target, GLint level, GLint internalformat,
                   GLsizei width, GLsizei height, GLint border,
                   GLenum format, GLenum type, const GLvoid *data) {
+    GL4ES_UNPACK_SWAP_REPLAY(width, height, 1, 0,
+        gl4es_glTexImage2D(target, level, internalformat, width, height, border, format, type, data))
+    // hybrid context: sRGB and integer formats keep their real storage in GLADIATOR (GL4ES would make them linear RGBA)
+    if (!glstate->list.compiling && (target==GL_TEXTURE_2D || (target>=GL_TEXTURE_CUBE_MAP_POSITIVE_X && target<=GL_TEXTURE_CUBE_MAP_NEGATIVE_Z))) {
+        if (gl4es_hybrid_tex_format(internalformat)) {
+            FLUSH_BEGINEND;
+            gl4es_hybrid_TexImage2D(target, level, internalformat, width, height, border, format, type, data);
+            noerrorShim();
+            return;
+        }
+        if (level==0 && gl4es_hybrid_tex_is_hybrid(target))
+            glstate->texture.bound[glstate->texture.active][what_target(target)]->hybrid = 0;   // respecified with a GL4ES format
+    }
     DBG(printf("glTexImage2D on target=%s with unpack_row_length(%i), size(%i,%i) and skip(%i,%i), format(internal)=%s(%s), type=%s, data=%p, level=%i (mipmap_need=%i, mipmap_auto=%i, base_level=%i, max_level=%i) => texture=%u (streamed=%i), glstate->list.compiling=%d\n", PrintEnum(target), glstate->texture.unpack_row_length, width, height, glstate->texture.unpack_skip_pixels, glstate->texture.unpack_skip_rows, PrintEnum(format), (internalformat==3)?"3":(internalformat==4?"4":PrintEnum(internalformat)), PrintEnum(type), data, level, glstate->texture.bound[glstate->texture.active][what_target(target)]->mipmap_need, glstate->texture.bound[glstate->texture.active][what_target(target)]->mipmap_auto, glstate->texture.bound[glstate->texture.active][what_target(target)]->base_level, glstate->texture.bound[glstate->texture.active][what_target(target)]->max_level, glstate->texture.bound[glstate->texture.active][what_target(target)]->texture, glstate->texture.bound[glstate->texture.active][what_target(target)]->streamed, glstate->list.compiling);)
     
     if(data==NULL && (internalformat == GL_RGB16F || internalformat == GL_RGBA16F))
@@ -1538,6 +1586,14 @@ void APIENTRY_GL4ES gl4es_glTexImage2D(GLenum target, GLint level, GLint interna
 void APIENTRY_GL4ES gl4es_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                      GLsizei width, GLsizei height, GLenum format, GLenum type,
                      const GLvoid *data) {
+    GL4ES_UNPACK_SWAP_REPLAY(width, height, 1, 0,
+        gl4es_glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, data))
+    if (!glstate->list.compiling && gl4es_hybrid_tex_is_hybrid(target)) {   // storage kept by GLADIATOR (hybrid.c)
+        FLUSH_BEGINEND;
+        gl4es_hybrid_TexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, data);
+        noerrorShim();
+        return;
+    }
 
     if (glstate->list.pending) {
         gl4es_flush();
@@ -1822,6 +1878,12 @@ void APIENTRY_GL4ES gl4es_glTexStorage1D(GLenum target, GLsizei levels, GLenum i
 }
 void APIENTRY_GL4ES gl4es_glTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
 {
+    if (gl4es_hybrid_tex_format(internalformat) && (target==GL_TEXTURE_2D || target==GL_TEXTURE_CUBE_MAP)) {
+        FLUSH_BEGINEND;
+        gl4es_hybrid_TexStorage2D(target, levels, internalformat, width, height);
+        noerrorShim();
+        return;
+    }
     // (could be implemented in GLES3.0)
     DBG(printf("glTexStorage2D(%s, %d, %s, %d, %d)\n", PrintEnum(target), levels, PrintEnum(internalformat), width, height);)
     if(!levels) {

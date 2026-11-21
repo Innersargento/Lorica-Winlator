@@ -4,6 +4,11 @@
 #include "gl31.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #ifndef GL_POINT
 #define GL_POINT 0x1B00
@@ -13,6 +18,28 @@
 #ifndef GL_CLAMP_READ_COLOR
 #define GL_CLAMP_READ_COLOR 0x891C
 #endif
+
+/* Diagnostico: activo con LIBGL_DEBUG. Va al logcat con la misma etiqueta que el resto de Lorica. */
+int gl31_diag(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("LIBGL_DEBUG") != NULL;
+    return v;
+}
+
+void gl31_log(const char* fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+#ifdef __ANDROID__
+    __android_log_write(ANDROID_LOG_INFO, "LIBGL", buf);
+#else
+    fputs(buf, stderr); fputc(10, stderr);
+#endif
+}
 
 /* `fn` debe ser un literal (se guarda el puntero para deduplicar). */
 void gl31_stub_warn(const char* fn)

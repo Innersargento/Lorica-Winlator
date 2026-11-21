@@ -1,7 +1,7 @@
 /* gl31_shader_glsl.c - conversor GLSL 1.10-1.50 / 3.30  ->  GLSL ES 3.00 / 3.10 / 3.20
  * (la version de salida es la del backend: gl31_caps.glsl_es)
  *
- * Transformaciones (todas textuales, sin AST):
+ * Transformaciones (textuales, salvo las conversiones de tipo, que usan un parser con tipos):
  *   - #version NNN [core]  ->  #version 300 es  + precisiones por defecto
  *   - #extension GL_ARB_*  -> se elimina; el resto se sube a la cabecera
  *   - layout(): se quitan los calificadores que ES 3.00 no admite
@@ -10,21 +10,27 @@
  *   - texture2D/textureCube/... -> texture/textureLod/...
  *   - noperspective se elimina
  *   - sampler1D / 1DArray / 2DRect (y variantes i/u) -> sampler2D / 2DArray; las llamadas
- *     texture/textureLod/texelFetch/textureSize sobre ellos se redirigen a funciones
- *     auxiliares lorica_* inyectadas en la cabecera (coordenada extra 0.5, o p/size en Rect)
+ *     texture/Lod/Proj/ProjLod/Grad/texelFetch/textureSize sobre ellos se redirigen a funciones
+ *     auxiliares lorica_* inyectadas en la cabecera (coordenada extra 0.5, o p/size en Rect), y
+ *     la familia *Offset a macros (el offset tiene que seguir siendo una expresion constante)
  *   - samplerBuffer, sampler2DMS, gl_ClipDistance y shaders de geometria: se pasan tal cual
  *     si el backend los tiene (con el #extension EXT/OES necesario bajo ES 3.20); si no, error
  *   - glBindFragDataLocation: se inyecta layout(location=N) en las salidas del fragment shader
  * Se rechaza (error claro) lo que no tiene equivalente: sombras 1D/Rect y built-ins del
  * perfil de compatibilidad (FPE).
- * Limitacion conocida: no se insertan conversiones implicitas int->float
- * (GLSL >= 1.20 las permite, ES no).
+ *   - conversiones implicitas int -> uint -> float (GLSL de escritorio las permite, ES no): se hacen explicitas con un
+ *     parser con tipos (gl31_glsl_tc.c)
  * Los numeros de linea se conservan (#line 1) para que los logs sean utiles. */
 #include "gl31.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
+char* gl31_glsl_implicit_conv(const char* src);        /* gl31_glsl_tc.c */
 
 typedef struct { char* p; size_t n, cap; int oom; } sb_t;
 
@@ -240,7 +246,9 @@ static const char* const k_rename[][2] = {
     { "textureCube", "texture" },       { "textureCubeLod", "textureLod" },
     { "texture1D", "texture" },         { "texture1DLod", "textureLod" },
     { "texture1DArray", "texture" },    { "texture1DArrayLod", "textureLod" },
-    { "texture2DRect", "texture" },
+    { "texture2DRect", "texture" },     { "texture2DRectProj", "textureProj" },
+    { "texture1DProj", "textureProj" }, { "texture1DProjLod", "textureProjLod" },
+    { "texture3DProj", "textureProj" }, { "texture3DProjLod", "textureProjLod" },
     { NULL, NULL }
 };
 
@@ -262,16 +270,85 @@ static const smp_t k_smp[] = {
     { NULL, NULL, 0, 0, 0 }
 };
 
+/* Los samplers solo pueden ser uniforms (ambito global) o parametros de funcion: no hay samplers locales en GLSL. Un nombre
+ * se resuelve como en GLSL: dentro del cuerpo de una funcion, un parametro con ese nombre esconde los uniforms globales. */
 #define MAX_SMP_NAMES 64
-typedef struct { char name[64]; int kind, v; GLenum gl; } smpname_t;
-typedef struct { smpname_t n[MAX_SMP_NAMES]; int cnt; } smpnames_t;
+#define MAX_FN_SCOPES 512
+typedef struct { const char *pl, *pr, *bl, *br; } fnscope_t;     /* ( ) de los parametros y { } del cuerpo */
+typedef struct { char name[64]; int kind, v; GLenum gl; int scope; } smpname_t;   /* scope: -1 global, si no indice de funcion */
+typedef struct { smpname_t n[MAX_SMP_NAMES]; int cnt; const char* base; fnscope_t f[MAX_FN_SCOPES]; int nf; } smpnames_t;
 
-static const smpname_t* smp_lookup(const smpnames_t* t, const char* nm, size_t len)
+static const smpname_t* smp_lookup_scope(const smpnames_t* t, const char* nm, size_t len, int scope)
 {
     int i;
     for (i = 0; i < t->cnt; i++)
-        if (strlen(t->n[i].name) == len && strncmp(t->n[i].name, nm, len) == 0) return &t->n[i];
+        if (t->n[i].scope == scope && strlen(t->n[i].name) == len && strncmp(t->n[i].name, nm, len) == 0) return &t->n[i];
     return NULL;
+}
+
+/* definiciones de funcion en ambito global: `... ( params ) {` hasta su `}` (structs y bloques no tienen ')' antes de '{') */
+static void collect_fn_scopes(const char* s, smpnames_t* t)
+{
+    int depth = 0;
+    const char* p;
+    t->nf = 0;
+    t->base = s;
+    for (p = s; *p; p++) {
+        if (p[0] == '/' && p[1] == '/') { while (p[1] && p[1] != '\n') p++; continue; }
+        if (p[0] == '/' && p[1] == '*') { p += 2; while (*p && !(p[0] == '*' && p[1] == '/')) p++; if (!*p) break; p++; continue; }
+        if (*p == '{') {
+            if (depth == 0 && t->nf < MAX_FN_SCOPES) {
+                const char* q = p;
+                while (q > s && isspace((unsigned char)q[-1])) q--;
+                if (q > s && q[-1] == ')') {
+                    const char* r = q - 1;
+                    int d = 0;
+                    for (; r >= s; r--) {
+                        if (*r == ')') d++;
+                        else if (*r == '(' && --d == 0) break;
+                    }
+                    if (r >= s) {
+                        t->f[t->nf].pl = r; t->f[t->nf].pr = q - 1; t->f[t->nf].bl = p; t->f[t->nf].br = NULL;
+                        t->nf++;
+                    }
+                }
+            }
+            depth++;
+        } else if (*p == '}') {
+            if (depth > 0) depth--;
+            if (depth == 0 && t->nf > 0 && !t->f[t->nf - 1].br) t->f[t->nf - 1].br = p;
+        }
+    }
+}
+
+/* funcion cuya lista de parametros contiene `q` (-1 ninguna) */
+static int fn_of_param(const smpnames_t* t, const char* q)
+{
+    int i;
+    for (i = 0; i < t->nf; i++) if (q > t->f[i].pl && q < t->f[i].pr) return i;
+    return -1;
+}
+
+/* la lista de parametros [pl, pr] declara el identificador nm */
+static int params_declare(const char* pl, const char* pr, const char* nm, size_t nl)
+{
+    const char* q;
+    for (q = pl + 1; q + nl <= pr; q++)
+        if (strncmp(q, nm, nl) == 0 && !is_id((unsigned char)q[-1]) && !is_id((unsigned char)q[nl])) return 1;
+    return 0;
+}
+
+/* `nm` usado en la posicion `at`: el parametro de la funcion que lo contiene, si declara ese nombre, o el uniform global */
+static const smpname_t* smp_resolve(const smpnames_t* t, const char* at, const char* nm, size_t nl)
+{
+    int i;
+    for (i = 0; i < t->nf; i++)
+        if (t->f[i].br && at > t->f[i].bl && at < t->f[i].br) {
+            if (params_declare(t->f[i].pl, t->f[i].pr, nm, nl))
+                return smp_lookup_scope(t, nm, nl, i);   /* NULL: el parametro es de un tipo que no se reescribe */
+            break;
+        }
+    return smp_lookup_scope(t, nm, nl, -1);
 }
 
 static void skip_ws(const char** p) { while (**p && isspace((unsigned char)**p)) (*p)++; }
@@ -291,6 +368,7 @@ static size_t read_id(const char** p, const char** start)
 static int collect_smp_names(const char* s, smpnames_t* t)
 {
     int k;
+    collect_fn_scopes(s, t);
     for (k = 0; k_smp[k].from; k++) {
         const char* p = s;
         const char* q;
@@ -302,13 +380,20 @@ static int collect_smp_names(const char* s, smpnames_t* t)
             for (;;) {
                 nl = read_id(&c, &nm);
                 if (!nl || nl >= sizeof t->n[0].name) break;
-                if (!smp_lookup(t, nm, nl)) {
+                int scope = fn_of_param(t, q);
+                if (scope < 0) {   /* fuera de una definicion: uniform global, salvo parametro de un prototipo `f(sampler1D s);` */
+                    const char* r = q;
+                    while (r > s && r[-1] != ';' && r[-1] != '{' && r[-1] != '}' && r[-1] != '(') r--;
+                    if (r > s && r[-1] == '(') break;
+                }
+                if (!smp_lookup_scope(t, nm, nl, scope)) {
                     if (t->cnt >= MAX_SMP_NAMES) return 0;
                     memcpy(t->n[t->cnt].name, nm, nl);
                     t->n[t->cnt].name[nl] = 0;
                     t->n[t->cnt].kind = k_smp[k].kind;
                     t->n[t->cnt].v = k_smp[k].v;
                     t->n[t->cnt].gl = k_smp[k].gl;
+                    t->n[t->cnt].scope = scope;
                     t->cnt++;
                 }
                 skip_ws(&c);
@@ -331,23 +416,98 @@ static int collect_smp_names(const char* s, smpnames_t* t)
 static const char* const k_vsfx[] = { "f", "i", "u" };
 static const char* const k_ksfx[] = { "1D", "1DA", "RECT" };
 
-/* Reemplaza fn(NAME, ...) por lorica_fn_KIND_V(NAME, ...) cuando NAME es un sampler reescrito.
- * `used` marca los (fn, kind, v) usados para generar los auxiliares. Devuelve NULL si
- * hay un error (msg en *bad) o sin memoria (bad == NULL). */
-enum { F_TEX, F_LOD, F_FETCH, F_SIZE, F_COUNT };
-static const char* const k_fn[F_COUNT] = { "texture", "textureLod", "texelFetch", "textureSize" };
-static const char* const k_fn_unsup[] = { "textureProj", "textureProjLod", "textureGrad", "textureOffset",
-                                          "texelFetchOffset", "textureLodOffset", "textureGather", NULL };
+/* Reemplaza fn(NAME, ...) por lorica_fn_KIND_V(NAME, ...) cuando NAME es un sampler reescrito (1D -> 2D con y = 0.5,
+ * 1DArray -> 2DArray, Rect -> 2D con coordenadas normalizadas). Las funciones cuyo offset debe ser una expresion constante
+ * (familia *Offset) se traducen con macros, que conservan la constancia; su nombre lleva el numero de argumentos de la
+ * llamada (lorica_fn_KIND_V_N). El resto son funciones auxiliares sobrecargadas por tipo de coordenada (vec2/vec4 en Proj).
+ * `used` marca, por (fn, kind, v), los numeros de argumentos vistos (bit N; bit 0 = funcion). Devuelve NULL si hay un
+ * error (msg en *bad) o sin memoria (bad == NULL). */
+enum { F_TEX, F_LOD, F_FETCH, F_SIZE, F_PROJ, F_PROJLOD, F_GRAD,
+       F_OFFSET, F_LODOFFSET, F_FETCHOFFSET, F_GRADOFFSET, F_COUNT };
+#define F_FIRST_MACRO F_OFFSET
+static const char* const k_fn[F_COUNT] = { "texture", "textureLod", "texelFetch", "textureSize", "textureProj", "textureProjLod",
+                                           "textureGrad", "textureOffset", "textureLodOffset", "texelFetchOffset", "textureGradOffset" };
+/* sin traduccion: no existen sobre 1D/Rect en GLSL, o necesitarian el divisor de la proyeccion dentro de una macro */
+static const char* const k_fn_unsup[] = { "textureProjOffset", "textureProjLodOffset", "textureProjGrad", "textureProjGradOffset",
+                                          "textureGather", "textureGatherOffset", "textureGatherOffsets", NULL };
+
+/* Traducciones. $R tipo de retorno (vec4/ivec4/uvec4), $S tipo del sampler ES, $N nombre del auxiliar.
+ * nargs = 0: funcion (se emite si la llamada se usa); nargs > 0: macro para ese numero de argumentos.
+ * frag = 1: solo en fragment shaders (formas con bias). */
+typedef struct { int f, k, nargs, frag; const char* text; } smp_helper_t;
+static const smp_helper_t k_helpers[] = {
+    { F_TEX,   K_1D,   0, 0, "$R $N($S s,float x){return texture(s,vec2(x,0.5));} " },
+    { F_TEX,   K_1D,   0, 1, "$R $N($S s,float x,float b){return texture(s,vec2(x,0.5),b);} " },
+    { F_TEX,   K_1DA,  0, 0, "$R $N($S s,vec2 c){return texture(s,vec3(c.x,0.5,c.y));} " },
+    { F_TEX,   K_1DA,  0, 1, "$R $N($S s,vec2 c,float b){return texture(s,vec3(c.x,0.5,c.y),b);} " },
+    { F_TEX,   K_RECT, 0, 0, "$R $N($S s,vec2 p){return texture(s,p/vec2(textureSize(s,0)));} " },
+    { F_LOD,   K_1D,   0, 0, "$R $N($S s,float x,float l){return textureLod(s,vec2(x,0.5),l);} " },
+    { F_LOD,   K_1DA,  0, 0, "$R $N($S s,vec2 c,float l){return textureLod(s,vec3(c.x,0.5,c.y),l);} " },
+    { F_FETCH, K_1D,   0, 0, "$R $N($S s,int p,int l){return texelFetch(s,ivec2(p,0),l);} " },
+    { F_FETCH, K_1DA,  0, 0, "$R $N($S s,ivec2 p,int l){return texelFetch(s,ivec3(p.x,0,p.y),l);} " },
+    { F_FETCH, K_RECT, 0, 0, "$R $N($S s,ivec2 p){return texelFetch(s,p,0);} " },
+    { F_SIZE,  K_1D,   0, 0, "int $N($S s,int l){return textureSize(s,l).x;} " },
+    { F_SIZE,  K_1DA,  0, 0, "ivec2 $N($S s,int l){ivec3 z=textureSize(s,l);return ivec2(z.x,z.z);} " },
+    { F_SIZE,  K_RECT, 0, 0, "ivec2 $N($S s){return textureSize(s,0);} " },
+    { F_PROJ,  K_1D,   0, 0, "$R $N($S s,vec2 p){return texture(s,vec2(p.x/p.y,0.5));} "
+                             "$R $N($S s,vec4 p){return texture(s,vec2(p.x/p.w,0.5));} " },
+    { F_PROJ,  K_1D,   0, 1, "$R $N($S s,vec2 p,float b){return texture(s,vec2(p.x/p.y,0.5),b);} "
+                             "$R $N($S s,vec4 p,float b){return texture(s,vec2(p.x/p.w,0.5),b);} " },
+    { F_PROJ,  K_RECT, 0, 0, "$R $N($S s,vec3 p){return texture(s,(p.xy/p.z)/vec2(textureSize(s,0)));} "
+                             "$R $N($S s,vec4 p){return texture(s,(p.xy/p.w)/vec2(textureSize(s,0)));} " },
+    { F_PROJLOD, K_1D, 0, 0, "$R $N($S s,vec2 p,float l){return textureLod(s,vec2(p.x/p.y,0.5),l);} "
+                             "$R $N($S s,vec4 p,float l){return textureLod(s,vec2(p.x/p.w,0.5),l);} " },
+    { F_GRAD,  K_1D,   0, 0, "$R $N($S s,float x,float dx,float dy){return textureGrad(s,vec2(x,0.5),vec2(dx,0.0),vec2(dy,0.0));} " },
+    { F_GRAD,  K_1DA,  0, 0, "$R $N($S s,vec2 c,float dx,float dy){return textureGrad(s,vec3(c.x,0.5,c.y),vec2(dx,0.0),vec2(dy,0.0));} " },
+    { F_GRAD,  K_RECT, 0, 0, "$R $N($S s,vec2 p,vec2 dx,vec2 dy){vec2 z=vec2(textureSize(s,0));return textureGrad(s,p/z,dx/z,dy/z);} " },
+    { F_OFFSET, K_1D,  3, 0, "#define $N(s,x,o) textureOffset(s,vec2(x,0.5),ivec2(o,0))" },
+    { F_OFFSET, K_1D,  4, 1, "#define $N(s,x,o,b) textureOffset(s,vec2(x,0.5),ivec2(o,0),b)" },
+    { F_OFFSET, K_1DA, 3, 0, "#define $N(s,c,o) textureOffset(s,vec3((c).x,0.5,(c).y),ivec2(o,0))" },
+    { F_OFFSET, K_1DA, 4, 1, "#define $N(s,c,o,b) textureOffset(s,vec3((c).x,0.5,(c).y),ivec2(o,0),b)" },
+    { F_OFFSET, K_RECT, 3, 0, "#define $N(s,p,o) textureOffset(s,(p)/vec2(textureSize(s,0)),o)" },
+    { F_LODOFFSET, K_1D,  4, 0, "#define $N(s,x,l,o) textureLodOffset(s,vec2(x,0.5),l,ivec2(o,0))" },
+    { F_LODOFFSET, K_1DA, 4, 0, "#define $N(s,c,l,o) textureLodOffset(s,vec3((c).x,0.5,(c).y),l,ivec2(o,0))" },
+    { F_FETCHOFFSET, K_1D,   4, 0, "#define $N(s,p,l,o) texelFetchOffset(s,ivec2(p,0),l,ivec2(o,0))" },
+    { F_FETCHOFFSET, K_1DA,  4, 0, "#define $N(s,p,l,o) texelFetchOffset(s,ivec3((p).x,0,(p).y),l,ivec2(o,0))" },
+    { F_FETCHOFFSET, K_RECT, 3, 0, "#define $N(s,p,o) texelFetchOffset(s,p,0,o)" },
+    { F_GRADOFFSET, K_1D,  5, 0, "#define $N(s,x,dx,dy,o) textureGradOffset(s,vec2(x,0.5),vec2(dx,0.0),vec2(dy,0.0),ivec2(o,0))" },
+    { F_GRADOFFSET, K_1DA, 5, 0, "#define $N(s,c,dx,dy,o) textureGradOffset(s,vec3((c).x,0.5,(c).y),vec2(dx,0.0),vec2(dy,0.0),ivec2(o,0))" },
+    { F_GRADOFFSET, K_RECT, 5, 0, "#define $N(s,p,dx,dy,o) textureGradOffset(s,(p)/vec2(textureSize(s,0)),(dx)/vec2(textureSize(s,0)),(dy)/vec2(textureSize(s,0)),o)" },
+    { -1, 0, 0, 0, NULL }
+};
+
+static int has_macro_helper(int f, int k, int nargs)
+{
+    int i;
+    for (i = 0; k_helpers[i].text; i++)
+        if (k_helpers[i].f == f && k_helpers[i].k == k && k_helpers[i].nargs == nargs) return 1;
+    return 0;
+}
+
+/* numero de argumentos de una llamada; `c` apunta justo despues de su '(' (comas al nivel 0 hasta el ')' que la cierra).
+ * 0 si no hay argumentos o la llamada no cierra */
+static int call_nargs(const char* c)
+{
+    int depth = 0, n = 1;
+    skip_ws(&c);
+    if (*c == ')') return 0;
+    for (; *c; c++) {
+        if (*c == '(' || *c == '[') depth++;
+        else if (*c == ')' || *c == ']') { if (depth == 0) return n; depth--; }
+        else if (*c == ',' && depth == 0) n++;
+    }
+    return 0;
+}
 
 static char* rewrite_calls(char* s, const smpnames_t* t, unsigned char used[F_COUNT][K_COUNT][3],
                            const char** bad)
 {
     sb_t b = {0, 0, 0, 0};
     const char* p = s;
-    int f, any = 0;
+    int f;
     *bad = NULL;
     if (!t->cnt) return s;
-    /* funciones sin soporte sobre samplers reescritos */
+    /* funciones sin traduccion sobre samplers reescritos */
     for (f = 0; k_fn_unsup[f]; f++) {
         const char* q = s;
         while ((q = find_word(q, k_fn_unsup[f])) != NULL) {
@@ -359,11 +519,11 @@ static char* rewrite_calls(char* s, const smpnames_t* t, unsigned char used[F_CO
             if (*c != '(') continue;
             c++;
             nl = read_id(&c, &nm);
-            if (nl && smp_lookup(t, nm, nl)) { *bad = k_fn_unsup[f]; free(s); return NULL; }
+            if (nl && smp_resolve(t, q, nm, nl)) { *bad = k_fn_unsup[f]; free(s); return NULL; }
         }
     }
     while (*p) {
-        /* siguiente aparicion de cualquiera de las 4 funciones */
+        /* siguiente aparicion de cualquiera de las funciones traducibles */
         const char* best = NULL;
         int bf = -1;
         for (f = 0; f < F_COUNT; f++) {
@@ -376,19 +536,28 @@ static char* rewrite_calls(char* s, const smpnames_t* t, unsigned char used[F_CO
             const char* nm;
             size_t nl;
             const smpname_t* e = NULL;
+            int nargs = 0;
             skip_ws(&c);
             if (*c == '(') {
                 c++;
+                nargs = call_nargs(c);
                 nl = read_id(&c, &nm);
-                if (nl) e = smp_lookup(t, nm, nl);
+                if (nl) e = smp_resolve(t, best, nm, nl);
             }
             sb_cat(&b, p, (size_t)(best - p));
             if (e) {
                 char nmb[64];
-                snprintf(nmb, sizeof nmb, "lorica_%s_%s_%s", k_fn[bf], k_ksfx[e->kind], k_vsfx[e->v]);
+                if (bf >= F_FIRST_MACRO) {
+                    if (nargs <= 0 || nargs > 7 || !has_macro_helper(bf, e->kind, nargs)) {
+                        *bad = k_fn[bf]; free(b.p); free(s); return NULL;
+                    }
+                    snprintf(nmb, sizeof nmb, "lorica_%s_%s_%s_%d", k_fn[bf], k_ksfx[e->kind], k_vsfx[e->v], nargs);
+                    used[bf][e->kind][e->v] |= (unsigned char)(1u << nargs);
+                } else {
+                    snprintf(nmb, sizeof nmb, "lorica_%s_%s_%s", k_fn[bf], k_ksfx[e->kind], k_vsfx[e->v]);
+                    used[bf][e->kind][e->v] |= 1u;
+                }
                 sb_str(&b, nmb);
-                used[bf][e->kind][e->v] = 1;
-                any = 1;
             } else {
                 sb_str(&b, k_fn[bf]);
             }
@@ -396,70 +565,38 @@ static char* rewrite_calls(char* s, const smpnames_t* t, unsigned char used[F_CO
         }
     }
     sb_str(&b, p);
-    (void)any;
     free(s);
     if (b.oom) { free(b.p); return NULL; }
     return b.p;
 }
 
-/* texto de las funciones auxiliares usadas */
-static void emit_helpers(sb_t* o, unsigned char used[F_COUNT][K_COUNT][3])
+/* texto de las funciones / macros auxiliares usadas */
+static void emit_helpers(sb_t* o, unsigned char used[F_COUNT][K_COUNT][3], int frag)
 {
     static const char* const pre[3]  = { "", "i", "u" };
     static const char* const rty[3]  = { "vec4", "ivec4", "uvec4" };
-    char buf[512];
-    int f, k, v;
+    int i, v;
     for (v = 0; v < 3; v++)
-        for (k = 0; k < K_COUNT; k++)
-            for (f = 0; f < F_COUNT; f++) {
-                const char* sty = (k == K_1DA) ? "sampler2DArray" : "sampler2D";
-                const char* nm = k_fn[f];
-                if (!used[f][k][v]) continue;
-#define EMIT(...) do { snprintf(buf, sizeof buf, __VA_ARGS__); sb_str(o, buf); } while (0)
-                if (k == K_1D) {
-                    if (f == F_TEX) {
-                        EMIT("%s lorica_%s_1D_%s(highp %s%s s, float x){return texture(s,vec2(x,0.5));} ",
-                             rty[v], nm, k_vsfx[v], pre[v], sty);
-                        if (v == V_F)
-                            sb_str(o, "vec4 lorica_texture_1D_f(highp sampler2D s, float x, float b){return texture(s,vec2(x,0.5),b);} ");
-                    } else if (f == F_LOD)
-                        EMIT("%s lorica_%s_1D_%s(highp %s%s s, float x, float l){return textureLod(s,vec2(x,0.5),l);} ",
-                             rty[v], nm, k_vsfx[v], pre[v], sty);
-                    else if (f == F_FETCH)
-                        EMIT("%s lorica_%s_1D_%s(highp %s%s s, int p, int l){return texelFetch(s,ivec2(p,0),l);} ",
-                             rty[v], nm, k_vsfx[v], pre[v], sty);
-                    else
-                        EMIT("int lorica_%s_1D_%s(highp %s%s s, int l){return textureSize(s,l).x;} ",
-                             nm, k_vsfx[v], pre[v], sty);
-                } else if (k == K_1DA) {
-                    if (f == F_TEX) {
-                        EMIT("%s lorica_%s_1DA_%s(highp %s%s s, vec2 c){return texture(s,vec3(c.x,0.5,c.y));} ",
-                             rty[v], nm, k_vsfx[v], pre[v], sty);
-                        if (v == V_F)
-                            sb_str(o, "vec4 lorica_texture_1DA_f(highp sampler2DArray s, vec2 c, float b){return texture(s,vec3(c.x,0.5,c.y),b);} ");
-                    } else if (f == F_LOD)
-                        EMIT("%s lorica_%s_1DA_%s(highp %s%s s, vec2 c, float l){return textureLod(s,vec3(c.x,0.5,c.y),l);} ",
-                             rty[v], nm, k_vsfx[v], pre[v], sty);
-                    else if (f == F_FETCH)
-                        EMIT("%s lorica_%s_1DA_%s(highp %s%s s, ivec2 p, int l){return texelFetch(s,ivec3(p.x,0,p.y),l);} ",
-                             rty[v], nm, k_vsfx[v], pre[v], sty);
-                    else
-                        EMIT("ivec2 lorica_%s_1DA_%s(highp %s%s s, int l){ivec3 z=textureSize(s,l);return ivec2(z.x,z.z);} ",
-                             nm, k_vsfx[v], pre[v], sty);
-                } else {   /* K_RECT: coordenadas sin normalizar, sin mipmaps */
-                    if (f == F_TEX)
-                        EMIT("%s lorica_%s_RECT_%s(highp %s%s s, vec2 p){return texture(s,p/vec2(textureSize(s,0)));} ",
-                             rty[v], nm, k_vsfx[v], pre[v], sty);
-                    else if (f == F_FETCH)
-                        EMIT("%s lorica_%s_RECT_%s(highp %s%s s, ivec2 p){return texelFetch(s,p,0);} ",
-                             rty[v], nm, k_vsfx[v], pre[v], sty);
-                    else if (f == F_SIZE)
-                        EMIT("ivec2 lorica_%s_RECT_%s(highp %s%s s){return textureSize(s,0);} ",
-                             nm, k_vsfx[v], pre[v], sty);
-                    /* textureLod sobre Rect no existe en GLSL de escritorio */
-                }
-#undef EMIT
+        for (i = 0; k_helpers[i].text; i++) {
+            const smp_helper_t* h = &k_helpers[i];
+            char name[64], sty[48];
+            const char* q;
+            if (h->frag && !frag) continue;
+            if (!(used[h->f][h->k][v] & (1u << h->nargs))) continue;
+            if (h->nargs) {
+                snprintf(name, sizeof name, "lorica_%s_%s_%s_%d", k_fn[h->f], k_ksfx[h->k], k_vsfx[v], h->nargs);
+                sb_str(o, "\n");            /* una directiva empieza al inicio de una linea */
+            } else
+                snprintf(name, sizeof name, "lorica_%s_%s_%s", k_fn[h->f], k_ksfx[h->k], k_vsfx[v]);
+            snprintf(sty, sizeof sty, "highp %s%s", pre[v], h->k == K_1DA ? "sampler2DArray" : "sampler2D");
+            for (q = h->text; *q; q++) {
+                if (q[0] == '$' && q[1] == 'R')      { sb_str(o, rty[v]); q++; }
+                else if (q[0] == '$' && q[1] == 'S') { sb_str(o, sty); q++; }
+                else if (q[0] == '$' && q[1] == 'N') { sb_str(o, name); q++; }
+                else sb_cat(o, q, 1);
             }
+            if (h->nargs) sb_str(o, "\n");
+        }
 }
 
 /* ---------- salidas del fragment shader: layout(location=N) segun glBindFragDataLocation ---------- */
@@ -626,28 +763,31 @@ static GL31_TLS gl31_conv_info_t g_info;
 void gl31_glsl_set_opts(const gl31_conv_opts_t* o) { if (o) g_opts = *o; else memset(&g_opts, 0, sizeof g_opts); }
 void gl31_glsl_get_info(gl31_conv_info_t* out) { if (out) *out = g_info; }
 
-/* Renombra la definicion `void main(` a `void lorica_main(`. *found = 0 si no existe. */
+/* Renombra todas las definiciones `void main(` a `void lorica_main(`. *found = 0 si no existe.
+ * Todas, no solo la primera: un shader de fuente unica puede tener un main por rama #if/#ifdef. */
 static char* rename_main(char* s, int* found)
 {
     const char* p = s;
+    sb_t o = {0, 0, 0, 0};
+    const char* last = s;       /* inicio del tramo aun no copiado */
     *found = 0;
     while ((p = find_word(p, "main")) != NULL) {
         const char* b = p; const char* q = p + 4;
         while (b > s && isspace((unsigned char)b[-1])) b--;
         while (isspace((unsigned char)*q)) q++;
         if (b - s >= 4 && strncmp(b - 4, "void", 4) == 0 && (b - 4 == s || !is_id((unsigned char)b[-5])) && *q == '(') {
-            sb_t o = {0, 0, 0, 0};
-            sb_cat(&o, s, (size_t)(p - s));
+            sb_cat(&o, last, (size_t)(p - last));
             sb_str(&o, "lorica_main");
-            sb_str(&o, p + 4);
-            free(s);
-            if (o.oom) { free(o.p); return NULL; }
+            last = p + 4;
             *found = 1;
-            return o.p;
         }
         p += 4;
     }
-    return s;
+    if (!*found) return s;
+    sb_str(&o, last);
+    free(s);
+    if (o.oom) { free(o.p); *found = 0; return NULL; }
+    return o.p;
 }
 
 /* Cuantas clip distances usa el VS (1..8). Una redeclaracion con tamano cuenta como tamano. */
@@ -861,6 +1001,112 @@ static char* assign_ssbo_bindings(char* s, gl31_conv_info_t* info)
     return s;
 }
 
+/* gl31_glsl_convert_for_legacy (camino hibrido) marca esta conversion: ademas de la comun, baja los built-ins de compatibilidad
+ * y quita las redeclaraciones de built-ins que el GLSL de escritorio admite. */
+static int g_promote_int_next;
+
+/* Contrato de built-ins de compatibilidad (modo hibrido, etapa 2). Los atributos (gl_Vertex, gl_MultiTexCoordN...) y los
+ * uniforms de estado (gl_ModelViewProjectionMatrix, gl_NormalMatrix, gl_TextureMatrix[]...) dependen de la funcion fija,
+ * que en un contexto hibrido es de GL4ES. GLADIATOR no duplica sus tablas: le pregunta al dueno del contrato (registrado
+ * por el puente) el nombre y la declaracion de cada uno, y el runtime de GL4ES los alimenta por nombre al linkear y al
+ * dibujar. Sin contrato (contextos core) siguen rechazados. */
+static gl31_compat_builtin_fn g_compat_builtin = NULL;
+void gl31_glsl_set_compat_builtins(gl31_compat_builtin_fn fn) { g_compat_builtin = fn; }
+
+/* Baja los built-ins de compatibilidad que el contrato conoce. Devuelve s (o NULL si OOM); las declaraciones van a d. */
+static char* lower_compat_builtins(char* s, int vertex, sb_t* d)
+{
+    char seen[48][48];
+    int nseen = 0, k;
+    const char* p = s;
+    char repl[96], decl[160];
+    if (!g_compat_builtin) return s;
+    /* ftransform(): MVP * gl_Vertex (lo resuelven los dos built-ins de abajo) */
+    char ft_mvp[96] = "", ft_vtx[96] = "";
+    if (vertex && find_word(s, "ftransform")) {
+        repl[0] = decl[0] = 0;
+        if (g_compat_builtin("gl_ModelViewProjectionMatrix", 1, ft_mvp, sizeof ft_mvp, decl, sizeof decl) && ft_mvp[0]) {
+            if (decl[0] && !strstr(d->p ? d->p : "", decl)) sb_str(d, decl);
+            decl[0] = 0;
+            if (g_compat_builtin("gl_Vertex", 1, ft_vtx, sizeof ft_vtx, decl, sizeof decl) && ft_vtx[0]) {
+                if (decl[0] && !strstr(d->p ? d->p : "", decl)) sb_str(d, decl);
+                s = repl_word(s, "ftransform", "lorica_ftransform");
+                if (!s) return NULL;
+            }
+        }
+    }
+    p = s;
+    while ((p = strstr(p, "gl_")) != NULL) {
+        const char* e = p + 3;
+        size_t n;
+        if (p != s && is_id((unsigned char)p[-1])) { p += 3; continue; }
+        while (is_id((unsigned char)*e)) e++;
+        n = (size_t)(e - p);
+        if (n < sizeof seen[0]) {
+            char nm[48];
+            memcpy(nm, p, n); nm[n] = 0;
+            for (k = 0; k < nseen; k++) if (!strcmp(seen[k], nm)) break;
+            if (k == nseen && nseen < 48) {
+                strcpy(seen[nseen++], nm);
+                repl[0] = decl[0] = 0;
+                if (g_compat_builtin(nm, vertex, repl, sizeof repl, decl, sizeof decl) && repl[0]) {
+                    size_t off = (size_t)(p - s);
+                    s = repl_word(s, nm, repl);
+                    if (!s) return NULL;
+                    if (decl[0] && !strstr(d->p ? d->p : "", decl)) sb_str(d, decl);
+                    p = s + off;          /* el texto cambio: seguir desde la misma posicion */
+                    continue;
+                }
+            }
+        }
+        p = e;
+    }
+    if (ft_vtx[0] && find_word(s, "lorica_ftransform")) {
+        sb_str(d, "vec4 lorica_ftransform() { return "); sb_str(d, ft_mvp); sb_str(d, " * "); sb_str(d, ft_vtx);
+        sb_str(d, "; }\n");
+    }
+    return s;
+}
+static int lcg_idc(int c)  { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+
+/* Camino hibrido: el GLSL de escritorio permite redeclarar built-ins (`out vec4 gl_Position;`, `in vec4 gl_FragCoord;`...) y ES no. */
+static size_t lcg_strip_builtin_decl(char* s, size_t len)
+{
+    static const char* const decls[][3] = {
+        { "out", "vec4", "gl_Position" }, { "in", "vec4", "gl_FragCoord" },
+        { "out", "vec4", "gl_FragColor" }, { "out", "float", "gl_FragDepth" }
+    };
+    size_t i = 0, o = 0;
+    while (i < len) {
+        int hit = 0;
+        if (i == 0 || s[i - 1] == '\n') {
+            size_t j = i;
+            int d;
+            for (d = 0; d < 4 && !hit; d++) {
+                int k, ok = 1;
+                j = i;
+                while (j < len && (s[j] == ' ' || s[j] == '\t')) j++;
+                for (k = 0; k < 3 && ok; k++) {
+                    size_t l = strlen(decls[d][k]);
+                    if (j + l <= len && memcmp(s + j, decls[d][k], l) == 0 && (j + l == len || !lcg_idc((unsigned char)s[j + l]))) {
+                        j += l;
+                        while (j < len && (s[j] == ' ' || s[j] == '\t')) j++;
+                    } else ok = 0;
+                }
+                if (ok && j < len && s[j] == ';') {
+                    j++;
+                    while (j < len && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r')) j++;
+                    if (j >= len || s[j] == '\n') { hit = 1; i = (j < len) ? j + 1 : j; }
+                }
+            }
+        }
+        if (hit) continue;
+        s[o++] = s[i++];
+    }
+    s[o] = '\0';
+    return o;
+}
+
 char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
                            const gl31_fragbind_t* binds, int nbinds,
                            gl31_sampler_info_t* samplers, char* err, size_t errlen)
@@ -868,15 +1114,17 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
     char *s = NULL, *p;
     sb_t ext = {0, 0, 0, 0}, o = {0, 0, 0, 0};
     long ver = 110;
-    int i, uses_color = 0, uses_data = 0, es = gl31_caps.glsl_es ? gl31_caps.glsl_es : 300;
+    int i, uses_color = 0, uses_data = 0, uses_shadow = 0, es = gl31_caps.glsl_es ? gl31_caps.glsl_es : 300;
     char num[32];
-    smpnames_t names;
+    static GL31_TLS smpnames_t names;
     unsigned char used[F_COUNT][K_COUNT][3];
     const char* bad = NULL;
 
     gl31_conv_opts_t opts = g_opts;                /* las opciones valen para una sola conversion */
     sb_t lu_hdr = {0, 0, 0, 0}, lu_tail = {0, 0, 0, 0};
     memset(&g_opts, 0, sizeof g_opts);
+    int promote_int = g_promote_int_next;
+    g_promote_int_next = 0;
     memset(&g_info, 0, sizeof g_info);
     memset(&names, 0, sizeof names);
     memset(used, 0, sizeof used);
@@ -927,6 +1175,43 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
         goto fail;
     }
 
+    /* solo el codigo activo: todas las comprobaciones textuales de abajo dependen de esto */
+    gl31_glsl_pp_resolve(s, ver);
+
+    /* built-ins de compatibilidad que son un varying puro (sin estado externo, como VARYING_SLOT_COL0 en Mesa):
+     * par de color, gl_TexCoord[] y gl_FogFragCoord pasan a varyings genericos. Los que necesitan estado de funcion fija
+     * (gl_Vertex, gl_ModelViewMatrix, atributos...) siguen rechazados abajo. */
+    {
+        sb_t d = {0, 0, 0, 0};
+        int vsx = (shader_type == GL_VERTEX_SHADER), fsx = (shader_type == GL_FRAGMENT_SHADER);
+        if (vsx && find_word(s, "gl_FrontColor")) { s = repl_word(s, "gl_FrontColor", "lorica_fc"); if (s && !strstr(s, "vec4 lorica_fc;")) sb_str(&d, "out vec4 lorica_fc;\n"); }
+        if (s && fsx && find_word(s, "gl_Color")) { s = repl_word(s, "gl_Color", "lorica_fc"); if (s && !strstr(s, "vec4 lorica_fc;")) sb_str(&d, "in vec4 lorica_fc;\n"); }
+        if (s && (vsx || fsx) && find_word(s, "gl_TexCoord")) {
+            s = repl_word(s, "gl_TexCoord", "lorica_tc"); if (s && !strstr(s, "vec4 lorica_tc[")) sb_str(&d, vsx ? "out vec4 lorica_tc[8];\n" : "in vec4 lorica_tc[8];\n");
+        }
+        if (s && (vsx || fsx) && find_word(s, "gl_FogFragCoord")) {
+            s = repl_word(s, "gl_FogFragCoord", "lorica_ffc"); if (s && !strstr(s, "float lorica_ffc;")) sb_str(&d, vsx ? "out float lorica_ffc;\n" : "in float lorica_ffc;\n");
+        }
+        /* atributos y uniforms de estado: solo en el camino hibrido (promote_int marca gl31_glsl_convert_for_legacy) */
+        if (s && promote_int && (vsx || fsx)) s = lower_compat_builtins(s, vsx, &d);
+        if (!s || d.oom) { free(d.p); goto oom; }
+        if (d.n) {
+            size_t dl = strlen(d.p), sl = strlen(s);
+            char* t = (char*)malloc(dl + sl + 1);
+            if (!t) { free(d.p); goto oom; }
+            memcpy(t, d.p, dl); memcpy(t + dl, s, sl + 1);
+            free(s); s = t;
+        }
+        free(d.p);
+    }
+    if (promote_int) lcg_strip_builtin_decl(s, strlen(s));
+    {
+        /* conversiones implicitas de escritorio (int -> uint -> float) hechas explicitas, con tipos (gl31_glsl_tc.c) */
+        char* t = gl31_glsl_implicit_conv(s);
+        if (!t) goto oom;
+        free(s); s = t;
+    }
+
     /* --- construcciones sin equivalente o que dependen del backend --- */
     for (i = 0; k_unsupported[i]; i++)
         if (find_word(s, k_unsupported[i])) {
@@ -973,6 +1258,7 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
     if (shader_type == GL_FRAGMENT_SHADER) {
         uses_color = find_word(s, "gl_FragColor") != NULL;
         uses_data  = find_word(s, "gl_FragData")  != NULL;
+        /* Tras el preprocesador condicional solo queda el codigo activo: usar los dos a la vez es un error real. */
         if (uses_color && uses_data) {
             set_err(err, errlen, "gl_FragColor y gl_FragData a la vez", NULL);
             goto fail;
@@ -1008,8 +1294,10 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
     }
     if (es < 320 && !(s = repl_word(s, "precise", ""))) goto oom;
 
-    /* --- palabras clave --- */
-    if (ver < 130) {
+    /* --- palabras clave ---
+     * attribute/varying siguen siendo validos (obsoletos) en GLSL 1.30/1.40 y en el perfil compatibility, y en GLSL ES 3.00
+     * son palabras reservadas: cualquier aparicion es el calificador, sea cual sea la version. */
+    {
         if (shader_type == GL_VERTEX_SHADER) {
             if (!(s = repl_word(s, "attribute", "in"))) goto oom;
             if (!(s = repl_word(s, "varying", "out"))) goto oom;
@@ -1019,6 +1307,16 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
     }
     for (i = 0; k_rename[i][0]; i++)
         if (!(s = repl_word(s, k_rename[i][0], k_rename[i][1]))) goto oom;
+    {   /* shadow2D* de GLSL <= 1.20: devuelven vec4; texture() de un sampler2DShadow devuelve float */
+        static const char* const sh[] = { "shadow2D", "shadow2DProj", "shadow2DLod", "shadow2DProjLod", NULL };
+        char nm[32];
+        for (i = 0; sh[i]; i++)
+            if (find_word(s, sh[i])) {
+                snprintf(nm, sizeof nm, "lorica_%s", sh[i]);
+                if (!(s = repl_word(s, sh[i], nm))) goto oom;
+                uses_shadow = 1;
+            }
+    }
     if (!(s = repl_word(s, "noperspective", ""))) goto oom;
     if (uses_color && !(s = repl_word(s, "gl_FragColor", "lorica_FragColor"))) goto oom;
     if (uses_data  && !(s = repl_word(s, "gl_FragData",  "lorica_FragData")))  goto oom;
@@ -1031,6 +1329,7 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
     if (names.cnt) {
         if (samplers)
             for (i = 0; i < names.cnt && samplers->n < GL31_MAX_SAMPLER_INFO; i++) {
+                if (names.n[i].scope >= 0) continue;   /* parametros de funcion: no son uniforms */
                 memcpy(samplers->s[samplers->n].name, names.n[i].name, sizeof samplers->s[0].name);
                 samplers->s[samplers->n].type = names.n[i].gl;
                 samplers->n++;
@@ -1049,6 +1348,8 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
     free(s);
     s = p;
     if (!s) goto oom;
+    /* `layout(depth_any) out float gl_FragDepth;` leaves a bare redeclaration once the layout is gone */
+    if (promote_int) lcg_strip_builtin_decl(s, strlen(s));
     if (shader_type == GL_FRAGMENT_SHADER && nbinds > 0) {
         int k2;
         s = inject_frag_locations(s, binds, nbinds);
@@ -1073,7 +1374,16 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
     emit_precisions(&o);
     if (uses_color) sb_str(&o, "layout(location = 0) out highp vec4 lorica_FragColor; ");
     if (uses_data)  sb_str(&o, "layout(location = 0) out highp vec4 lorica_FragData[4]; ");
-    emit_helpers(&o, used);
+    emit_helpers(&o, used, shader_type == GL_FRAGMENT_SHADER);
+    if (uses_shadow) {   /* resultado como con GL_DEPTH_TEXTURE_MODE = GL_LUMINANCE (el valor por defecto) */
+        sb_str(&o, "\nhighp vec4 lorica_shadow2D(highp sampler2DShadow s, highp vec3 c) { highp float r = texture(s, c); return vec4(r, r, r, 1.0); }\n"
+                   "highp vec4 lorica_shadow2DProj(highp sampler2DShadow s, highp vec4 c) { highp float r = textureProj(s, c); return vec4(r, r, r, 1.0); }\n"
+                   "highp vec4 lorica_shadow2DLod(highp sampler2DShadow s, highp vec3 c, highp float l) { highp float r = textureLod(s, c, l); return vec4(r, r, r, 1.0); }\n"
+                   "highp vec4 lorica_shadow2DProjLod(highp sampler2DShadow s, highp vec4 c, highp float l) { highp float r = textureProjLod(s, c, l); return vec4(r, r, r, 1.0); }\n");
+        if (shader_type == GL_FRAGMENT_SHADER)   /* con bias: solo en el fragment shader */
+            sb_str(&o, "highp vec4 lorica_shadow2D(highp sampler2DShadow s, highp vec3 c, highp float b) { highp float r = texture(s, c, b); return vec4(r, r, r, 1.0); }\n"
+                       "highp vec4 lorica_shadow2DProj(highp sampler2DShadow s, highp vec4 c, highp float b) { highp float r = textureProj(s, c, b); return vec4(r, r, r, 1.0); }\n");
+    }
     if (lu_hdr.n) sb_cat(&o, lu_hdr.p, lu_hdr.n);
     sb_str(&o, "\n#line 1\n");
     sb_str(&o, s);
@@ -1093,4 +1403,34 @@ fail:
 char* gl31_glsl_convert(const char* src, GLenum shader_type, char* err, size_t errlen)
 {
     return gl31_glsl_convert_ex(src, shader_type, NULL, 0, NULL, err, errlen);
+}
+
+/* Conversion para un shader que compila otro llamador (el puente hibrido: GL4ES compila el GLSL ES que sale de aqui).
+ * Mismas opciones que usa gl31_glCompileShader para un shader suelto. Devuelve memoria de malloc o NULL con `err`. */
+char* gl31_glsl_convert_for_legacy(const char* src, unsigned shader_type, char* err, size_t errlen)
+{
+    return gl31_glsl_convert_for_legacy_ex(src, shader_type, 0, 0, NULL, err, errlen);
+}
+
+/* Igual, con las clip distances emuladas (backend sin EXT_clip_cull_distance): un VS devuelve en *cd_n cuantas
+ * escribe en lorica_cd[]; un FS se convierte con fs_cd = las del VS del programa (las descarta por mascara). Es lo
+ * que hace gl31_glLinkProgram en sus contextos; en el hibrido linkea GL4ES y lo pide al linkear. */
+char* gl31_glsl_convert_for_legacy_ex(const char* src, unsigned shader_type, int staged, int fs_cd, int* cd_n,
+                                      char* err, size_t errlen)
+{
+    gl31_conv_opts_t co;
+    char* out;
+    memset(&co, 0, sizeof co);
+    co.last_vs = (shader_type == GL_VERTEX_SHADER) && !staged;   /* con geometry/teselacion el VS no es la ultima etapa */
+    co.fs_cd = (shader_type == GL_FRAGMENT_SHADER) ? fs_cd : 0;
+    gl31_glsl_set_opts(&co);
+    g_promote_int_next = 1;
+    out = gl31_glsl_convert_ex(src, (GLenum)shader_type, NULL, 0, NULL, err, errlen);
+    if (cd_n) {
+        gl31_conv_info_t ci;
+        memset(&ci, 0, sizeof ci);
+        if (out) gl31_glsl_get_info(&ci);
+        *cd_n = ci.cd_n;
+    }
+    return out;
 }

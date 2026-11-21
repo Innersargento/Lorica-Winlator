@@ -101,6 +101,8 @@ typedef struct {
     GLuint  pack_align,
             unpack_align;            
     GLboolean pack_lsb_first;
+    GLboolean unpack_swap_bytes,     // ES has neither: applied by GL4ES on the pixels (pixel_swap.h)
+              pack_swap_bytes;
     gltexture_t *bound[MAX_TEX][ENABLED_TEXTURE_LAST];  //TODO: this should be shared
     gltexture_t *zero;  // this is texture 0...
     GLboolean pscoordreplace[MAX_TEX];
@@ -126,6 +128,7 @@ typedef struct {
     rasterpos_t rPos;
     GLboolean   rPos_valid;     /* 0 once glRasterPos clips or w<=0 */
                                 /* TODO: expose as GL_CURRENT_RASTER_POSITION_VALID */
+    GLfloat     rColor[4];      /* current raster color: glColor at the last glRasterPos/glWindowPos (glBitmap uses it) */
     viewport_t viewport;
     viewport_t scissor;
     int         viewport_known; /* 1 after glViewport or an init query; width==0 is legal */
@@ -295,6 +298,11 @@ typedef struct {
     GLenum read_type;
     int    n_draw;
     GLenum drawbuff[MAX_DRAW_BUFFERS];    //TODO: define a MAX_DRAWBUFF?
+    // GLES 3 backend, glDrawBuffers mapping that is not output i -> COLOR_ATTACHMENTi: the draws go to a proxy FBO
+    // whose attachment i is this FBO's drawbuff[i] (framebuffers.c, gl4es_fbo_draw_begin)
+    int    remap;
+    int    proxy_dirty;
+    GLuint proxy;
 } glframebuffer_t;
 
 typedef struct {

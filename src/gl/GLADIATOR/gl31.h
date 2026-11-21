@@ -640,13 +640,16 @@ typedef double GLclampd;
 typedef struct {
     int es_major, es_minor;     /* versión GLES */
     int has_pvrtc, has_s3tc;    /* compresión */
-    int has_astc, has_bptc;
+    int has_astc, has_bptc, has_rgtc;
     int has_basis;
     int tex_buffer;             /* glTexBuffer / samplerBuffer */
     int draw_instanced;         /* EXT_draw_instanced (en ES 3.0 el instancing ya es core) */
     int draw_buf_indexed;       /* ES 3.2 o EXT/OES_draw_buffers_indexed (Enablei, ColorMaski...) */
     int half_float;             /* EXT_color_buffer_half_float */
     int float_buffer;           /* EXT_color_buffer_float */
+    int float_linear;           /* OES_texture_float_linear: los 32F se filtran (GL_LINEAR) */
+    int norm16;                 /* EXT_texture_norm16: R16/RG16/RGBA16 (UNORM) muestreables y renderizables */
+    int render_snorm;           /* EXT_render_snorm: los SNORM son renderizables */
     int border_clamp;           /* ES 3.2 o EXT/OES_texture_border_clamp */
     int aniso;                  /* EXT_texture_filter_anisotropic */
     int level_query;            /* ES 3.1+: glGetTexLevelParameter nativo */
@@ -696,6 +699,7 @@ typedef struct {
     GLuint     buffer;
     GLintptr   offset;
     GLsizeiptr size;   /* 0 = buffer completo (BindBufferBase) */
+    int        fit;    /* solo UBO: 0 el backend tiene el rango de la app; 1 rango ampliado al bloque; 2 copia con relleno (gl31_ubo_fit) */
 } gl31_ubo_binding_t;
 
 #define GL31_MAX_SOFTCAPS 32      /* caps de desktop servidas por estado propio (gl31_render.c) */
@@ -762,12 +766,20 @@ typedef struct {
     GLint   ubo_alignment;
     GLint   max_ubo_bindings;
     GLint   max_tex_units;
+    /* copias con relleno de ceros para bloques uniform mas grandes que el buffer ligado (gl31_ubo_fit) */
+    GLuint     ubo_pad[GL31_MAX_UBO_BINDINGS];
+    GLsizeiptr ubo_pad_cap[GL31_MAX_UBO_BINDINGS];
+    GLuint     ubo_fit_program;    /* ultimo programa validado y ... */
+    unsigned   ubo_fit_gen;        /* ... la generacion de enlaces con la que se valido */
+    unsigned   ubo_gen;            /* sube con cada cambio de enlace UBO, glUniformBlockBinding o link */
+    int        ubo_fit_padded;     /* la ultima validacion uso copias: se rehacen en cada draw (los datos pueden cambiar) */
 } gl31_state_t;
 
 /* gl31.c */
 typedef void* (*gl31_loader_fn)(const char* name);
 int   gl31_init(gl31_loader_fn loader);          /* 0 = OK */
 void  gl31_shutdown(void);
+int   gl31_buffer_storage_path(void);         /* 1 nativo, 2 Vulkan, 0 sin camino (gl31_buffer.c) */
 void* gl31_get_proc_address(const char* name);   /* NULL si no es de GL31 */
 
 /* gl31_state.c */
@@ -856,6 +868,7 @@ void gl31_glGetQueryObjectiv(GLuint id, GLenum pname, GLint* params);
 void gl31_set_max_version(int major, int minor);
 /* Version/perfil del contexto actual (0,0,0 = sin tope por contexto). Lo llama ActivateGLState. */
 void gl31_set_context_version(int major, int minor, int profile);
+void gl31_set_context_flags(int flags);
 void gl31_advertised_version(int* major, int* minor);
 int  gl31_advertised_minor(void);   /* compat: minor de la version anunciada */
 const GLubyte* gl31_glGetString(GLenum name);
@@ -865,6 +878,13 @@ void gl31_glGetIntegerv(GLenum pname, GLint* data);
 /* gl31_shader_glsl.c: GLSL 1.30/1.40/1.50/3.30 -> GLSL ES 3.00.
  * Devuelve memoria malloc'd (free) o NULL y rellena err. */
 char* gl31_glsl_convert(const char* src, GLenum shader_type, char* err, size_t errlen);
+char* gl31_glsl_convert_for_legacy(const char* src, unsigned shader_type, char* err, size_t errlen);
+char* gl31_glsl_convert_for_legacy_ex(const char* src, unsigned shader_type, int staged, int fs_cd, int* cd_n,
+                                      char* err, size_t errlen);
+/* Contrato de built-ins de compatibilidad (modo hibrido): para `name` (gl_Vertex, gl_ModelViewMatrix...) en un vertex
+ * (vertex=1) o fragment shader, escribe el nombre que lo reemplaza y su declaracion GLSL ES 3.00; 0 = no lo conoce. */
+typedef int (*gl31_compat_builtin_fn)(const char* name, int vertex, char* repl, size_t replen, char* decl, size_t decllen);
+void gl31_glsl_set_compat_builtins(gl31_compat_builtin_fn fn);
 
 /* gl31_shader_link.c */
 void   gl31_link_shutdown(void);
@@ -890,6 +910,13 @@ GLint  gl31_glGetUniformLocation(GLuint program, const GLchar* name);
 
 /* gl31_stubs.c */
 void gl31_stub_warn(const char* fn);
+/* diagnostico (LIBGL_DEBUG): log a logcat (tag LIBGL) y bandera cacheada */
+void gl31_log(const char* fmt, ...);
+int gl31_diag(void);
+/* gl31_texture.c: formato de almacenamiento ES para un internalformat de desktop (segun capacidades del backend) */
+GLenum gl31_storage_format(GLenum ifmt);
+/* gl31_fbo.c: idem para renderbuffers (formatos sin tamano incluidos) */
+GLenum gl31_rb_storage_format(GLenum ifmt);
 void gl31_glTexBuffer(GLenum target, GLenum internalformat, GLuint buffer);
 void gl31_glBindFragDataLocation(GLuint program, GLuint color, const GLchar* name);
 void gl31_glTexImage1D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLint border, GLenum format, GLenum type, const void* pixels);
@@ -971,6 +998,9 @@ void gl31_glVertexAttrib4Nsv(GLuint index, const GLshort* v);
 void gl31_glVertexAttrib4Nubv(GLuint index, const GLubyte* v);
 void gl31_glVertexAttrib4Nusv(GLuint index, const GLushort* v);
 void gl31_glVertexAttrib4Nuiv(GLuint index, const GLuint* v);
+void gl31_glVertexAttrib4Niv(GLuint index, const GLint* v);
+void gl31_glGetPointerv(GLenum pname, void** params);
+void gl31_glShaderBinary(GLsizei count, const GLuint* shaders, GLenum binaryformat, const void* binary, GLsizei length);
 void gl31_glVertexAttrib4bv(GLuint index, const GLbyte* v);
 void gl31_glVertexAttrib4iv(GLuint index, const GLint* v);
 void gl31_glVertexAttrib4ubv(GLuint index, const GLubyte* v);
@@ -1403,9 +1433,19 @@ typedef struct {
 /* glShaderStorageBlockBinding: ES fija el binding en el shader. Cada bloque recibe un binding unico en el
  * backend y el enlace real se resuelve antes de cada draw/dispatch (gl31_ssbo_sync). */
 void   gl31_ssbo_sync(void);
+/* Antes de cada draw: los bloques uniform del programa `program` (nombre del backend) con un rango ligado mas corto
+ * que el bloque reciben el tamano exacto del bloque, o una copia con ceros al final si el buffer no alcanza (gl31_uniform.c) */
+void   gl31_ubo_fit(GLuint program);
+void   gl31_ubo_invalidate(void);
 void   gl31_ssbo_record(GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size);
 int    gl31_ssbo_get(GLuint index, GLuint* buffer, GLint64* offset, GLint64* size);
 GLint  gl31_program_ssbo_binding(GLuint program, GLuint block_index, GLint backend_binding);
+/* gl31_glsl_pp.c: preprocesador condicional minimo (#if/#ifdef/#ifndef/#elif/#else/#endif, #define/#undef).
+ * Sustituye por espacios las lineas inactivas y las directivas condicionales, en sitio (se conservan los saltos).
+ * Devuelve 1 si proceso el texto, 0 si lo dejo intacto (expresion no evaluable). */
+int   gl31_glsl_pp_resolve(char* s, long ver);
+int   gl31_ext_advertised(const char* name);              /* gl31_query.c: GL_EXTENSIONS la incluye */
+
 void  gl31_glsl_set_opts(const gl31_conv_opts_t* o);      /* vale solo para la siguiente conversion */
 void  gl31_glsl_get_info(gl31_conv_info_t* out);          /* info de la ultima conversion (TLS) */
 void  gl31_xfb_account(GLenum mode, GLsizei count, GLsizei inst);   /* un draw se ha emitido */
@@ -1415,6 +1455,8 @@ int   gl31_query_target_active(GLenum target);
 int   gl31_program_staged(GLuint program);                          /* tiene geometry / tessellation */
 void  gl31_lu_bump(void);                                 /* el estado que alimenta los uniforms cambio */
 void  gl31_lu_sync(void);
+void  gl31_hybrid_set_program(GLuint program);            /* modo hibrido: programa actual de GL4ES */
+void  gl31_lu_values(GLfloat point_size, int pps, GLenum sprite_origin, unsigned mask_lo, GLfloat out[3][4]);
 int   gl31_lu_hidden_count(GLuint program);
 GLuint gl31_lu_app_to_backend(GLuint program, GLuint idx);
 GLuint gl31_lu_backend_to_app(GLuint program, GLuint idx);                                 /* antes de dibujar: sube los uniforms si hace falta */
@@ -1476,6 +1518,12 @@ void gl31_glCopyTextureSubImage2D(GLuint t, GLint l, GLint xo, GLint yo, GLint x
 void gl31_glCopyTextureSubImage3D(GLuint t, GLint l, GLint xo, GLint yo, GLint zo, GLint x, GLint y, GLsizei w, GLsizei h);
 void gl31_glGetTextureImage(GLuint t, GLint l, GLenum f, GLenum ty, GLsizei bufSize, void* pixels);
 void gl31_glGetCompressedTextureImage(GLuint t, GLint l, GLsizei bufSize, void* pixels);
+int  gl31_compressed_formats(GLint* out);      /* gl31_texture.c: formatos comprimidos que Lorica acepta (nativos + CPU); out NULL = solo contar */
+void gl31_glGetTextureSubImage(GLuint t, GLint l, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d, GLenum f, GLenum ty, GLsizei bufSize, void* pixels);
+void gl31_glGetCompressedTextureSubImage(GLuint t, GLint l, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d, GLsizei bufSize, void* pixels);
+void gl31_glClearTexImage(GLuint t, GLint l, GLenum f, GLenum ty, const void* data);
+void gl31_glClearTexSubImage(GLuint t, GLint l, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d, GLenum f, GLenum ty, const void* data);
+void gl31_glGetTexSubImage(GLenum target, GLint level, GLint x0, GLint y0, GLint z0, GLsizei w, GLsizei h, GLsizei d, GLenum format, GLenum type, void* pixels);
 void gl31_glCreateBuffers(GLsizei n, GLuint* buffers);
 void gl31_glNamedBufferData(GLuint b, GLsizeiptr size, const void* data, GLenum usage);
 void gl31_glNamedBufferStorage(GLuint b, GLsizeiptr size, const void* data, GLbitfield flags);

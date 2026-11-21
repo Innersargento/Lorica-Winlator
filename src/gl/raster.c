@@ -12,6 +12,7 @@
 #include "loader.h"
 #include "matvec.h"
 #include "pixel.h"
+#include "texture.h"
 
 #undef min
 #undef max
@@ -54,6 +55,7 @@ void APIENTRY_GL4ES gl4es_glRasterPos3f(GLfloat x, GLfloat y, GLfloat z) {
     glstate->raster.rPos.y = transl[1]*invw*h2+h2;
     glstate->raster.rPos.z = transl[2]*invw*0.5f+0.5f;
     glstate->raster.rPos_valid = GL_TRUE;
+    memcpy(glstate->raster.rColor, glstate->color, 4*sizeof(GLfloat));
 }
 #if !defined(NO_EGL) && !defined(NOX11)
 void refreshMainFBO();
@@ -72,6 +74,7 @@ void APIENTRY_GL4ES gl4es_glWindowPos3f(GLfloat x, GLfloat y, GLfloat z) {
       glstate->raster.rPos.y = y;
       glstate->raster.rPos.z = z;
       glstate->raster.rPos_valid = GL_TRUE;
+      memcpy(glstate->raster.rColor, glstate->color, 4*sizeof(GLfloat));
     } else {
       // TODO: glWindowPos never invalidates per spec; negative coords should still draw, clipped
       glstate->raster.rPos_valid = GL_FALSE;
@@ -315,6 +318,7 @@ void raster_to_texture(rasterlist_t *r)
 void bitmap_flush() {
 	if(!glstate->raster.bm_drawing)
 		return;
+	glstate->raster.bm_drawing = 0;	// first: what this draws may reach another flush point (no reentry)
 	// draw actual bitmap
 	int old_tex_unit = glstate->texture.active;
 	if(old_tex_unit)
@@ -494,8 +498,8 @@ void APIENTRY_GL4ES gl4es_glBitmap(GLsizei width, GLsizei height, GLfloat xorig,
     const GLubyte *from;
     GLubyte *to;
 	GLubyte col[4];
-	for (int i=0; i<4; i++)
-		col[i] = glstate->color[i]*255.f;
+	for (int i=0; i<4; i++)	// the current raster color (set by glRasterPos), not the current color
+		col[i] = glstate->raster.rColor[i]*255.f;
     // copy to pixel data
 	if (pixtrans) {
         for (int y = sy; y < ey; ++y) {
@@ -548,6 +552,7 @@ void APIENTRY_GL4ES gl4es_glDrawPixels(GLsizei width, GLsizei height, GLenum for
 		gl4es_glBitmap(width, height, 0, 0, 0, 0, data);
 		return;
 	}
+    GL4ES_UNPACK_SWAP_REPLAY(width, height, 1, 0, gl4es_glDrawPixels(width, height, format, type, data))
 
     noerrorShim();
 	FLUSH_BEGINEND;

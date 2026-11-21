@@ -173,6 +173,7 @@ void* NewGLState(void* shared_glstate, int es2only) {
     glstate->raster.raster_zoomx=1.0f;
     glstate->raster.raster_zoomy=1.0f;
     glstate->raster.rPos_valid = GL_TRUE;
+    glstate->raster.rColor[0] = glstate->raster.rColor[1] = glstate->raster.rColor[2] = glstate->raster.rColor[3] = 1.0f;
     glstate->raster.map_i2i_size=1;
     glstate->raster.map_i2r_size=1;
     glstate->raster.map_i2g_size=1;
@@ -612,11 +613,16 @@ void DeleteGLState(void* oldstate) {
 }
 
 extern void gl31_set_context_version(int major, int minor, int profile);
+extern void gl31_set_context_flags(int flags);
 
 int gl4es_context_gl_version(void) {
     if(glstate && glstate->gl_version)
         return glstate->gl_version;
     return globals4es.gl_compat ? globals4es.gl_compat : globals4es.gl;
+}
+
+int gl4es_context_gl_flags(void) {
+    return glstate ? glstate->gl_flags : 0;
 }
 
 int gl4es_context_gl_profile(void) {
@@ -631,6 +637,7 @@ static void sync_gl31_context(glstate_t* st) {
         gl31_set_context_version(st->gl_version/10, st->gl_version%10, st->gl_profile);
     else
         gl31_set_context_version(0, 0, 0);   // legacy context: no cap from the context
+    gl31_set_context_flags(st ? st->gl_flags : 0);
 }
 
 void ActivateGLState(void* new_glstate) {

@@ -282,6 +282,9 @@ int builtin_CheckUniform(program_t *glprogram, char* name, GLint id, int size);
 int builtin_CheckVertexAttrib(program_t *glprogram, char* name, GLint id);
 
 void realize_glenv(int ispoint, int first, int count, GLenum type, const void* indices, scratch_t* scratch);
+// glDrawElementsBaseVertex through the driver's own: fpe_basevertex is the base vertex of the next fpe_glDrawElements (0 = none)
+extern int fpe_basevertex;
+int fpe_native_basevertex_ok(GLenum mode, GLenum type, const void *indices);
 void realize_blitenv(int alpha);
 
 #endif // _GL4ES_FPE_H_

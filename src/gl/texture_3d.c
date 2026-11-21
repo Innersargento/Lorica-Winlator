@@ -1,4 +1,5 @@
 #include "texture.h"
+#include "hybrid.h"
 
 #include "../glx/hardext.h"
 #include "../glx/streaming.h"
@@ -27,6 +28,9 @@
 void APIENTRY_GL4ES gl4es_glTexImage3D(GLenum target, GLint level, GLint internalFormat,
                   GLsizei width, GLsizei height, GLsizei depth, GLint border,
                   GLenum format, GLenum type, const GLvoid *data) {
+    GL4ES_UNPACK_SWAP_REPLAY(width, height, depth, 1,
+        gl4es_glTexImage3D(target, level, internalFormat, width, height, depth, border, format, type, data))
+    if (!glstate->list.compiling && gl4es_hybrid_tex_target(target)) { FLUSH_BEGINEND; gl4es_hybrid_TexImage3D(target, level, internalFormat, width, height, depth, border, format, type, data); noerrorShim(); return; }
 
     // TODO: maybe too naive to force GL_TEXTURE_2D here?
     gl4es_glTexImage2D(GL_TEXTURE_3D, level, internalFormat, width, height,
@@ -35,6 +39,9 @@ void APIENTRY_GL4ES gl4es_glTexImage3D(GLenum target, GLint level, GLint interna
 void APIENTRY_GL4ES gl4es_glTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, 
                      GLsizei width, GLsizei height, GLsizei depth, GLenum format,
                      GLenum type, const GLvoid *data) {
+    GL4ES_UNPACK_SWAP_REPLAY(width, height, depth, 1,
+        gl4es_glTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, data))
+    if (!glstate->list.compiling && gl4es_hybrid_tex_target(target)) { FLUSH_BEGINEND; gl4es_hybrid_TexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, data); noerrorShim(); return; }
 
     gl4es_glTexSubImage2D(GL_TEXTURE_3D, level, xoffset, yoffset,
                     width, height, format, type, data);
@@ -42,12 +49,14 @@ void APIENTRY_GL4ES gl4es_glTexSubImage3D(GLenum target, GLint level, GLint xoff
 
 void APIENTRY_GL4ES gl4es_glTexStorage3D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth)
 {
+    if (!glstate->list.compiling && gl4es_hybrid_tex_target(target)) { FLUSH_BEGINEND; gl4es_hybrid_TexStorage3D(target, levels, internalformat, width, height, depth); noerrorShim(); return; }
     DBG(printf("glTexStorage3D(%s, %d, %s, %d, %d, %d)\n", PrintEnum(target), levels, PrintEnum(internalformat), width, height, depth);)
     gl4es_glTexImage3D(target, 0, internalformat, width, height, depth, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 }
 
 void APIENTRY_GL4ES gl4es_glCopyTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset,
                                 GLint x, GLint y, GLsizei width, GLsizei height) {
+    if (!glstate->list.compiling && gl4es_hybrid_tex_target(target)) { FLUSH_BEGINEND; gl4es_hybrid_CopyTexSubImage3D(target, level, xoffset, yoffset, zoffset, x, y, width, height); noerrorShim(); return; }
     gl4es_glCopyTexSubImage2D(GL_TEXTURE_3D, level, xoffset, yoffset, x, y, width, height);
 }
 

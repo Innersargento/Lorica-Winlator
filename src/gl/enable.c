@@ -65,6 +65,11 @@ void change_vao_texcoord(int tmu, bool enable)
 #define GL_TEXTURE_STREAM_IMG                                   0x8C0D     
 #endif
 
+#ifndef NOEGL
+// glx/gl31_bridge.c: cap handled by GLADIATOR in a hybrid context (enable 1/0 = glEnable/glDisable, -1 = glIsEnabled into *is)
+extern int gl4es_gl31_hybrid_enable(GLenum cap, int enable, GLboolean* is);
+extern int gl4es_backend_es3(void);   // glx/gl31_bridge.c
+#endif
 static void proxy_glEnable(GLenum cap, bool enable, void (APIENTRY_GLES *next)(GLenum)) {
     #define proxy_GO(constant, name) \
         case constant: if(glstate->enable.name != enable) {FLUSH_BEGINEND; glstate->enable.name = enable; next(cap);} break
@@ -271,7 +276,17 @@ static void proxy_glEnable(GLenum cap, bool enable, void (APIENTRY_GLES *next)(G
             break;
 
         
-        default: errorGL(); FLUSH_BEGINEND; realize_active(); next(cap); break;
+        default:
+            FLUSH_BEGINEND; realize_active();
+#ifndef NOEGL
+            // hybrid context: caps GL4ES does not know (GL_PRIMITIVE_RESTART, GL_TEXTURE_CUBE_MAP_SEAMLESS, GL_FRAMEBUFFER_SRGB,
+            // GL_CLIP_DISTANCEi, GL_DEPTH_CLAMP...) go to GLADIATOR, which translates or emulates the desktop ones and passes the
+            // rest to GLES, instead of reaching GLES raw and leaving GL_INVALID_ENUM
+            if(gl4es_gl31_hybrid_enable(cap, enable, NULL)) { noerrorShim(); break; }
+            // GLES 3 cube maps are always seamless: nothing to switch (and GLES does not know the cap)
+            if(cap==0x884F /* GL_TEXTURE_CUBE_MAP_SEAMLESS */ && gl4es_backend_es3()) { noerrorShim(); break; }
+#endif
+            errorGL(); next(cap); break;
     }
     #undef proxy_GO
     #undef GO
@@ -340,6 +355,7 @@ void APIENTRY_GL4ES gl4es_glDisableClientState(GLenum cap) {
 }
 AliasExport(void,glDisableClientState,,(GLenum cap));
 
+GLboolean gl4es_enable_state(GLenum cap);
 
 #define isenabled(what, where) \
     case what: return glstate->enable.where
@@ -353,8 +369,13 @@ GLboolean APIENTRY_GL4ES gl4es_glIsEnabled(GLenum cap) {
     // should flush for now... but no need if it's just a pending list...
     if (glstate->list.active && !glstate->list.pending)
         gl4es_flush();
-    GLboolean gles_glIsEnabled(glIsEnabled_ARG_EXPAND); //LOAD_GLES(glIsEnabled);
     noerrorShim();
+    return gl4es_enable_state(cap);
+}
+
+// The enable state GL4ES tracks, without glIsEnabled's display-list checks: glGet* of an enable cap reads it too
+GLboolean gl4es_enable_state(GLenum cap) {
+    GLboolean gles_glIsEnabled(glIsEnabled_ARG_EXPAND); //LOAD_GLES(glIsEnabled);
     switch (cap) {
         isenabled(GL_AUTO_NORMAL, auto_normal);
         isenabled(GL_ALPHA_TEST, alpha_test);
@@ -428,9 +449,15 @@ GLboolean APIENTRY_GL4ES gl4es_glIsEnabled(GLenum cap) {
         // ARB_vertex_program
         isenabled(GL_VERTEX_PROGRAM_ARB, vertex_arb);
         isenabled(GL_VERTEX_PROGRAM_TWO_SIDE_ARB, vertex_two_side_arb);
-        default:
+        default: {
+#ifndef NOEGL
+            GLboolean r;
+            if(gl4es_gl31_hybrid_enable(cap, -1, &r)) { noerrorShim(); return r; }
+            if(cap==0x884F /* GL_TEXTURE_CUBE_MAP_SEAMLESS */ && gl4es_backend_es3()) { noerrorShim(); return GL_TRUE; }
+#endif
             errorGL();
             return gles_glIsEnabled(cap);
+        }
     }
 }
 #undef isenabled

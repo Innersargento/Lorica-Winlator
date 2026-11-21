@@ -321,6 +321,9 @@ void GetHardwareExtensions(int notest)
         SHUT_LOGD("Texture Mirrored Repeat is in core, and so used\n");
         hardext.mirrored = 1;
     }
+    S("GL_EXT_texture_border_clamp ", border_clamp, 1);
+    S("GL_OES_texture_border_clamp ", border_clamp, 1);
+    S("GL_NV_texture_border_clamp ", border_clamp, 1);
     S("GL_OES_mapbuffer ", mapbuffer, 0);
     S("GL_OES_element_index_uint ", elementuint, 1);
     S("GL_OES_packed_depth_stencil ", depthstencil, 1);

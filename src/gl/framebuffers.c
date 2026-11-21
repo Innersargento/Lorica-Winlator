@@ -5,6 +5,7 @@
 #include "debug.h"
 #include "fpe.h"
 #include "gl4es.h"
+#include "hybrid.h"
 #include "glstate.h"
 #include "init.h"
 #include "loader.h"
@@ -23,6 +24,10 @@ KHASH_MAP_IMPL_INT(framebufferlist_t, glframebuffer_t *);
 
 int npot(int n);
 int wrap_npot(GLenum wrap);
+static void gl4es_fbo_drop_proxy(glframebuffer_t* fb);
+#ifndef NOEGL
+extern unsigned gl4es_gl31_rb_format(unsigned f);                                          // glx/gl31_bridge.c
+#endif
 
 glframebuffer_t* find_framebuffer(GLuint framebuffer) {
     // Get a framebuffer based on ID
@@ -162,6 +167,7 @@ void APIENTRY_GL4ES gl4es_glDeleteFramebuffers(GLsizei n, GLuint *framebuffers) 
                         if (glstate->fbo.fbo_draw == fb) {
                             glstate->fbo.fbo_draw = 0;
                         }
+                        gl4es_fbo_drop_proxy(fb);
                         free(fb);
                         kh_del(framebufferlist_t, glstate->fbo.framebufferlist, k);                        
                     }
@@ -197,6 +203,7 @@ GLboolean APIENTRY_GL4ES gl4es_glIsFramebuffer(GLuint framebuffer) {
     return find_framebuffer(framebuffer)!=NULL;
 }
 
+
 GLenum APIENTRY_GL4ES gl4es_glCheckFramebufferStatus(GLenum target) {
     GLenum result;
     if(glstate->fbo.internal) {
@@ -212,12 +219,17 @@ GLenum APIENTRY_GL4ES gl4es_glCheckFramebufferStatus(GLenum target) {
         if(target==GL_DRAW_FRAMEBUFFER)
             rtarget = GL_FRAMEBUFFER;
         result = gles_glCheckFramebufferStatus(rtarget);
+#ifndef NOEGL
+        if (globals4es.verbose && gl4es_hybrid() && result != GL_FRAMEBUFFER_COMPLETE && glstate->fbo.current_fb)
+            LOGD("LORICA FBO: framebuffer %u incomplete (0x%x)\n", glstate->fbo.current_fb->id, result);
+#endif
      }
     DBG(printf("glCheckFramebufferStatus(0x%04X)=0x%04X\n", target, result);)
     return result;
 }
 
 void APIENTRY_GL4ES gl4es_glBindFramebuffer(GLenum target, GLuint framebuffer) {
+    if (glstate->raster.bm_drawing) bitmap_flush();   // pending glBitmap pixels belong before this framebuffer access
     DBG(printf("glBindFramebuffer(%s, %u), list=%s, glstate->fbo.current_fb=%d (draw=%d, read=%d)\n", PrintEnum(target), framebuffer, glstate->list.active?"active":"none", glstate->fbo.current_fb->id, glstate->fbo.fbo_draw->id, glstate->fbo.fbo_read->id);)
     PUSH_IF_COMPILING(glBindFramebuffer);
     LOAD_GLES2_OR_OES(glBindFramebuffer);
@@ -229,6 +241,7 @@ void APIENTRY_GL4ES gl4es_glBindFramebuffer(GLenum target, GLuint framebuffer) {
         errorShim(GL_INVALID_VALUE);
         return;
     }
+    if(fb->remap) fb->proxy_dirty = 1;   // attachments may have changed through another path: the proxy is rebuilt
         
     if (target == GL_FRAMEBUFFER) {
         glstate->fbo.fbo_read = fb;
@@ -295,6 +308,7 @@ void ReadDraw_Pop(GLenum target) {
 
 void SetAttachment(glframebuffer_t* fb, GLenum attachment, GLenum atttarget, GLuint att, int level)
 {
+    fb->proxy_dirty = 1;    // draw buffer proxy (gl4es_fbo_draw_begin) follows the attachments
     switch (attachment) {
     case GL_COLOR_ATTACHMENT0:
     case GL_COLOR_ATTACHMENT1:
@@ -461,7 +475,10 @@ void APIENTRY_GL4ES gl4es_glFramebufferTexture2D(GLenum target, GLenum attachmen
             tex->fbtex_ratio = (globals4es.fbtexscale > 0.0f) ? globals4es.fbtexscale : 0.0f;
 
             // check if texture was shrunk or if fb texture is being scaled...
-            if (globals4es.fbtexscale > 0.0f || tex->shrink || tex->useratio || (tex->adjust && (hardext.npot==1 || hardext.npot==2) && !globals4es.potframebuffer)) {
+            // (not for a texture whose storage GLADIATOR keeps, hybrid.c: re-creating it with GL4ES's format/type would replace it)
+            if (tex->hybrid) {
+                // nothing to adjust: full size, real format
+            } else if (globals4es.fbtexscale > 0.0f || tex->shrink || tex->useratio || (tex->adjust && (hardext.npot==1 || hardext.npot==2) && !globals4es.potframebuffer)) {
                 LOGD("%s texture for FBO\n",(tex->useratio)?"going back to npot size pot'ed":"unshrinking shrinked");
                 if(tex->shrink || tex->useratio) {
                     if(tex->useratio) {
@@ -494,12 +511,12 @@ void APIENTRY_GL4ES gl4es_glFramebufferTexture2D(GLenum target, GLenum attachmen
                 if (oldtex!=tex->glname) gles_glBindTexture(GL_TEXTURE_2D, oldtex);
                 if(oldactive) gles_glActiveTexture(GL_TEXTURE0+oldactive);
             }
-            int need_change = (globals4es.potframebuffer && (npot(twidth)!=twidth || npot(theight)!=theight))?1:0;
-            if((tex->type==GL_FLOAT && !hardext.floatfbo) || (tex->type==GL_HALF_FLOAT_OES && !hardext.halffloatfbo)) {
+            int need_change = (globals4es.potframebuffer && (npot(twidth)!=twidth || npot(theight)!=theight) && !tex->hybrid)?1:0;
+            if(!tex->hybrid && ((tex->type==GL_FLOAT && !hardext.floatfbo) || (tex->type==GL_HALF_FLOAT_OES && !hardext.halffloatfbo))) {
                 need_change += 2;
                 tex->type = GL_UNSIGNED_BYTE;
             }
-            if(tex->format==GL_BGRA && (globals4es.nobgra || !hardext.bgra8888)) {
+            if(!tex->hybrid && tex->format==GL_BGRA && (globals4es.nobgra || !hardext.bgra8888)) {
                 if(need_change<2) need_change += 2;
                 tex->format = GL_RGBA;
             }
@@ -865,7 +882,9 @@ void APIENTRY_GL4ES gl4es_glFramebufferRenderbuffer(GLenum target, GLenum attach
             int oldactive = glstate->texture.active;
             if(oldactive) gl4es_glActiveTexture(GL_TEXTURE0);
             gltexture_t *bound = glstate->texture.bound[0][ENABLED_TEX2D];
-            GLuint oldtex = bound->glname;
+            // put back through gl4es_glBindTexture, so the application's name (glname is the GLES one: it differs for a
+            // name the application did not get from glGenTextures, and then binding it picked another texture for unit 0)
+            GLuint oldtex = bound->texture;
             // get size of renderbuffer
             GLenum format = rend->format;
             GLint width = rend->width;
@@ -983,6 +1002,12 @@ void APIENTRY_GL4ES gl4es_glRenderbufferStorage(GLenum target, GLenum internalfo
     int use_secondarybuffer = 0;
     int use_secondarytexture = 0;
     GLenum format = internalformat;
+#ifndef NOEGL
+    // hybrid context (ES 3 backend): GLADIATOR picks the sized ES format by backend capability (GL_DEPTH_COMPONENT32 ->
+    // DEPTH_COMPONENT32F, GL_RGBA -> RGBA8, RGB16F -> RGBA16F...) instead of the ES 2 substitutions below (DEPTH16, RGBA4)
+    if (gl4es_hybrid())
+        internalformat = gl4es_gl31_rb_format(internalformat);
+#endif
     // check if internal format is GL_DEPTH_STENCIL_EXT
     if (internalformat == GL_DEPTH_STENCIL)
         internalformat = GL_DEPTH24_STENCIL8;
@@ -1085,6 +1110,8 @@ GLboolean APIENTRY_GL4ES gl4es_glIsRenderbuffer(GLuint renderbuffer) {
 }
 
 void APIENTRY_GL4ES gl4es_glGenerateMipmap(GLenum target) {
+    if (gl4es_hybrid_tex_target(target)) { gl4es_hybrid_GenerateMipmap(target); noerrorShim(); return; }
+    if (gl4es_hybrid_tex_is_hybrid(target)) { gl4es_hybrid_GenerateMipmap2D(target); noerrorShim(); return; }   // storage kept by GLADIATOR
     DBG(printf("glGenerateMipmap(%s)\n", PrintEnum(target));)
     LOAD_GLES2_OR_OES(glGenerateMipmap);
     
@@ -1391,6 +1418,7 @@ void APIENTRY_GL4ES gl4es_glFramebufferTextureLayer(    GLenum target, GLenum at
 void gl4es_SwapBuffers_currentContext();    // defined in glx/glx.c
 #endif
 void APIENTRY_GL4ES gl4es_glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {
+    if (glstate->raster.bm_drawing) bitmap_flush();   // pending glBitmap pixels belong before this framebuffer access
     // mask will be ignored
     // filter will be taken only for ReadFBO has no Texture attached (so readpixel is used)
     DBG(printf("glBlitFramebuffer(%d, %d, %d, %d,  %d, %d, %d, %d,  0x%04X, %s) fbo_read=%d, fbo_draw=%d\n",
@@ -1510,21 +1538,267 @@ void gl4es_setCurrentFBO() {
 }
 
 // DrawBuffers functions are faked unless GL_EXT_draw_buffers is supported
-void APIENTRY_GL4ES gl4es_glDrawBuffers(GLsizei n, const GLenum *bufs) {
-    DBG(printf("glDrawBuffers(%d, %p) [0]=%s\n", n, bufs, n?PrintEnum(bufs[0]):"nil");)
-    if(hardext.drawbuffers) {
-        LOAD_GLES_EXT(glDrawBuffers);
-        gles_glDrawBuffers(n, bufs);
-        errorGL();
-    } else {
-        if(n<0 || n>hardext.maxdrawbuffers) {
-            errorShim(GL_INVALID_VALUE);
-            return;
+#ifndef NOEGL
+extern int gl4es_backend_es3(void);                 // glx/gl31_bridge.c
+extern unsigned gl4es_gl31_tex_target(unsigned name);   // glx/gl31_bridge.c: GLES target GLADIATOR gave a texture (2D if unknown)
+#endif
+
+/* ---- arbitrary draw buffer mapping on a GLES 3 backend ----
+ * Desktop GL lets glDrawBuffers send fragment output i to any color attachment (glDrawBuffer(GL_COLOR_ATTACHMENT3): output
+ * 0 -> attachment 3); GLES only allows output i -> COLOR_ATTACHMENTi or NONE ("Ith value does not match COLOR_ATTACHMENTi").
+ * As GLADIATOR does for core contexts (gl31_fbo.c, rm_apply), the draws then go to a proxy FBO whose attachment i is the
+ * image the application's FBO has at drawbuff[i], plus its depth/stencil. The proxy is bound as the GLES draw framebuffer
+ * only around GL4ES's draws and clears (gl4es_fbo_draw_begin/end): everything else keeps seeing the application's FBO,
+ * which is what GL4ES binds and edits. It is rebuilt from what GLES has attached when the FBO changes or is bound again. */
+static int fb_identity_map(GLsizei n, const GLenum* bufs)
+{
+    for (GLsizei j=0; j<n; j++)
+        if (bufs[j]!=GL_NONE && bufs[j]!=GL_COLOR_ATTACHMENT0+(GLenum)j)
+            return 0;
+    return 1;
+}
+
+static int fb_use_proxy(glframebuffer_t* fb, GLsizei n, const GLenum* bufs)
+{
+#ifndef NOEGL
+    return fb && fb->id && hardext.drawbuffers && gl4es_backend_es3() && !fb_identity_map(n, bufs);
+#else
+    (void)fb; (void)n; (void)bufs;
+    return 0;
+#endif
+}
+
+#ifndef NOEGL
+typedef void (APIENTRY_GLES *fbp_tex2d_t)(GLenum, GLenum, GLenum, GLuint, GLint);
+typedef void (APIENTRY_GLES *fbp_layer_t)(GLenum, GLenum, GLuint, GLint, GLint);
+typedef void (APIENTRY_GLES *fbp_rb_t)(GLenum, GLenum, GLenum, GLuint);
+typedef void (APIENTRY_GLES *fbp_query_t)(GLenum, GLenum, GLenum, GLint*);
+typedef void (APIENTRY_GLES *fbp_bind_t)(GLenum, GLuint);
+typedef void (APIENTRY_GLES *fbp_gen_t)(GLsizei, GLuint*);
+typedef void (APIENTRY_GLES *fbp_db_t)(GLsizei, const GLenum*);
+static struct { int loaded; fbp_tex2d_t tex2d; fbp_layer_t layer; fbp_rb_t rb; fbp_query_t query; fbp_bind_t bind; fbp_gen_t gen; fbp_db_t db; } fbp;
+static int fbp_proxy_bound = 0;    // the proxy is the GLES draw framebuffer right now (between begin and end)
+
+static int fbp_load(void)
+{
+    if (!fbp.loaded) {
+        fbp.loaded = 1;
+        fbp.tex2d = (fbp_tex2d_t)proc_address(gles, "glFramebufferTexture2D");
+        fbp.layer = (fbp_layer_t)proc_address(gles, "glFramebufferTextureLayer");
+        fbp.rb    = (fbp_rb_t)proc_address(gles, "glFramebufferRenderbuffer");
+        fbp.query = (fbp_query_t)proc_address(gles, "glGetFramebufferAttachmentParameteriv");
+        fbp.bind  = (fbp_bind_t)proc_address(gles, "glBindFramebuffer");
+        fbp.gen   = (fbp_gen_t)proc_address(gles, "glGenFramebuffers");
+        fbp.db    = (fbp_db_t)proc_address(gles, "glDrawBuffers");
+    }
+    return fbp.tex2d && fbp.layer && fbp.rb && fbp.query && fbp.bind && fbp.gen && fbp.db;
+}
+
+static GLint fbp_att(GLenum att, GLenum pname)
+{
+    GLint v = 0;
+    fbp.query(GL_READ_FRAMEBUFFER, att, pname, &v);
+    return v;
+}
+
+// attachment `dst` of the draw framebuffer (the proxy) = the image `src` has in the read framebuffer (the application's FBO)
+static void fbp_copy(GLenum dst, GLenum src)
+{
+    GLint ty = fbp_att(src, 0x8CD0 /* GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE */);
+    GLint name;
+    if (ty == GL_NONE) { fbp.rb(GL_DRAW_FRAMEBUFFER, dst, GL_RENDERBUFFER, 0); return; }
+    name = fbp_att(src, 0x8CD1 /* GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME */);
+    if (ty == GL_RENDERBUFFER) { fbp.rb(GL_DRAW_FRAMEBUFFER, dst, GL_RENDERBUFFER, (GLuint)name); return; }
+    {
+        GLint level = fbp_att(src, 0x8CD2 /* TEXTURE_LEVEL */);
+        GLint face  = fbp_att(src, 0x8CD3 /* TEXTURE_CUBE_MAP_FACE */);
+        GLint layer = fbp_att(src, 0x8CD4 /* TEXTURE_LAYER */);
+        GLenum t = gl4es_gl31_tex_target((GLuint)name);
+        if (face) fbp.tex2d(GL_DRAW_FRAMEBUFFER, dst, (GLenum)face, (GLuint)name, level);
+        else if (t == 0x806F /* 3D */ || t == 0x8C1A /* 2D_ARRAY */ || t == 0x9009 /* CUBE_MAP_ARRAY */ || t == 0x9102 /* 2D_MS_ARRAY */)
+            fbp.layer(GL_DRAW_FRAMEBUFFER, dst, (GLuint)name, level, layer);
+        else fbp.tex2d(GL_DRAW_FRAMEBUFFER, dst, t == 0x9100 ? 0x9100 /* 2D_MULTISAMPLE */ : GL_TEXTURE_2D, (GLuint)name, level);
+    }
+}
+
+static void fbp_build(glframebuffer_t* fb)
+{
+    GLenum db[MAX_DRAW_BUFFERS];
+    int n = fb->n_draw, j, nmax = hardext.maxcolorattach;
+    if (nmax > MAX_DRAW_BUFFERS) nmax = MAX_DRAW_BUFFERS;
+    if (!fb->proxy) fbp.gen(1, &fb->proxy);
+    fbp.bind(GL_READ_FRAMEBUFFER, fb->id);
+    fbp.bind(GL_DRAW_FRAMEBUFFER, fb->proxy);
+    for (j = 0; j < nmax; j++) {
+        if (j < n && fb->drawbuff[j] != GL_NONE) {
+            fbp_copy(GL_COLOR_ATTACHMENT0 + j, fb->drawbuff[j]);
+            db[j] = GL_COLOR_ATTACHMENT0 + j;
+        } else {
+            fbp.rb(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + j, GL_RENDERBUFFER, 0);
+            if (j < n) db[j] = GL_NONE;
         }
     }
-    glstate->fbo.fbo_draw->n_draw = n;
-    memcpy(glstate->fbo.fbo_draw->drawbuff, bufs, n*sizeof(GLenum));
+    fbp_copy(GL_DEPTH_ATTACHMENT, GL_DEPTH_ATTACHMENT);
+    fbp_copy(GL_STENCIL_ATTACHMENT, GL_STENCIL_ATTACHMENT);
+    fbp.db(n, db);
+    fb->proxy_dirty = 0;
+    // GL4ES keeps one GLES binding (GL_FRAMEBUFFER) for its current framebuffer
+    fbp.bind(GL_FRAMEBUFFER, glstate->fbo.current_fb->id ? glstate->fbo.current_fb->id : glstate->fbo.mainfbo_fbo);
+}
+#endif
+
+void gl4es_fbo_draw_begin(void)
+{
+#ifndef NOEGL
+    glframebuffer_t* fb = glstate->fbo.current_fb;
+    if (!fb || !fb->remap || !fb->id || fb != glstate->fbo.fbo_draw || fbp_proxy_bound) return;
+    if (!fbp_load()) return;
+    if (fb->proxy_dirty || !fb->proxy) fbp_build(fb);
+    fbp.bind(GL_DRAW_FRAMEBUFFER, fb->proxy);
+    fbp_proxy_bound = 1;
+#endif
+}
+
+void gl4es_fbo_draw_end(void)
+{
+#ifndef NOEGL
+    if (!fbp_proxy_bound) return;
+    fbp_proxy_bound = 0;
+    fbp.bind(GL_DRAW_FRAMEBUFFER, glstate->fbo.current_fb->id ? glstate->fbo.current_fb->id : glstate->fbo.mainfbo_fbo);
+#endif
+}
+
+// the proxy of a deleted framebuffer
+static void gl4es_fbo_drop_proxy(glframebuffer_t* fb)
+{
+#ifndef NOEGL
+    if (fb && fb->proxy) {
+        LOAD_GLES2_OR_OES(glDeleteFramebuffers);
+        gles_glDeleteFramebuffers(1, &fb->proxy);
+        fb->proxy = 0;
+    }
+#else
+    (void)fb;
+#endif
+}
+
+// glDrawBuffers on `fb` (bound as the draw framebuffer when `bound`)
+static void fb_set_drawbuffers(glframebuffer_t* fb, GLsizei n, const GLenum *bufs, int bound)
+{
+    fb->n_draw = n;
+    memcpy(fb->drawbuff, bufs, n*sizeof(GLenum));
+    if (fb_use_proxy(fb, n, bufs)) {
+        fb->remap = 1;
+        fb->proxy_dirty = 1;
+    } else {
+        fb->remap = 0;
+        if (hardext.drawbuffers) {
+            LOAD_GLES_EXT(glDrawBuffers);
+            GLenum tb[MAX_DRAW_BUFFERS];
+            if (!fb->id && n <= MAX_DRAW_BUFFERS) {
+                // default framebuffer: GLES knows GL_BACK only (COLOR_ATTACHMENT0 when it is GL4ES's main FBO)
+                for (GLsizei j=0; j<n; j++)
+                    tb[j] = (bufs[j]==GL_NONE) ? GL_NONE : (glstate->fbo.mainfbo_fbo ? GL_COLOR_ATTACHMENT0 : GL_BACK);
+                bufs = tb;
+            }
+            if (bound) {
+                ReadDraw_Push(GL_DRAW_FRAMEBUFFER);
+                gles_glDrawBuffers(n, bufs);
+                errorGL();
+                ReadDraw_Pop(GL_DRAW_FRAMEBUFFER);
+            } else {
+                GLuint oldf = glstate->fbo.fbo_draw->id;
+                gl4es_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb->id);
+                gles_glDrawBuffers(n, bufs);
+                errorGL();
+                gl4es_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldf);
+            }
+        }
+    }
+}
+
+void APIENTRY_GL4ES gl4es_glDrawBuffers(GLsizei n, const GLenum *bufs) {
+    DBG(printf("glDrawBuffers(%d, %p) [0]=%s\n", n, bufs, n?PrintEnum(bufs[0]):"nil");)
+    if(n<0 || n>hardext.maxdrawbuffers) {
+        errorShim(GL_INVALID_VALUE);
+        return;
+    }
+    fb_set_drawbuffers(glstate->fbo.fbo_draw, n, bufs, 1);
     noerrorShim();
+}
+
+// glDrawBuffer(mode) = glDrawBuffers(1, &mode) on a framebuffer object; on the default framebuffer GLES has GL_BACK only
+void APIENTRY_GL4ES gl4es_glDrawBuffer(GLenum mode) {
+    DBG(printf("glDrawBuffer(%s)\n", PrintEnum(mode));)
+    FLUSH_BEGINEND;
+    glframebuffer_t* fb = glstate->fbo.fbo_draw;
+    if(fb->id) {
+        if(mode!=GL_NONE && (mode<GL_COLOR_ATTACHMENT0 || mode>=GL_COLOR_ATTACHMENT0+(GLenum)hardext.maxcolorattach)) {
+            errorShim((mode==GL_BACK || mode==GL_FRONT || mode==GL_FRONT_AND_BACK || mode==0x0402 || mode==0x0400 || mode==0x0406)
+                      ? GL_INVALID_OPERATION : GL_INVALID_ENUM);
+            return;
+        }
+    } else {
+        switch(mode) {
+            case GL_NONE: case GL_FRONT: case GL_BACK: case GL_FRONT_AND_BACK:
+            case 0x0400 /* GL_FRONT_LEFT */: case 0x0402 /* GL_BACK_LEFT */: case 0x0406 /* GL_LEFT */:
+                break;
+            default:
+                errorShim(GL_INVALID_ENUM);
+                return;
+        }
+#ifndef NOEGL
+        if(!gl4es_backend_es3()) {     // GLES 2: only recorded, as before
+            fb->n_draw = 1;
+            fb->drawbuff[0] = mode;
+            noerrorShim();
+            return;
+        }
+#endif
+    }
+    fb_set_drawbuffers(fb, 1, &mode, 1);
+    noerrorShim();
+}
+AliasExport(void,glDrawBuffer,,(GLenum mode));
+// glReadBuffer: ES 3 has it (per framebuffer object, like GL); ES 2 can only read COLOR_ATTACHMENT0 / the back buffer, so there it
+// stays a no-op. The default framebuffer only knows GL_BACK in GLES (or COLOR_ATTACHMENT0 when it is GL4ES's main FBO, LIBGL_FB=2).
+void APIENTRY_GL4ES gl4es_glReadBuffer(GLenum mode) {
+    DBG(printf("glReadBuffer(%s)\n", PrintEnum(mode));)
+    FLUSH_BEGINEND;
+    int es3 = 0;
+#ifndef NOEGL
+    es3 = gl4es_backend_es3();
+#endif
+    GLenum m = mode;
+    if(!glstate->fbo.fbo_read->id) {
+        switch(mode) {
+            case GL_NONE: break;
+            case GL_FRONT: case GL_BACK: case 0x0406 /* GL_LEFT */: case 0x0400 /* GL_FRONT_LEFT */: case 0x0402 /* GL_BACK_LEFT */: case GL_FRONT_AND_BACK:
+                m = glstate->fbo.mainfbo_fbo ? GL_COLOR_ATTACHMENT0 : GL_BACK;
+                break;
+            default:
+                errorShim(GL_INVALID_ENUM);
+                return;
+        }
+    } else if(mode!=GL_NONE && (mode<GL_COLOR_ATTACHMENT0 || mode>=GL_COLOR_ATTACHMENT0+(GLenum)hardext.maxcolorattach)) {
+        errorShim(GL_INVALID_OPERATION);
+        return;
+    }
+    if(!es3) {
+        noerrorShim();
+        return;
+    }
+    static void (APIENTRY_GLES *gles_glReadBuffer)(GLenum) = NULL;
+    static int rb_loaded = 0;
+    if(!rb_loaded) { rb_loaded = 1; gles_glReadBuffer = (void (APIENTRY_GLES *)(GLenum))proc_address(gles, "glReadBuffer"); }
+    if(!gles_glReadBuffer) {
+        noerrorShim();
+        return;
+    }
+    readfboBegin();
+    gles_glReadBuffer(m);
+    errorGL();
+    readfboEnd();
 }
 void APIENTRY_GL4ES gl4es_glNamedFramebufferDrawBuffers(GLuint framebuffer, GLsizei n, const GLenum *bufs) {
     if(n<0 || n>hardext.maxdrawbuffers) {
@@ -1532,22 +1806,42 @@ void APIENTRY_GL4ES gl4es_glNamedFramebufferDrawBuffers(GLuint framebuffer, GLsi
         return;
     }
     glframebuffer_t* fb = find_framebuffer(framebuffer);
-    if(hardext.drawbuffers) {
-        GLuint oldf = glstate->fbo.fbo_draw->id;
-        gl4es_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb->id);
-        LOAD_GLES_EXT(glDrawBuffers);
-        gles_glDrawBuffers(n, bufs);
-        errorGL();
-        gl4es_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldf);
+    if(!fb) {
+        errorShim(GL_INVALID_OPERATION);
+        return;
     }
-    fb->n_draw = n;
-    memcpy(fb->drawbuff, bufs, n*sizeof(GLenum));
+    fb_set_drawbuffers(fb, n, bufs, fb==glstate->fbo.fbo_draw);
     noerrorShim();
 }
 
 
+// glClearBuffer* on a GLES 3.x backend: GLES has them, with the same meaning (drawbuffer = index into the draw
+// buffers, values in the buffer's own type). The emulation below goes through glClear and a normalized clear color,
+// which cannot clear an integer buffer. The application's draw framebuffer has to be the bound one.
+static void* clearbuffer_native(const char* name) {
+#ifndef NOEGL
+    if(!gl4es_backend_es3() || !gles) return NULL;
+    FLUSH_BEGINEND;
+    if (glstate->raster.bm_drawing) bitmap_flush();
+    if(glstate->fbo.current_fb != glstate->fbo.fbo_draw) {
+        LOAD_GLES2_OR_OES(glBindFramebuffer);
+        glstate->fbo.current_fb = glstate->fbo.fbo_draw;
+        gles_glBindFramebuffer(GL_FRAMEBUFFER, glstate->fbo.fbo_draw->id ? glstate->fbo.fbo_draw->id : glstate->fbo.mainfbo_fbo);
+    }
+    return proc_address(gles, name);
+#else
+    (void)name;
+    return NULL;
+#endif
+}
+
 void APIENTRY_GL4ES gl4es_glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint * value) {
     noerrorShim();
+    if (!glstate->list.compiling) {
+        if (glstate->cond_render_skip) return;
+        void (APIENTRY_GLES *f)(GLenum, GLint, const GLint*) = (void (APIENTRY_GLES *)(GLenum, GLint, const GLint*))clearbuffer_native("glClearBufferiv");
+        if (f) { gl4es_fbo_draw_begin(); f(buffer, drawbuffer, value); gl4es_fbo_draw_end(); errorGL(); return; }
+    }
     GLenum attch;
     switch(buffer) {
         case GL_COLOR:
@@ -1593,6 +1887,11 @@ void APIENTRY_GL4ES gl4es_glClearBufferiv(GLenum buffer, GLint drawbuffer, const
 }
 void APIENTRY_GL4ES gl4es_glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint * value) {
     noerrorShim();
+    if (!glstate->list.compiling) {
+        if (glstate->cond_render_skip) return;
+        void (APIENTRY_GLES *f)(GLenum, GLint, const GLuint*) = (void (APIENTRY_GLES *)(GLenum, GLint, const GLuint*))clearbuffer_native("glClearBufferuiv");
+        if (f) { gl4es_fbo_draw_begin(); f(buffer, drawbuffer, value); gl4es_fbo_draw_end(); errorGL(); return; }
+    }
     GLenum attch;
     switch(buffer) {
         case GL_COLOR:
@@ -1626,6 +1925,11 @@ void APIENTRY_GL4ES gl4es_glClearBufferuiv(GLenum buffer, GLint drawbuffer, cons
 }
 void APIENTRY_GL4ES gl4es_glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat * value) {
     noerrorShim();
+    if (!glstate->list.compiling) {
+        if (glstate->cond_render_skip) return;
+        void (APIENTRY_GLES *f)(GLenum, GLint, const GLfloat*) = (void (APIENTRY_GLES *)(GLenum, GLint, const GLfloat*))clearbuffer_native("glClearBufferfv");
+        if (f) { gl4es_fbo_draw_begin(); f(buffer, drawbuffer, value); gl4es_fbo_draw_end(); errorGL(); return; }
+    }
     GLenum attch;
     switch(buffer) {
         case GL_COLOR:
@@ -1670,6 +1974,11 @@ void APIENTRY_GL4ES gl4es_glClearBufferfv(GLenum buffer, GLint drawbuffer, const
     return;
 }
 void APIENTRY_GL4ES gl4es_glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
+    if (!glstate->list.compiling) {
+        if (glstate->cond_render_skip) { noerrorShim(); return; }
+        void (APIENTRY_GLES *f)(GLenum, GLint, GLfloat, GLint) = (void (APIENTRY_GLES *)(GLenum, GLint, GLfloat, GLint))clearbuffer_native("glClearBufferfi");
+        if (f) { gl4es_fbo_draw_begin(); f(buffer, drawbuffer, depth, stencil); gl4es_fbo_draw_end(); errorGL(); return; }
+    }
     if(buffer!=GL_DEPTH_STENCIL || drawbuffer!=0) {
         errorShim(GL_INVALID_ENUM);
         return;
@@ -1795,6 +2104,7 @@ AliasExport(void,glRenderbufferStorageMultisample,,(GLenum target, GLsizei sampl
 
 // DrawBuffers
 AliasExport(void,glDrawBuffers,,(GLsizei n, const GLenum *bufs));
+AliasExport(void,glReadBuffer,,(GLenum mode));
 AliasExport(void,glDrawBuffers,ARB,(GLsizei n, const GLenum *bufs));
 AliasExport(void,glNamedFramebufferDrawBuffers,,(GLuint framebuffer, GLsizei n, const GLenum *bufs));
 AliasExport(void,glNamedFramebufferDrawBuffers,EXT,(GLuint framebuffer, GLsizei n, const GLenum *bufs));

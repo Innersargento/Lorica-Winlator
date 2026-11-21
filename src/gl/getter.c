@@ -12,6 +12,9 @@
 #ifndef GL_CONTEXT_PROFILE_MASK
 #define GL_CONTEXT_PROFILE_MASK 0x9126
 #endif
+#ifndef GL_CONTEXT_FLAGS
+#define GL_CONTEXT_FLAGS 0x821E
+#endif
 
 //#define DEBUG
 #ifdef DEBUG
@@ -83,148 +86,199 @@ void APIENTRY_GL4ES gl4es_glGetPointerv(GLenum pname, GLvoid* *params) {
 }
 AliasExport(void,glGetPointerv,,(GLenum pname, GLvoid* *params));
 
+#ifndef NOEGL
+extern const char* gl4es_gl31_hybrid_extensions(void);   // glx/gl31_bridge.c
+#endif
+#define EXTENSIONS_BUFSZ 16384
+
+// ---- GL4ES extension table (model: src/mesa/main/extensions_table.h) ----
+// Every name GL4ES can announce, with the capability that makes it true and, for extensions that define entry points, those
+// entry points. A name is announced only when its condition holds AND every listed function resolves in gl4es_GetProcAddress.
+// The string, GL_NUM_EXTENSIONS and glGetStringi are all generated from here (plus GLADIATOR's own table in hybrid contexts).
+void* gl4es_GetProcAddress(const char *name);   // gl_lookup.c
+#ifndef NOEGL
+extern int gl4es_gl31_hybrid_active(void);      // glx/gl31_bridge.c
+#endif
+typedef struct { const char* name; int (*cond)(void); const char* const* funcs; } gl4es_ext_t;
+static int c_always(void)    { return 1; }
+static int c_gl4es_hint(void){ const char *c4 = getenv("LIBGL_GL4ES_COMPAT"); return c4 && *c4=='1'; }
+static int c_texrect(void)   { return !globals4es.notexrect; }
+static int c_vabgra(void)    { return globals4es.vabgra; }
+static int c_npot1(void)     { return globals4es.npot>=1; }
+static int c_npot2(void)     { return globals4es.npot>=2; }
+static int c_blendcolor(void){ return hardext.blendcolor; }
+static int c_blendminmax(void){ return hardext.blendminmax; }
+static int c_blendeq(void)   { return hardext.blendeq; }
+static int c_blendfunc(void) { return hardext.blendfunc; }
+static int c_blendsub(void)  { return hardext.blendsub; }
+static int c_aniso(void)     { return hardext.aniso; }
+static int c_mirrored(void)  { return hardext.mirrored; }
+static int c_fbo(void)       { return hardext.fbo; }
+static int c_pointsprite(void){ return hardext.pointsprite; }
+static int c_cubemap(void)   { return hardext.cubemap; }
+static int c_rgtex(void)     { return hardext.rgtex; }
+static int c_floattex(void)  { return hardext.floattex || (globals4es.floattex==2); }
+static int c_hfloattex(void) { return hardext.halffloattex || (globals4es.floattex==2); }
+static int c_floatfbo(void)  { return hardext.floatfbo || (globals4es.floattex==2); }
+static int c_hfloatfbo(void) { return hardext.halffloatfbo || (globals4es.floattex==2); }
+static int c_depthtex(void)  { return hardext.depthtex; }
+static int c_es2(void)       { return hardext.esversion>1; }
+static int c_arbprog(void)   { return hardext.esversion>1 && !globals4es.noarbprogram; }
+static int c_prgbin(void)    { return hardext.prgbin_n; }
+static int c_queries(void)   { return globals4es.queries; }   // GL_SAMPLES_PASSED / GL_TIME_ELAPSED / GL_TIMESTAMP (queries.c)
+// GL_ARB_compatibility: the context is a compatibility profile of GL >= 3.1 (the hybrid contexts)
+static int c_compat31(void) {
+#ifndef NOEGL
+    return gl4es_gl31_hybrid_active();
+#else
+    return 0;
+#endif
+}
+
+#define F(...) (const char* const[]){ __VA_ARGS__, NULL }
+static const gl4es_ext_t k_gl4es_ext[] = {
+    { "GL_EXT_abgr",                       c_always, NULL },
+#ifdef AMIGAOS4
+    { "GL_MGL_packed_pixels",              c_always, NULL },   // same as GL_EXT_packed_pixels, older; some old Amiga games check for it
+#endif
+    { "GL_EXT_packed_pixels",              c_always, NULL },
+    { "GL_EXT_compiled_vertex_array",      c_always, F("glLockArraysEXT", "glUnlockArraysEXT") },
+    { "GL_EXT_compiled_vertex_arrays",     c_always, F("glLockArraysEXT", "glUnlockArraysEXT") },   // typo of the old AmigaOS MiniGL driver that programs check
+    { "GL_ARB_vertex_buffer_object",       c_always, F("glGenBuffersARB", "glBindBufferARB", "glBufferDataARB", "glMapBufferARB", "glUnmapBufferARB") },
+    { "GL_ARB_vertex_array_object",        c_always, F("glGenVertexArrays", "glBindVertexArray", "glDeleteVertexArrays") },
+    { "GL_ARB_vertex_buffer",              c_always, NULL },
+    { "GL_EXT_vertex_array",               c_always, NULL },
+    { "GL_EXT_secondary_color",            c_always, F("glSecondaryColor3fEXT", "glSecondaryColorPointerEXT") },
+    { "GL_ARB_multitexture",               c_always, F("glActiveTextureARB", "glClientActiveTextureARB", "glMultiTexCoord2fARB") },
+    { "GL_ARB_texture_border_clamp",       c_always, NULL },
+    { "GL_ARB_texture_env_add",            c_always, NULL },
+    { "GL_EXT_texture_env_add",            c_always, NULL },
+    { "GL_ARB_texture_env_combine",        c_always, NULL },
+    { "GL_EXT_texture_env_combine",        c_always, NULL },
+    { "GL_ARB_texture_env_crossbar",       c_always, NULL },
+    { "GL_EXT_texture_env_crossbar",       c_always, NULL },
+    { "GL_ARB_texture_env_dot3",           c_always, NULL },
+    { "GL_EXT_texture_env_dot3",           c_always, NULL },
+    { "GL_SGIS_generate_mipmap",           c_always, NULL },
+    { "GL_EXT_draw_range_elements",        c_always, F("glDrawRangeElementsEXT") },
+    { "GL_EXT_bgra",                       c_always, NULL },
+    { "GL_ARB_texture_compression",        c_always, F("glCompressedTexImage2DARB", "glCompressedTexSubImage2DARB", "glGetCompressedTexImageARB") },
+    { "GL_EXT_texture_compression_s3tc",   c_always, NULL },
+    { "GL_OES_texture_compression_S3TC",   c_always, NULL },
+    { "GL_EXT_texture_compression_dxt1",   c_always, NULL },
+    { "GL_EXT_texture_compression_dxt3",   c_always, NULL },
+    { "GL_EXT_texture_compression_dxt5",   c_always, NULL },
+    { "GL_ARB_point_parameters",           c_always, F("glPointParameterfARB", "glPointParameterfvARB") },
+    { "GL_EXT_point_parameters",           c_always, F("glPointParameterfEXT", "glPointParameterfvEXT") },
+    { "GL_EXT_stencil_wrap",               c_always, NULL },
+    { "GL_ATI_separate_stencil",           c_es2, F("glStencilOpSeparateATI", "glStencilFuncSeparateATI") },
+    { "GL_SGIS_texture_edge_clamp",        c_always, NULL },
+    { "GL_EXT_texture_edge_clamp",         c_always, NULL },
+    { "GL_EXT_direct_state_access",        c_always, F("glMatrixLoadfEXT", "glTextureParameteriEXT", "glBindMultiTextureEXT") },
+    { "GL_EXT_multi_draw_arrays",          c_always, F("glMultiDrawArraysEXT", "glMultiDrawElementsEXT") },
+    { "GL_SUN_multi_draw_arrays",          c_always, NULL },
+    { "GL_ARB_multisample",                c_always, F("glSampleCoverageARB") },
+    { "GL_EXT_texture_object",             c_always, F("glGenTexturesEXT", "glBindTextureEXT", "glDeleteTexturesEXT") },
+    { "GL_EXT_polygon_offset",             c_always, NULL },
+    { "GL_LORICA_hint",                    c_always, NULL },
+    { "GL_ARB_draw_elements_base_vertex",  c_always, F("glDrawElementsBaseVertex", "glDrawRangeElementsBaseVertex") },
+    { "GL_EXT_draw_elements_base_vertex",  c_always, NULL },
+    { "GL_ARB_map_buffer_range",           c_always, F("glMapBufferRange", "glFlushMappedBufferRange") },
+    { "GL_NV_blend_square",                c_always, NULL },
+    { "GL_GL4ES_hint",                     c_gl4es_hint, NULL },
+    { "GL_ARB_texture_rectangle",          c_texrect, NULL },
+    { "GL_ARB_vertex_array_bgra",          c_vabgra, NULL },
+    { "GL_APPLE_texture_2D_limited_npot",  c_npot1, NULL },
+    { "GL_ARB_texture_non_power_of_two",   c_npot2, NULL },
+    { "GL_EXT_blend_color",                c_blendcolor, F("glBlendColorEXT") },
+    { "GL_EXT_blend_minmax",               c_blendminmax, F("glBlendEquationEXT") },
+    { "GL_EXT_blend_equation_separate",    c_blendeq, F("glBlendEquationSeparateEXT") },
+    { "GL_EXT_blend_func_separate",        c_blendfunc, F("glBlendFuncSeparateEXT") },
+    { "GL_EXT_blend_subtract",             c_blendsub, NULL },
+    { "GL_EXT_texture_filter_anisotropic", c_aniso, NULL },
+    { "GL_ARB_texture_mirrored_repeat",    c_mirrored, NULL },
+    { "GL_ARB_framebuffer_object",         c_fbo, F("glGenFramebuffers", "glBindFramebuffer", "glFramebufferTexture2D", "glGenRenderbuffers", "glGenerateMipmap") },
+    { "GL_EXT_framebuffer_object",         c_fbo, F("glGenFramebuffersEXT", "glBindFramebufferEXT", "glFramebufferTexture2DEXT", "glGenRenderbuffersEXT") },
+    { "GL_EXT_packed_depth_stencil",       c_fbo, NULL },
+    { "GL_EXT_framebuffer_blit",           c_fbo, F("glBlitFramebufferEXT") },
+    { "GL_ARB_draw_buffers",               c_fbo, F("glDrawBuffersARB") },
+    { "GL_EXT_draw_buffers2",              c_fbo, F("glColorMaskIndexedEXT") },
+    { "GL_ARB_point_sprite",               c_pointsprite, NULL },
+    { "GL_ARB_texture_cube_map",           c_cubemap, NULL },
+    { "GL_EXT_texture_cube_map",           c_cubemap, NULL },
+    { "GL_EXT_texture_rg",                 c_rgtex, NULL },
+    { "GL_ARB_texture_rg",                 c_rgtex, NULL },
+    { "GL_EXT_texture_float",              c_floattex, NULL },
+    { "GL_ARB_texture_float",              c_floattex, NULL },
+    { "GL_EXT_texture_half_float",         c_hfloattex, NULL },
+    { "GL_EXT_color_buffer_float",         c_floatfbo, NULL },
+    { "GL_EXT_color_buffer_half_float",    c_hfloatfbo, NULL },
+    { "GL_EXT_depth_texture",              c_depthtex, NULL },
+    { "GL_ARB_depth_texture",              c_depthtex, NULL },
+    { "GL_EXT_fog_coord",                  c_es2, F("glFogCoordfEXT", "glFogCoordPointerEXT") },
+    { "GL_EXT_separate_specular_color",    c_es2, NULL },
+    { "GL_EXT_rescale_normal",             c_es2, NULL },
+    { "GL_ARB_ES2_compatibility",          c_es2, NULL },
+    { "GL_ARB_fragment_shader",            c_es2, NULL },
+    { "GL_ARB_vertex_shader",              c_es2, F("glBindAttribLocationARB", "glGetAttribLocationARB") },
+    { "GL_ARB_shader_objects",             c_es2, F("glCreateShaderObjectARB", "glShaderSourceARB", "glCompileShaderARB", "glCreateProgramObjectARB", "glLinkProgramARB", "glUseProgramObjectARB") },
+    { "GL_ARB_shading_language_100",       c_es2, NULL },
+    { "GL_ATI_texture_env_combine3",       c_es2, NULL },
+    { "GL_ATIX_texture_env_route",         c_es2, NULL },
+    { "GL_NV_texture_env_combine4",        c_es2, NULL },
+    { "GL_NV_fog_distance",                c_es2, NULL },
+    { "GL_ARB_draw_instanced",             c_es2, F("glDrawArraysInstancedARB", "glDrawElementsInstancedARB") },
+    { "GL_ARB_instanced_arrays",           c_es2, F("glVertexAttribDivisorARB") },
+    { "GL_ARB_vertex_program",             c_arbprog, F("glGenProgramsARB", "glBindProgramARB", "glProgramStringARB") },
+    { "GL_ARB_fragment_program",           c_arbprog, F("glGenProgramsARB", "glBindProgramARB", "glProgramStringARB") },
+    { "GL_EXT_program_parameters",         c_arbprog, F("glProgramEnvParameters4fvEXT") },
+    { "GL_ARB_get_program_binary",         c_prgbin, F("glGetProgramBinary", "glProgramBinary") },
+    { "GL_ARB_occlusion_query",            c_queries, F("glGenQueriesARB", "glDeleteQueriesARB", "glIsQueryARB", "glBeginQueryARB", "glEndQueryARB",
+                                                        "glGetQueryivARB", "glGetQueryObjectivARB", "glGetQueryObjectuivARB") },
+    { "GL_EXT_timer_query",                c_queries, F("glGetQueryObjecti64vEXT", "glGetQueryObjectui64vEXT") },   // + GL_TIME_ELAPSED
+    { "GL_ARB_timer_query",                c_queries, F("glQueryCounter", "glGetQueryObjecti64v", "glGetQueryObjectui64v") },   // + GL_TIMESTAMP
+    { "GL_ARB_compatibility",              c_compat31, NULL },
+    { NULL, NULL, NULL }
+};
+#undef F
+
+static int all_resolve(const char* const* funcs) {
+    for(int i=0; funcs && funcs[i]; i++)
+        if(!gl4es_GetProcAddress(funcs[i])) {
+            DBG(printf("LIBGL: extension dropped, %s does not resolve\n", funcs[i]);)
+            return 0;
+        }
+    return 1;
+}
+// appends `name` to the space separated list unless it is already there
+static void append_extension(char* extensions, const char* name) {
+    size_t tl = strlen(name), cur = strlen(extensions);
+    for(const char* q = extensions; (q = strstr(q, name)); q += tl)
+        if((q==extensions || q[-1]==' ') && (q[tl]==' ' || q[tl]=='\0')) return;
+    if(cur + tl + 2 < EXTENSIONS_BUFSZ) { memcpy(extensions+cur, name, tl); extensions[cur+tl] = ' '; extensions[cur+tl+1] = '\0'; }
+}
+
 void BuildExtensionsList() {
 	if(!glstate->extensions) {
-		glstate->extensions = (GLubyte*)malloc(5000);	// arbitrary size...
+		glstate->extensions = (GLubyte*)malloc(EXTENSIONS_BUFSZ);	// arbitrary size...
         char *extensions = (char *) glstate->extensions;
-		strcpy(extensions,
-				"GL_EXT_abgr "
-                #ifdef AMIGAOS4
-                "GL_MGL_packed_pixels " // same as GL_EXT_packed_pixels, but older, some old Amiga games may check for this
-                #endif
-                "GL_EXT_packed_pixels "
-                "GL_EXT_compiled_vertex_array "
-                "GL_EXT_compiled_vertex_arrays " // yes, at least on AmigaOS there are progs which check for this wrong string; reason is an old typo in the MiniGL driver.
-                "GL_ARB_vertex_buffer_object "
-                "GL_ARB_vertex_array_object "
-                "GL_ARB_vertex_buffer "
-                "GL_EXT_vertex_array "
-                "GL_EXT_secondary_color "
-                "GL_ARB_multitexture "
-                "GL_ARB_texture_border_clamp "
-                "GL_ARB_texture_env_add "
-                "GL_EXT_texture_env_add "
-                "GL_ARB_texture_env_combine "
-                "GL_EXT_texture_env_combine "
-                "GL_ARB_texture_env_crossbar "
-                "GL_EXT_texture_env_crossbar "
-                "GL_ARB_texture_env_dot3 "
-                "GL_EXT_texture_env_dot3 "
-                "GL_SGIS_generate_mipmap "
-                "GL_EXT_draw_range_elements "
-                "GL_EXT_bgra "
-                "GL_ARB_texture_compression "
-                "GL_EXT_texture_compression_s3tc "
-                "GL_OES_texture_compression_S3TC "
-                "GL_EXT_texture_compression_dxt1 "
-                "GL_EXT_texture_compression_dxt3 "
-                "GL_EXT_texture_compression_dxt5 "
-                "GL_ARB_point_parameters "
-                "GL_EXT_point_parameters "
-                "GL_EXT_stencil_wrap "
-                "GL_SGIS_texture_edge_clamp "
-                "GL_EXT_texture_edge_clamp "
-                "GL_EXT_direct_state_access "
-                "GL_EXT_multi_draw_arrays "
-                "GL_SUN_multi_draw_arrays "
-                "GL_ARB_multisample "
-                "GL_EXT_texture_object "
-                "GL_EXT_polygon_offset "
-                "GL_LORICA_hint "
-                "GL_ARB_draw_elements_base_vertex "
-                "GL_EXT_draw_elements_base_vertex "
-                "GL_ARB_map_buffer_range "
-                "GL_NV_blend_square "
-//                "GL_EXT_blend_logic_op "
-				);
-        { const char *c4 = getenv("LIBGL_GL4ES_COMPAT"); if(c4 && *c4=='1') strcat(extensions, "GL_GL4ES_hint "); }
-        if(!globals4es.notexrect)
-            strcat(extensions, "GL_ARB_texture_rectangle ");
-        if(globals4es.vabgra)
-            strcat(extensions, "GL_ARB_vertex_array_bgra ");
-		if(globals4es.npot>=1)
-			strcat(extensions, "GL_APPLE_texture_2D_limited_npot ");
-		if(globals4es.npot>=2)
-			strcat(extensions, "GL_ARB_texture_non_power_of_two ");
-        if(hardext.blendcolor)
-            strcat(extensions, "GL_EXT_blend_color ");
-        if(hardext.blendminmax)
-            strcat(extensions, "GL_EXT_blend_minmax ");
-        if(hardext.blendeq)
-            strcat(extensions, "GL_EXT_blend_equation_separate ");
-        if(hardext.blendfunc)
-            strcat(extensions, "GL_EXT_blend_func_separate ");
-        if(hardext.blendsub)
-            strcat(extensions, "GL_EXT_blend_subtract ");
-        if(hardext.aniso)
-            strcat(extensions, "GL_EXT_texture_filter_anisotropic ");
-        if(hardext.mirrored)
-            strcat(extensions, "GL_ARB_texture_mirrored_repeat ");
-        if(hardext.fbo)
-            strcat(extensions,                 
-                "GL_ARB_framebuffer_object "
-                "GL_EXT_framebuffer_object "
-                "GL_EXT_packed_depth_stencil "
-                "GL_EXT_framebuffer_blit "
-                "GL_ARB_draw_buffers "
-                "GL_EXT_draw_buffers2 "
-                );
-        if(hardext.pointsprite)
-            strcat(extensions, "GL_ARB_point_sprite ");
-        if(hardext.cubemap) {
-            strcat(extensions, "GL_ARB_texture_cube_map ");
-            strcat(extensions, "GL_EXT_texture_cube_map ");
+        extensions[0] = '\0';
+        for(int e=0; k_gl4es_ext[e].name; e++)
+            if(k_gl4es_ext[e].cond() && all_resolve(k_gl4es_ext[e].funcs))
+                append_extension(extensions, k_gl4es_ext[e].name);
+        #ifndef NOEGL
+        {
+            // hybrid mode (compatibility GL>=3.2): append what GLADIATOR announces and GL4ES does not
+            const char* gx = gl4es_gl31_hybrid_extensions();
+            if(gx) {
+                char* tmp = strdup(gx);
+                char* save = NULL;
+                for(char* tok = strtok_r(tmp, " ", &save); tok; tok = strtok_r(NULL, " ", &save))
+                    append_extension(extensions, tok);
+                free(tmp);
+            }
         }
-        if(hardext.rgtex) {
-            strcat(extensions, "GL_EXT_texture_rg ");
-            strcat(extensions, "GL_ARB_texture_rg ");
-        }
-        if(hardext.floattex || (globals4es.floattex==2)) {
-            strcat(extensions, "GL_EXT_texture_float ");
-            strcat(extensions, "GL_ARB_texture_float ");
-        }
-        if(hardext.halffloattex || (globals4es.floattex==2)) {
-            strcat(extensions, "GL_EXT_texture_half_float ");
-        }
-        if(hardext.floatfbo || (globals4es.floattex==2)) {
-            strcat(extensions, "GL_EXT_color_buffer_float ");
-        }
-        if(hardext.halffloatfbo || (globals4es.floattex==2)) {
-            strcat(extensions, "GL_EXT_color_buffer_half_float ");
-        }
-        if(hardext.depthtex) {
-            strcat(extensions, "GL_EXT_depth_texture ");
-            strcat(extensions, "GL_ARB_depth_texture ");
-        }
-        if(hardext.esversion>1) {
-            strcat(extensions, "GL_EXT_fog_coord ");
-            strcat(extensions, "GL_EXT_separate_specular_color ");
-            strcat(extensions, "GL_EXT_rescale_normal ");
-            strcat(extensions, "GL_ARB_ES2_compatibility ");
-            strcat(extensions,
-                "GL_ARB_fragment_shader "
-                "GL_ARB_vertex_shader "
-                "GL_ARB_shader_objects "
-                "GL_ARB_shading_language_100 "
-                "GL_ATI_texture_env_combine3 "
-                "GL_ATIX_texture_env_route "
-                "GL_NV_texture_env_combine4 "
-                "GL_NV_fog_distance "
-                "GL_ARB_draw_instanced "
-                "GL_ARB_instanced_arrays "
-                );
-            if(!globals4es.noarbprogram)
-                strcat(extensions,
-                "GL_ARB_vertex_program "
-                "GL_ARB_fragment_program "
-                "GL_EXT_program_parameters "
-                );
-        }
-        if(hardext.prgbin_n) {
-            strcat(extensions,
-            "GL_ARB_get_program_binary "
-            );
-        }
+        #endif
         char *p = extensions;
         glstate->num_extensions = 0;
         // quickly count extensions. Each one is separated by space...
@@ -269,7 +323,21 @@ const GLubyte* APIENTRY_GL4ES gl4es_glGetString(GLenum name) {
             return (GLubyte *)globals4es.version;
         case GL_EXTENSIONS:
             BuildExtensionsList();
-            return glstate->extensions;
+            {
+                // Old games copy glGetString(GL_EXTENSIONS) into a 4096 byte buffer: past that they crash or cut a name in half.
+                // The string keeps whole names up to 4000 characters (Wine appends its WGL_* names after them), the oldest first (GL4ES's own, then what GLADIATOR adds);
+                // glGetStringi(GL_EXTENSIONS, i) still lists every one.
+                static __thread char short_ext[4096];
+                const char* full = (const char*)glstate->extensions;
+                size_t fl = strlen(full);
+                // only a context that asked for no version: one that asks for 3.x or more uses glGetStringi and expects the string to match it
+                if(!glstate->gl_legacy || fl <= 4000) return glstate->extensions;
+                size_t n = 4000;
+                while(n > 0 && full[n] != ' ') --n;     // cut at the end of a name
+                memcpy(short_ext, full, n);
+                short_ext[n] = '\0';
+                return (GLubyte*)short_ext;
+            }
 		case GL_VENDOR:
             if(!vendor_string[0]) {
                 lorica_ident(vendor_string, sizeof(vendor_string), gl4es_original_vendor?gl4es_original_vendor:"ARM");
@@ -281,13 +349,22 @@ const GLubyte* APIENTRY_GL4ES gl4es_glGetString(GLenum name) {
             }
 			return (GLubyte *)renderer_string;
 		case GL_SHADING_LANGUAGE_VERSION:
-            if(gl4es_context_gl_version()>=30)
-                return (GLubyte *)"1.40";   /* GLSL 1.40 = GL 3.1 */
-            else if(gl4es_context_gl_version()==21)
-            return (GLubyte *)"1.20";
-            else if(gl4es_context_gl_version()==20)
-                return (GLubyte *)"1.10";
-			return (GLubyte *)"";
+            {
+                /* como Mesa (_mesa_get_shading_language_version): GL 2.0->1.10, 2.1->1.20, 3.0->1.30,
+                 * 3.1->1.40, 3.2->1.50, y desde 3.3 la GLSL lleva el mismo numero que GL (3.30 ... 4.60) */
+                static char glsl_str[8];
+                int v = gl4es_context_gl_version();
+                int M, m;
+                if(v < 20) return (GLubyte *)"";
+                if(v < 33) {
+                    static const char* const old[] = {"1.10","1.20","1.30","1.40","1.50"};
+                    int idx = (v==20)?0 : (v==21)?1 : (v==30)?2 : (v==31)?3 : (v==32)?4 : (v<30)?1 : 2;
+                    return (GLubyte *)old[idx];
+                }
+                M = v/10; m = v%10;
+                snprintf(glsl_str, sizeof(glsl_str), "%d.%d0", M, m);
+                return (GLubyte *)glsl_str;
+            }
         case GL_PROGRAM_ERROR_STRING_ARB:
             return (GLubyte*)glstate->glsl->error_msg;
         default:
@@ -323,7 +400,33 @@ static int getter_scissor4(GLfloat *params) {
     return 1;
 }
 
+extern GLboolean gl4es_enable_state(GLenum cap);   // enable.c
+// Enable caps of the compatibility profile that GLES does not know as glGet pnames (all enable caps are queryable with
+// glGet*: Wine's win32u asks glGetIntegerv(GL_TEXTURE_2D), for instance). GL_LIGHTING is answered below.
+static int compat_enable_pname(GLenum p) {
+    switch (p) {
+        case GL_AUTO_NORMAL: case GL_ALPHA_TEST: case GL_FOG: case GL_LINE_STIPPLE: case GL_COLOR_MATERIAL:
+        case GL_TEXTURE_GEN_S: case GL_TEXTURE_GEN_T: case GL_TEXTURE_GEN_R: case GL_TEXTURE_GEN_Q:
+        case GL_COLOR_SUM: case GL_POINT_SPRITE: case GL_NORMALIZE: case GL_RESCALE_NORMAL:
+        case GL_POINT_SMOOTH: case GL_LINE_SMOOTH: case GL_COLOR_LOGIC_OP: case GL_SAMPLE_ALPHA_TO_ONE: case GL_MULTISAMPLE:
+        case GL_TEXTURE_1D: case GL_TEXTURE_2D: case GL_TEXTURE_3D: case GL_TEXTURE_CUBE_MAP:
+        case GL_VERTEX_ARRAY: case GL_NORMAL_ARRAY: case GL_COLOR_ARRAY: case GL_TEXTURE_COORD_ARRAY:
+        case GL_SECONDARY_COLOR_ARRAY: case GL_FOG_COORD_ARRAY:
+        case GL_MAP1_COLOR_4: case GL_MAP1_INDEX: case GL_MAP1_NORMAL: case GL_MAP1_TEXTURE_COORD_1: case GL_MAP1_TEXTURE_COORD_2:
+        case GL_MAP1_TEXTURE_COORD_3: case GL_MAP1_TEXTURE_COORD_4: case GL_MAP1_VERTEX_3: case GL_MAP1_VERTEX_4:
+        case GL_MAP2_COLOR_4: case GL_MAP2_INDEX: case GL_MAP2_NORMAL: case GL_MAP2_TEXTURE_COORD_1: case GL_MAP2_TEXTURE_COORD_2:
+        case GL_MAP2_TEXTURE_COORD_3: case GL_MAP2_TEXTURE_COORD_4: case GL_MAP2_VERTEX_3: case GL_MAP2_VERTEX_4:
+            return 1;
+        default:
+            return (p >= GL_CLIP_PLANE0 && p <= GL_CLIP_PLANE0+5) || (p >= GL_LIGHT0 && p <= GL_LIGHT0+7);
+    }
+}
+
 int gl4es_commonGet(GLenum pname, GLfloat *params) {
+    if (compat_enable_pname(pname)) {
+        *params = gl4es_enable_state(pname) ? 1.0f : 0.0f;
+        return 1;
+    }
     switch (pname) {
         case GL_MAJOR_VERSION:
             *params = gl4es_context_gl_version()/10;
@@ -335,6 +438,11 @@ int gl4es_commonGet(GLenum pname, GLfloat *params) {
             if(gl4es_context_gl_version()<32)
                 return 0;   // profiles only exist from 3.2
             *params = (GLfloat)gl4es_context_gl_profile();
+            break;
+        case GL_CONTEXT_FLAGS:
+            if(gl4es_context_gl_version()<30)
+                return 0;   // GL_CONTEXT_FLAGS exists from 3.0
+            *params = (GLfloat)gl4es_context_gl_flags();
             break;
         case GL_DOUBLEBUFFER:
             *params = 1;    // Fake double buffering...
@@ -401,10 +509,11 @@ int gl4es_commonGet(GLenum pname, GLfloat *params) {
             *params = glstate->texture.pack_image_height;
             break;
         case GL_UNPACK_SWAP_BYTES:
+            *params = glstate->texture.unpack_swap_bytes;
+            break;
         case GL_PACK_SWAP_BYTES:
-            //Fake, *TODO* ?
-			*params = 0;
-			break;
+            *params = glstate->texture.pack_swap_bytes;
+            break;
         case GL_ZOOM_X:
 	        *params = glstate->raster.raster_zoomx;
 	        break;
@@ -872,6 +981,11 @@ void APIENTRY_GL4ES gl4es_glGetIntegerv(GLenum pname, GLint *params) {
     GLint dummy;
     LOAD_GLES(glGetIntegerv);
     noerrorShim();
+    {
+        // ES-only buffer targets (hybrid mode): answer with the application's buffer id, not the real GLES name
+        GLuint eb;
+        if (gl4es_es_only_binding(pname, &eb)) { params[0] = (GLint)eb; return; }
+    }
     GLfloat fparam;
     if (gl4es_commonGet(pname, &fparam)) {
         params[0] = fparam;

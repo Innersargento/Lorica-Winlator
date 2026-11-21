@@ -438,6 +438,7 @@ void gl31_glLinkProgram(GLuint program)
             p->smp.s[p->smp.n++] = sh->smp->s[j];
     }
     BE(glLinkProgram)(program);
+    gl31_ubo_invalidate();               /* bloques y tamanos nuevos */
     BE(glGetProgramiv)(program, GL_LINK_STATUS, &ok);
     p->linked = ok;
     free(p->log);
@@ -493,26 +494,39 @@ static prog_t* pr_cached(GLuint id)
     return NULL;
 }
 
+/* Valores de lorica_vs / lorica_vs2 / lorica_fs. point_size, pps (GL_PROGRAM_POINT_SIZE), sprite_origin y los bits
+ * 0..5 de la mascara de GL_CLIP_DISTANCEi vienen de quien lleva ese estado: GLADIATOR en sus contextos, GL4ES en
+ * el modo hibrido (alli GL_CLIP_DISTANCE0..5 = GL_CLIP_PLANE0..5 los lleva GL4ES). El resto es estado de GLADIATOR. */
+void gl31_lu_values(GLfloat point_size, int pps, GLenum sprite_origin, unsigned mask_lo, GLfloat out[3][4])
+{
+    gl31_state_t* s = gl31_state();
+    GLboolean b; int i;
+    unsigned mask = mask_lo & 0x3fu;
+    for (i = 6; i < 8; i++) if (gl31_soft_cap_get(GL_CLIP_DISTANCE0 + i, &b) && b) mask |= 1u << i;
+    out[0][0] = point_size; out[0][1] = pps ? 0.0f : 1.0f;
+    out[0][2] = s->clip_depth == GL_ZERO_TO_ONE ? 1.0f : 0.0f;
+    out[0][3] = s->clip_origin == GL_UPPER_LEFT ? 1.0f : 0.0f;
+    out[1][0] = s->depth_clamp_soft ? 1.0f : 0.0f; out[1][1] = (GLfloat)mask; out[1][2] = out[1][3] = 0.0f;
+    out[2][0] = sprite_origin == GL_LOWER_LEFT ? 1.0f : 0.0f; out[2][1] = (GLfloat)mask; out[2][2] = out[2][3] = 0.0f;
+}
+
 void gl31_lu_sync(void)
 {
     gl31_state_t* s = gl31_state();
     prog_t* p;
-    GLboolean b; int i, mask = 0;
+    GLboolean b; int i;
+    unsigned mlo = 0;
+    GLboolean pps = GL_FALSE;
+    GLfloat v[3][4];
     if (!s->program) return;
     p = pr_cached(s->program);
     if (!p || !p->has_lu || p->lu_ver == g_lu_ver) return;
-    if (p->loc_vs >= 0) {
-        GLboolean pps = GL_FALSE;
-        gl31_soft_cap_get(GL_PROGRAM_POINT_SIZE, &pps);
-        BE(glUniform4f)(p->loc_vs, s->point_size, pps ? 0.0f : 1.0f,
-                        s->clip_depth == GL_ZERO_TO_ONE ? 1.0f : 0.0f,
-                        s->clip_origin == GL_UPPER_LEFT ? 1.0f : 0.0f);
-    }
-    for (i = 0; i < 8; i++) if (gl31_soft_cap_get(GL_CLIP_DISTANCE0 + i, &b) && b) mask |= 1 << i;
-    if (p->loc_vs2 >= 0) BE(glUniform4f)(p->loc_vs2, s->depth_clamp_soft ? 1.0f : 0.0f, (GLfloat)mask, 0.0f, 0.0f);
-    if (p->loc_fs >= 0) {
-        BE(glUniform4f)(p->loc_fs, s->point_sprite_origin == GL_LOWER_LEFT ? 1.0f : 0.0f, (GLfloat)mask, 0.0f, 0.0f);
-    }
+    gl31_soft_cap_get(GL_PROGRAM_POINT_SIZE, &pps);
+    for (i = 0; i < 6; i++) if (gl31_soft_cap_get(GL_CLIP_DISTANCE0 + i, &b) && b) mlo |= 1u << i;
+    gl31_lu_values(s->point_size, pps, s->point_sprite_origin, mlo, v);
+    if (p->loc_vs >= 0)  BE(glUniform4f)(p->loc_vs,  v[0][0], v[0][1], v[0][2], v[0][3]);
+    if (p->loc_vs2 >= 0) BE(glUniform4f)(p->loc_vs2, v[1][0], v[1][1], v[1][2], v[1][3]);
+    if (p->loc_fs >= 0)  BE(glUniform4f)(p->loc_fs,  v[2][0], v[2][1], v[2][2], v[2][3]);
     p->lu_ver = g_lu_ver;
 }
 
@@ -599,6 +613,13 @@ void gl31_glUseProgram(GLuint program)
         for (i = 0; i < g_npr; i++)
             if (g_pr[i].id == old && g_pr[i].deleted) { pr_free_at(i); shader_gc(); break; }
     }
+}
+
+/* Modo hibrido: el programa lo linkeo y lo enlaza GL4ES (no esta en g_pr); GLADIATOR solo necesita saber cual es el
+ * actual para lo que comprueba (glBeginTransformFeedback). Sin glUseProgram: GL4ES ya lo enlazo en el backend. */
+void gl31_hybrid_set_program(GLuint program)
+{
+    gl31_state()->program = program;
 }
 
 void gl31_glDeleteProgram(GLuint program)

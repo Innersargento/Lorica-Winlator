@@ -94,5 +94,6 @@ extern globals4es_t globals4es;
 int gl4es_context_gl_version(void);
 // Profile mask (GL_CONTEXT_CORE_PROFILE_BIT / COMPATIBILITY) of the current context
 int gl4es_context_gl_profile(void);
+int gl4es_context_gl_flags(void);       // GL_CONTEXT_FLAGS of the current context
 
 #endif // _GL4ES_INIT_H_
