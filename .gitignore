@@ -35,3 +35,5 @@ core
 build_linux/
 tests/hybrid/test_*
 !tests/hybrid/test_*.c
+.termux_xsys/
+dist/
