@@ -610,6 +610,7 @@ typedef double GLclampd;
     /* ---- ES 3.2 / extensiones ---- */ \
     X(void, glPatchParameteri, (GLenum,GLint)) \
     X(void, glMinSampleShading, (GLfloat)) \
+    X(void, glPolygonOffsetClamp, (GLfloat,GLfloat,GLfloat)) \
     X(void, glBlendEquationi, (GLuint,GLenum)) \
     X(void, glBlendEquationSeparatei, (GLuint,GLenum,GLenum)) \
     X(void, glBlendFunci, (GLuint,GLenum,GLenum)) \
@@ -1122,6 +1123,7 @@ void gl31_glEnablei(GLenum cap, GLuint index);
 void gl31_glDisablei(GLenum cap, GLuint index);
 GLboolean gl31_glIsEnabledi(GLenum cap, GLuint index);
 void gl31_glPolygonOffset(GLfloat factor, GLfloat units);
+void gl31_glPolygonOffsetClamp(GLfloat factor, GLfloat units, GLfloat clamp);
 void gl31_glLineWidth(GLfloat width);
 void gl31_glPointSize(GLfloat size);
 void gl31_glHint(GLenum target, GLenum mode);
@@ -1389,6 +1391,8 @@ void gl31_glInvalidateBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr l
 void gl31_glClearBufferData(GLenum target, GLenum ifmt, GLenum format, GLenum type, const void* data);
 void gl31_glClearBufferSubData(GLenum target, GLenum ifmt, GLintptr offset, GLsizeiptr size, GLenum format, GLenum type, const void* data);
 void gl31_glGetInternalformativ(GLenum target, GLenum ifmt, GLenum pname, GLsizei bufSize, GLint* params);
+void gl31_glGetInternalformati64v(GLenum target, GLenum ifmt, GLenum pname, GLsizei bufSize, GLint64* params);
+int  gl31_internalformat_query(GLenum target, GLenum ifmt, GLenum pname, GLint64* out);
 void gl31_glGetActiveAtomicCounterBufferiv(GLuint program, GLuint index, GLenum pname, GLint* params);
 GLuint gl31_glCreateShaderProgramv(GLenum type, GLsizei count, const GLchar* const* strings);
 void gl31_glProgramParameteri(GLuint program, GLenum pname, GLint value);

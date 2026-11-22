@@ -2036,6 +2036,8 @@ static const void* upload_prepare(GLenum rf, GLenum* format, GLenum* type, GLsiz
     const void* src = pixels;
     void* mapped = NULL;
     void* cv;
+    /* RGBA + UNSIGNED_INT_8_8_8_8_REV: los bytes en memoria son R,G,B,A (little endian) = UNSIGNED_BYTE; ES no tiene ese tipo */
+    if (*type == GL_UNSIGNED_INT_8_8_8_8_REV && (*format == GL_RGBA || *format == GL_RGBA_INTEGER)) *type = GL_UNSIGNED_BYTE;
     if (!fmt_managed(rf) || es_pair_ok(rf, *format, *type))
         return bgra_prepare(format, type, w, h, d, is3d, pixels, b);
     memset(b, 0, sizeof *b);
@@ -3317,3 +3319,152 @@ int gl31_tex_bound_for(GLenum target, GLuint* out)
 }
 
 GLuint gl31_tex_active_unit(void) { return g_active_unit; }
+
+/* ---------- GL_ARB_internalformat_query2 (GL 4.3 core) ----------
+ * Un contexto 4.3 anuncia esta extension por version, y los clientes (wined3d de Wine, apps basadas en Mesa) deciden con ella
+ * que formatos pueden muestrear, filtrar o renderizar: contestar 0 a todo equivale a "ningun formato sirve" (wined3d no crea
+ * el adaptador y Direct3DCreate9 devuelve NULL). Las respuestas salen de lo que el backend ES hace de verdad (tabla de
+ * formatos + capacidades + sustitucion de gl31_storage_format). */
+#define IQ_NONE      0
+#define IQ_FULL      0x82B7
+
+static int iq_compressed(GLenum f, int* block_bytes)
+{
+    *block_bytes = 16;
+    switch (f) {
+        case 0x83F0: case 0x83F1: case 0x8C4C: case 0x8C4D:   /* S3TC DXT1 (RGB/RGBA) y sRGB */
+        case 0x8DBB: case 0x8DBC:                              /* RGTC1 */
+        case 0x9274: case 0x9275: case 0x9276: case 0x9277:    /* ETC2 RGB8 / sRGB8 / RGB8A1 / sRGB8A1 */
+        case 0x9270: case 0x9271:                              /* EAC R11 */
+            *block_bytes = 8; return 1;
+        case 0x83F2: case 0x83F3: case 0x8C4E: case 0x8C4F:   /* DXT3 / DXT5 y sRGB */
+        case 0x8DBD: case 0x8DBE:                              /* RGTC2 */
+        case 0x8E8C: case 0x8E8D: case 0x8E8E: case 0x8E8F:    /* BPTC */
+        case 0x9278: case 0x9279:                              /* ETC2 RGBA8 */
+        case 0x9272: case 0x9273:                              /* EAC RG11 */
+            return 1;
+    }
+    return 0;
+}
+
+/* devuelve 1 si lo contesta (valor en *out), 0 si el pname no existe */
+int gl31_internalformat_query(GLenum target, GLenum ifmt, GLenum pname, GLint64* out)
+{
+    static const fmtinfo_t k_s8 = { GL_STENCIL_INDEX8, 0,0,0,0,0,8,0, T_UN };
+    const int rbuf = target == GL_RENDERBUFFER;
+    const int msaa = target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY;
+    const fmtinfo_t* fi = ifmt == GL_STENCIL_INDEX8 ? &k_s8 : fmt_lookup(ifmt);
+    const fmtinfo_t* fs = fi;                 /* formato con el que se almacena de verdad */
+    int cb = 0, comp, known, color, depth, stencil, integer, fl32, rend, filt, srgb, texonly;
+    GLint v = 0;
+    comp = fi ? 0 : iq_compressed(ifmt, &cb);
+    known = fi != NULL || comp;
+    color = fi && (fi->r || fi->g || fi->b || fi->a);
+    depth = fi && fi->d;
+    stencil = fi && fi->s;
+    if (fi && color) { const fmtinfo_t* s = fmt_lookup(gl31_storage_format(ifmt)); if (s) fs = s; }
+    integer = color && (fs->type == T_IN || fs->type == T_UI);
+    fl32 = color && fs->type == T_FL && fs->r == 32;
+    srgb = ifmt == GL_SRGB8 || ifmt == GL_SRGB8_ALPHA8 || ifmt == 0x8C4C || ifmt == 0x8C4D || ifmt == 0x8C4E ||
+           ifmt == 0x8C4F || ifmt == 0x9275 || ifmt == 0x9277 || ifmt == 0x9279;
+    rend = 0;
+    if (depth || stencil) rend = 1;
+    else if (color) {
+        if (integer) rend = fmt_comps(fs) != 3;
+        else if (fs->type == T_FL) rend = fs->shared ? 0 : (gl31_caps.float_buffer || (fs->r == 16 && gl31_caps.half_float));
+        else if (fs->type == T_SN) rend = gl31_caps.render_snorm;
+        else if (fs->r == 16) rend = gl31_caps.norm16;
+        else rend = ifmt != GL_SRGB8;
+    }
+    filt = known && !integer && !(fl32 && !gl31_caps.float_linear);
+    /* un renderbuffer solo se renderiza: no se muestrea, ni se usa como imagen */
+    texonly = !rbuf;
+
+#define RET(x) do { *out = (x); return 1; } while (0)
+#define SUP(c) RET((c) ? IQ_FULL : IQ_NONE)
+    switch (pname) {
+        case 0x826F: RET(known);                                           /* INTERNALFORMAT_SUPPORTED */
+        case 0x8270: RET(known ? (GLint64)ifmt : 0);                       /* INTERNALFORMAT_PREFERRED */
+        case 0x8271: RET(fi ? fi->r : 0);  case 0x8272: RET(fi ? fi->g : 0);
+        case 0x8273: RET(fi ? fi->b : 0);  case 0x8274: RET(fi ? fi->a : 0);
+        case 0x8275: RET(fi ? fi->d : 0);  case 0x8276: RET(fi ? fi->s : 0);
+        case 0x8277: RET(fi ? fi->shared : 0);
+        case 0x8278: RET(fi && fi->r ? (GLint64)fi->type : 0);            /* *_TYPE: tipo de cada canal */
+        case 0x8279: RET(fi && fi->g ? (GLint64)fi->type : 0);
+        case 0x827A: RET(fi && fi->b ? (GLint64)fi->type : 0);
+        case 0x827B: RET(fi && fi->a ? (GLint64)fi->type : 0);
+        case 0x827C: RET(depth ? (GLint64)fi->type : 0);
+        case 0x827D: RET(stencil ? (GLint64)GL_UNSIGNED_NORMALIZED : 0);
+        case 0x827E: case 0x827F:                                          /* MAX_WIDTH / MAX_HEIGHT */
+            if (!known) RET(0);
+            BE(glGetIntegerv)(rbuf ? GL_MAX_RENDERBUFFER_SIZE : GL_MAX_TEXTURE_SIZE, &v);
+            RET(v);
+        case 0x8280:                                                       /* MAX_DEPTH */
+            if (!known || rbuf || msaa) RET(0);
+            BE(glGetIntegerv)(GL_MAX_3D_TEXTURE_SIZE, &v);
+            RET(v);
+        case 0x8281:                                                       /* MAX_LAYERS */
+            if (!known || rbuf) RET(0);
+            BE(glGetIntegerv)(GL_MAX_ARRAY_TEXTURE_LAYERS, &v);
+            RET(v);
+        case 0x8282:                                                       /* MAX_COMBINED_DIMENSIONS */
+            if (!known) RET(0);
+            BE(glGetIntegerv)(rbuf ? GL_MAX_RENDERBUFFER_SIZE : GL_MAX_TEXTURE_SIZE, &v);
+            RET((GLint64)v * v);
+        case 0x8283: RET(color || comp);   case 0x8284: RET(depth);   case 0x8285: RET(stencil);
+        case 0x8286: SUP(color && rend);                                   /* COLOR_RENDERABLE */
+        case 0x8287: SUP(depth);                                           /* DEPTH_RENDERABLE */
+        case 0x8288: SUP(stencil);                                         /* STENCIL_RENDERABLE */
+        case 0x8289: SUP(known && rend);                                   /* FRAMEBUFFER_RENDERABLE */
+        case 0x828A: SUP(known && rend && !rbuf && !msaa);                 /* ..._LAYERED */
+        case 0x828B: SUP(color && rend && !integer);                       /* FRAMEBUFFER_BLEND */
+        case 0x828C: SUP(known && rend && !comp);                          /* READ_PIXELS */
+        case 0x828D: case 0x828E:                                          /* READ_PIXELS_FORMAT / _TYPE */
+        case 0x828F: case 0x8290: case 0x8291: case 0x8292: {              /* TEXTURE_IMAGE_* / GET_TEXTURE_IMAGE_* */
+            GLenum pf = 0, pt = 0;
+            const int want_fmt = (pname == 0x828D || pname == 0x828F || pname == 0x8291);
+            if (color && pair_for_ifmt(gl31_storage_format(ifmt), &pf, &pt)) RET(want_fmt ? pf : pt);
+            if (depth) {
+                if (want_fmt) RET(stencil ? GL_DEPTH_STENCIL : GL_DEPTH_COMPONENT);
+                if (fi->type == T_FL) RET(stencil ? GL_FLOAT_32_UNSIGNED_INT_24_8_REV : GL_FLOAT);
+                RET(stencil ? GL_UNSIGNED_INT_24_8 : GL_UNSIGNED_INT);
+            }
+            RET(0);
+        }
+        case 0x8293: SUP(known && !msaa && !rbuf);                         /* MIPMAP */
+        case 0x8294: case 0x8295:                                          /* MANUAL / AUTO_GENERATE_MIPMAP */
+            SUP(known && !comp && !msaa && !rbuf && rend && filt);
+        case 0x8296: RET(srgb ? 0x8C40 : 0x2601);                          /* COLOR_ENCODING: GL_SRGB / GL_LINEAR */
+        case 0x8297: SUP(srgb && texonly);                                 /* SRGB_READ */
+        case 0x8298: SUP(srgb && rend);                                    /* SRGB_WRITE */
+        case 0x8299: SUP(srgb && texonly);                                 /* SRGB_DECODE_ARB */
+        case 0x829A: SUP(known && texonly && filt);                        /* FILTER */
+        case 0x829B: case 0x829C: case 0x829D: case 0x829E: case 0x829F: case 0x82A0:   /* *_TEXTURE (por etapa) */
+            SUP(known && texonly);
+        case 0x82A1: SUP(depth && texonly);                                /* TEXTURE_SHADOW */
+        case 0x82A2: SUP((color || comp || depth) && texonly && !msaa);    /* TEXTURE_GATHER */
+        case 0x82A3: SUP(depth && texonly && !msaa);                       /* TEXTURE_GATHER_SHADOW */
+        case 0x82A4: case 0x82A5: case 0x82A6: {                           /* SHADER_IMAGE_LOAD / STORE / ATOMIC */
+            int img = 0, at = 0;
+            if (texonly && gl31_caps.es31) switch (ifmt) {
+                case GL_RGBA32F: case GL_RGBA16F: case GL_R32F: case GL_RGBA8: case GL_RGBA8_SNORM:
+                case GL_RGBA32I: case GL_RGBA16I: case GL_RGBA8I: case GL_RGBA32UI: case GL_RGBA16UI: case GL_RGBA8UI:
+                    img = 1; break;
+                case GL_R32I: case GL_R32UI: img = at = 1; break;
+            }
+            SUP(pname == 0x82A6 ? at : img);
+        }
+        case 0x82A7: case 0x82A8: case 0x82A9: case 0x82AA: RET(0);        /* IMAGE_TEXEL_SIZE / CLASS / PIXEL_FORMAT / TYPE */
+        case 0x82AC: case 0x82AE: SUP(depth && texonly);                   /* SIMULTANEOUS_TEXTURE_AND_DEPTH_{TEST,WRITE} */
+        case 0x82AD: case 0x82AF: SUP(stencil && texonly);                 /* ..._STENCIL_{TEST,WRITE} */
+        case 0x86A1: RET(comp);                                            /* TEXTURE_COMPRESSED */
+        case 0x82B1: case 0x82B2: RET(comp ? 4 : 0);                       /* BLOCK_WIDTH / HEIGHT */
+        case 0x82B3: RET(comp ? cb : 0);                                   /* BLOCK_SIZE */
+        case 0x82B4: SUP(known && !comp && texonly);                       /* CLEAR_BUFFER */
+        case 0x82B5: SUP(known && texonly && (gl31_caps.texture_view || gl31_caps.copy_image));   /* TEXTURE_VIEW */
+        case 0x82B6: RET(0);                                               /* VIEW_COMPATIBILITY_CLASS */
+    }
+    return 0;
+#undef SUP
+#undef RET
+}

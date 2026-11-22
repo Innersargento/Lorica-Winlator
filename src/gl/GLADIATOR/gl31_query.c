@@ -453,6 +453,10 @@ static const ext_t k_ext[] = {
     { "GL_KHR_debug",                     x_debug,  F("glDebugMessageControl", "glDebugMessageInsert", "glDebugMessageCallback", "glGetDebugMessageLog", "glPushDebugGroup", "glObjectLabel") },
     { "GL_ARB_debug_output",              x_debug,  F("glDebugMessageControl", "glDebugMessageInsert", "glDebugMessageCallback", "glGetDebugMessageLog") },
     { "GL_ARB_internalformat_query",      x_always, F("glGetInternalformativ") },
+    { "GL_ARB_polygon_offset_clamp",      x_v4,     F("glPolygonOffsetClamp") },
+    { "GL_EXT_polygon_offset_clamp",      x_v4,     F("glPolygonOffsetClamp") },
+    { "GL_EXT_shader_integer_mix",        x_v4,     NULL },   /* mix() con int/uint/bool: se emula con sobrecargas en el traductor GLSL */
+    { "GL_ARB_internalformat_query2",     x_v4,     F("glGetInternalformativ", "glGetInternalformati64v") },
     { "GL_ARB_texture_storage_multisample", x_msstore, F("glTexStorage2DMultisample", "glTexStorage3DMultisample") },
     { "GL_ARB_texture_buffer_range",      x_texbuf, F("glTexBufferRange") },
     { "GL_ARB_clear_buffer_object",       x_always, F("glClearBufferData", "glClearBufferSubData") },
@@ -608,6 +612,21 @@ static int local_integer(GLenum pname, GLint* out)
         case GL_MAX_TEXTURE_BUFFER_SIZE:
             if (gl31_caps.tex_buffer) return 0;      /* lo sabe el backend */
             *out = 0; return 1;
+        /* En GL de escritorio gl_FragCoord (4 componentes) no se descuenta de MAX_VARYING_COMPONENTS; en ES (Mali) si
+         * entra en el limite de entradas del fragment shader. Un cliente que declara tantos varyings como anuncia este
+         * limite (wined3d: 31 vec4) mas gl_FragCoord no linkearia: se anuncia lo que queda libre. */
+        case 0x8B4B /* GL_MAX_VARYING_COMPONENTS / FLOATS */: {
+            GLint v = 0;
+            BE(glGetIntegerv)(0x8B4B, &v);
+            *out = v > 4 ? v - 4 : v;
+            return 1;
+        }
+        case 0x8DFC /* GL_MAX_VARYING_VECTORS */: {
+            GLint v = 0;
+            BE(glGetIntegerv)(0x8DFC, &v);
+            *out = v > 1 ? v - 1 : v;
+            return 1;
+        }
         case GL_MAX_RECTANGLE_TEXTURE_SIZE:
             BE(glGetIntegerv)(GL_MAX_TEXTURE_SIZE, out);
             return 1;

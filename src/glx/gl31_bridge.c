@@ -7,6 +7,7 @@
 
 #include "gl31_bridge.h"
 #include "hardext.h"
+#include "../config.h"
 #include "../gl/loader.h"
 #include "../gl/init.h"
 #include "../gl/logs.h"
@@ -323,6 +324,22 @@ int gl4es_gl31_bridge_ensure(void)
     }
     /* modo hibrido: GL4ES es el dueno de los built-ins de compatibilidad (atributos y uniforms de estado) */
     gl31_glsl_set_compat_builtins(gl4es_compat_builtin);
+    /* hardext se sondeo con un contexto ES 2.0, que no tiene draw buffers multiples (1/1); el contexto ES 3.x si
+     * (MAX_DRAW_BUFFERS y MAX_COLOR_ATTACHMENTS >= 4 en el nucleo). Sin esto un contexto GL 4.3 anuncia un solo render
+     * target y D3D9 sobre wined3d (NumSimultaneousRTs = 1) lo rechaza. */
+    {
+        typedef void (*geti_fn)(unsigned, int*);
+        geti_fn geti = (geti_fn)bridge_loader("glGetIntegerv");
+        int ca = 0, db = 0;
+        if (geti) {
+            geti(0x8CDF /* GL_MAX_COLOR_ATTACHMENTS */, &ca);
+            geti(0x8824 /* GL_MAX_DRAW_BUFFERS */, &db);
+        }
+        if (ca > hardext.maxcolorattach) hardext.maxcolorattach = ca > MAX_DRAW_BUFFERS ? MAX_DRAW_BUFFERS : ca;
+        if (db > hardext.maxdrawbuffers) hardext.maxdrawbuffers = db > MAX_DRAW_BUFFERS ? MAX_DRAW_BUFFERS : db;
+        hardext.drawbuffers = 1;
+        LOGD("LIBGL: backend ES 3.x: %d color attachments / %d draw buffers\n", hardext.maxcolorattach, hardext.maxdrawbuffers);
+    }
     gl31_ready = 1;
     LOGD("LIBGL: GLADIATOR iniciado (backend ES 3.x)\n");
     return 1;

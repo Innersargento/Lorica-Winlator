@@ -649,6 +649,14 @@ int gl4es_commonGet(GLenum pname, GLfloat *params) {
                 errorShim(GL_INVALID_ENUM);
             }
             break;
+        case 0x8B4B:   /* GL_MAX_VARYING_COMPONENTS / FLOATS: en ES gl_FragCoord entra en el limite; en GL de escritorio no */
+        {
+            GLint v = 0;
+            LOAD_GLES(glGetIntegerv);
+            gles_glGetIntegerv(pname, &v);
+            params[0] = (GLfloat)(v > 4 ? v - 4 : v);
+        }
+            break;
         case GL_MAX_COLOR_ATTACHMENTS:
             if(hardext.fbo)
                 *params=hardext.maxcolorattach;

@@ -523,26 +523,48 @@ void gl31_glClearBufferSubData(GLenum target, GLenum ifmt, GLintptr offset, GLsi
 }
 
 /* ---------- consultas ---------- */
-void gl31_glGetInternalformativ(GLenum target, GLenum ifmt, GLenum pname, GLsizei bufSize, GLint* params)
+/* el backend ES solo acepta consultar muestras para formatos renderizables (si no: GL_INVALID_ENUM en su cola de errores) */
+static int iq_can_msaa(GLenum target, GLenum ifmt)
 {
+    GLint64 r = 0;
+    if (target != GL_RENDERBUFFER && target != GL_TEXTURE_2D_MULTISAMPLE && target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY)
+        return 0;
+    return gl31_internalformat_query(target, ifmt, 0x8289, &r) && r != 0;   /* FRAMEBUFFER_RENDERABLE */
+}
+
+void gl31_glGetInternalformati64v(GLenum target, GLenum ifmt, GLenum pname, GLsizei bufSize, GLint64* params)
+{
+    GLint64 v = 0;
     if (bufSize < 0) { gl31_set_error(GL_INVALID_VALUE); return; }
     if (!bufSize || !params) return;
-    switch (pname) {
-        case GL_SAMPLES:
-        case GL_NUM_SAMPLE_COUNTS:
-            if (target == GL_RENDERBUFFER || target == GL_TEXTURE_2D_MULTISAMPLE ||
-                target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
-                BE(glGetInternalformativ)(target, ifmt, pname, bufSize, params);
-                return;
-            }
-            params[0] = pname == GL_NUM_SAMPLE_COUNTS ? 0 : 0;
-            return;
-        case GL_INTERNALFORMAT_SUPPORTED:
-            params[0] = GL_TRUE;               /* mejor esfuerzo: el backend decide al crear la textura */
-            return;
-        default:
-            params[0] = 0;                     /* el resto de propiedades de GL 4.3 no existen en ES */
+    if (pname == GL_SAMPLES || pname == GL_NUM_SAMPLE_COUNTS) {
+        GLint tmp[64];
+        GLsizei n = bufSize < 64 ? bufSize : 64, i;
+        if (iq_can_msaa(target, ifmt)) {
+            BE(glGetInternalformativ)(target, ifmt, pname, n, tmp);
+            for (i = 0; i < n; i++) params[i] = tmp[i];
+        } else params[0] = 0;
+        return;
     }
+    if (gl31_internalformat_query(target, ifmt, pname, &v)) { params[0] = v; return; }
+    gl31_set_error(GL_INVALID_ENUM);
+}
+
+void gl31_glGetInternalformativ(GLenum target, GLenum ifmt, GLenum pname, GLsizei bufSize, GLint* params)
+{
+    GLint64 v = 0;
+    if (bufSize < 0) { gl31_set_error(GL_INVALID_VALUE); return; }
+    if (!bufSize || !params) return;
+    if (pname == GL_SAMPLES || pname == GL_NUM_SAMPLE_COUNTS) {
+        if (iq_can_msaa(target, ifmt)) BE(glGetInternalformativ)(target, ifmt, pname, bufSize, params);
+        else params[0] = 0;
+        return;
+    }
+    if (gl31_internalformat_query(target, ifmt, pname, &v)) {
+        params[0] = v > 0x7fffffffLL ? 0x7fffffff : (GLint)v;
+        return;
+    }
+    gl31_set_error(GL_INVALID_ENUM);
 }
 
 /* GL 4.2 -> glGetProgramResourceiv sobre la interfaz GL_ATOMIC_COUNTER_BUFFER de ES 3.1 */

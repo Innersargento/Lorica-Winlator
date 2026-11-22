@@ -274,6 +274,7 @@ int gl31_init(gl31_loader_fn loader)
         LOAD_OPT(glPatchParameteri);
         if (!gl31_be.glPatchParameteri) gl31_caps.tess = 0;
     }
+    LOAD_OPT(glPolygonOffsetClamp);   /* EXT_polygon_offset_clamp: sin el, glPolygonOffsetClamp ignora el clamp */
     if (gl31_caps.sample_shading) {
         LOAD_OPT(glMinSampleShading);
         if (!gl31_be.glMinSampleShading) gl31_caps.sample_shading = 0;

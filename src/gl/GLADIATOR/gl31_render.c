@@ -468,6 +468,12 @@ void gl31_glClipControl(GLenum origin, GLenum depth)
     gl31_lu_bump();
 }
 void gl31_glPolygonOffset(GLfloat factor, GLfloat units) { BE(glPolygonOffset)(factor, units); }
+/* GL 4.6 / ARB_polygon_offset_clamp: el driver ES lo tiene como EXT_polygon_offset_clamp; si no, solo se pierde el tope */
+void gl31_glPolygonOffsetClamp(GLfloat factor, GLfloat units, GLfloat clamp)
+{
+    if (gl31_be.glPolygonOffsetClamp) gl31_be.glPolygonOffsetClamp(factor, units, clamp);
+    else BE(glPolygonOffset)(factor, units);
+}
 
 void gl31_glLineWidth(GLfloat width)
 {

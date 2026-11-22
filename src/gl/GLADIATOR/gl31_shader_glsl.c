@@ -104,7 +104,71 @@ static char* repl_word(char* s, const char* from, const char* to)
     return b.p;
 }
 
+/* ---------- GL_EXT_shader_integer_mix ---------- */
+/* mix(genIType/genUType/genBType, ..., genBType): GLSL 4.50 / EXT_shader_integer_mix. ES 3.x solo trae mix() de float con
+ * selector bool; los demas tipos se anaden como sobrecargas de usuario (ES permite sobrecargar funciones incorporadas). */
+static GL31_TLS int g_imix;
+
+static void emit_integer_mix(sb_t* sb)
+{
+    static const char* const base[3] = { "int", "uint", "bool" };
+    static const char* const pre[3]  = { "i", "u", "b" };
+    int t, n;
+    for (t = 0; t < 3; t++) {
+        for (n = 1; n <= 4; n++) {
+            char ty[16], bt[16], line[400];
+            static const char* const sw[4] = { "x", "y", "z", "w" };
+            if (n == 1) { snprintf(ty, sizeof ty, "%s", base[t]); snprintf(bt, sizeof bt, "bool"); }
+            else { snprintf(ty, sizeof ty, "%svec%d", pre[t], n); snprintf(bt, sizeof bt, "bvec%d", n); }
+            if (n == 1) {
+                snprintf(line, sizeof line, "%s lorica_mix(%s x, %s y, bool a){ return a ? y : x; }\n", ty, ty, ty);
+            } else {
+                char comps[200] = "";
+                int k;
+                for (k = 0; k < n; k++) {
+                    char c[40];
+                    snprintf(c, sizeof c, "%sa.%s ? y.%s : x.%s", k ? ", " : "", sw[k], sw[k], sw[k]);
+                    strcat(comps, c);
+                }
+                snprintf(line, sizeof line, "%s lorica_mix(%s x, %s y, %s a){ return %s(%s); }\n", ty, ty, ty, bt, ty, comps);
+            }
+            sb_str(sb, line);
+        }
+    }
+    /* mix() de float: el nombre incorporado no se puede sobrecargar, asi que todo mix() del shader pasa a lorica_mix() */
+    for (n = 1; n <= 4; n++) {
+        char ty[16], bt[16], line[300];
+        if (n == 1) { snprintf(ty, sizeof ty, "float"); snprintf(bt, sizeof bt, "bool"); }
+        else { snprintf(ty, sizeof ty, "vec%d", n); snprintf(bt, sizeof bt, "bvec%d", n); }
+        snprintf(line, sizeof line, "%s lorica_mix(%s x, %s y, %s a){ return mix(x, y, a); }\n", ty, ty, ty, ty);
+        sb_str(sb, line);
+        snprintf(line, sizeof line, "%s lorica_mix(%s x, %s y, %s a){ return mix(x, y, a); }\n", ty, ty, ty, bt);
+        sb_str(sb, line);
+        if (n > 1) {
+            snprintf(line, sizeof line, "%s lorica_mix(%s x, %s y, float a){ return mix(x, y, a); }\n", ty, ty, ty);
+            sb_str(sb, line);
+        }
+    }
+}
+
 /* ---------- #extension ---------- */
+/* extensiones EXT/NV de escritorio que ES 3.x ya trae en el nucleo (o no tiene): el compilador ES las rechaza */
+static int desktop_only_ext(const char* n)
+{
+    static const char* const k[] = {
+        "GL_EXT_texture_array", "GL_EXT_gpu_shader4", "GL_EXT_texture_buffer_object", "GL_EXT_geometry_shader4",
+        "GL_EXT_draw_buffers2", "GL_EXT_texture_integer", "GL_EXT_packed_float", "GL_EXT_texture_shared_exponent",
+        "GL_EXT_texture_swizzle", "GL_EXT_shadow_funcs", "GL_EXT_framebuffer_object", "GL_EXT_framebuffer_blit",
+        "GL_EXT_draw_instanced", "GL_EXT_bindable_uniform", "GL_EXT_transform_feedback", "GL_NV_gpu_program4",
+        "GL_NV_gpu_shader5", "GL_NV_shader_buffer_load", "GL_EXT_texture3D", "GL_EXT_timer_query", NULL };
+    int i;
+    for (i = 0; k[i]; i++) {
+        size_t l = strlen(k[i]);
+        if (strncmp(n, k[i], l) == 0 && !isalnum((unsigned char)n[l]) && n[l] != '_') return 1;
+    }
+    return 0;
+}
+
 static void process_extensions(char* s, sb_t* ext)
 {
     char* line = s;
@@ -116,7 +180,9 @@ static void process_extensions(char* s, sb_t* ext)
         if (eol - t >= 10 && strncmp(t, "#extension", 10) == 0) {
             const char* name = t + 10;
             while (name < eol && isspace((unsigned char)*name)) name++;
-            if (strncmp(name, "GL_ARB_", 7) != 0) {   /* ARB: ya es core en ES */
+            if (strncmp(name, "GL_EXT_shader_integer_mix", 25) == 0) {
+                g_imix = 1;                          /* ES no la tiene: se emula con sobrecargas de mix() */
+            } else if (strncmp(name, "GL_ARB_", 7) != 0 && !desktop_only_ext(name)) {   /* ARB: ya es core en ES */
                 sb_cat(ext, t, (size_t)(eol - t));
                 sb_str(ext, "\n");
             }
@@ -217,6 +283,39 @@ static char* filter_layouts(const char* s, GLenum type, int es)
         if (!close) { sb_cat(&b, p, (size_t)(q + 6 - p)); p = q + 6; continue; }
         sb_cat(&b, p, (size_t)(q - p));
         dir = next_direction(close + 1);
+        /* Segunda fuente de mezcla (layout(location = 0, index = 1) out ...) sin EXT_blend_func_extended: ES no tiene dual-source
+         * y dos salidas en location 0 no compilan (S0059). La segunda salida pasa a ser una variable global privada: el shader
+         * compila y solo se pierde esa fuente del mezclado. */
+        if (type == GL_FRAGMENT_SHADER && dir == 2 && !gl31_caps.dual_src) {
+            const char* ix = o + 1;
+            int is1 = 0;
+            while (ix < close) {
+                const char* w = find_word(ix, "index");
+                if (!w || w >= close) break;
+                w += 5;
+                while (w < close && isspace((unsigned char)*w)) w++;
+                if (w < close && *w == '=') {
+                    w++;
+                    while (w < close && isspace((unsigned char)*w)) w++;
+                    if (w < close && *w == '1' && !is_id((unsigned char)w[1])) is1 = 1;
+                }
+                ix = w;
+            }
+            if (is1) {
+                const char* a = close + 1;
+                const char* c;
+                while (*a && isspace((unsigned char)*a)) a++;
+                while (*a == 'f' || *a == 's' || *a == 'c') {   /* flat/smooth/centroid antes de out: no hacen falta */
+                    const char* e2 = a; while (is_id((unsigned char)*e2)) e2++;
+                    if ((size_t)(e2 - a) == 4 || (size_t)(e2 - a) == 6 || (size_t)(e2 - a) == 8) { a = e2; while (*a && isspace((unsigned char)*a)) a++; } else break;
+                }
+                if (a[0] == 'o' && a[1] == 'u' && a[2] == 't' && !is_id((unsigned char)a[3])) {
+                    for (c = o; c < a + 3; c++) if (*c == '\n') sb_str(&b, "\n");
+                    p = a + 3;
+                    continue;
+                }
+            }
+        }
         /* ES 3.00: location solo en entradas de vertice y salidas de fragmento; ES 3.10+ lo admite entre etapas */
         drop = es < 310 && ((type == GL_VERTEX_SHADER && dir == 2) || (type == GL_FRAGMENT_SHADER && dir == 1));
         emit_layout(&b, o + 1, close, drop, es);
@@ -763,6 +862,159 @@ static GL31_TLS gl31_conv_info_t g_info;
 void gl31_glsl_set_opts(const gl31_conv_opts_t* o) { if (o) g_opts = *o; else memset(&g_opts, 0, sizeof g_opts); }
 void gl31_glsl_get_info(gl31_conv_info_t* out) { if (out) *out = g_info; }
 
+/* ---------- inicializadores globales no constantes ---------- */
+/* GLSL de escritorio (1.20+) admite `vec4 v = vec4(gl_VertexID, ...);` o con uniforms en el ambito global; ES exige una
+ * expresion constante (S0012). wined3d las genera (vs_in0 con gl_VertexID - base_vertex_id). Se parte la declaracion:
+ * `vec4 v;` queda donde estaba y la asignacion pasa al principio de main(), en el mismo orden. Solo se mueven las que
+ * mencionan un gl_* o un uniform (las demas pueden ser constantes y siguen intactas). */
+#define HOIST_MAXU 256
+static int hoist_has_word(const char* b, const char* e, const char* w)
+{
+    size_t n = strlen(w);
+    const char* p = b;
+    while (p + n <= e) {
+        if (strncmp(p, w, n) == 0 && (p == b || !is_id((unsigned char)p[-1])) && (p + n == e || !is_id((unsigned char)p[n])))
+            return 1;
+        p++;
+    }
+    return 0;
+}
+
+static int hoist_has_glprefix(const char* b, const char* e)
+{
+    const char* p = b;
+    while (p + 3 <= e) {
+        if (strncmp(p, "gl_", 3) == 0 && (p == b || !is_id((unsigned char)p[-1]))) return 1;
+        p++;
+    }
+    return 0;
+}
+
+static char* hoist_global_inits(char* s)
+{
+    static const char* const skipkw[] = { "const", "uniform", "in", "out", "layout", "struct", "typedef", "precision",
+        "invariant", "buffer", "shared", "flat", "smooth", "centroid", "attribute", "varying", "patch", "sample",
+        "coherent", "volatile", "restrict", "readonly", "writeonly", NULL };
+    char (*un)[64] = NULL;
+    int nu = 0, any = 0;
+    sb_t out = {0, 0, 0, 0}, asg = {0, 0, 0, 0};
+    const char *p = s, *st = s, *last = s;
+    int depth = 0;
+    un = (char (*)[64])malloc((size_t)HOIST_MAXU * 64);
+    if (!un) return s;
+    while (*p) {
+        if (*p == '#' ) {                       /* directiva: hasta fin de linea */
+            const char* ls = p;
+            while (ls > s && (ls[-1] == ' ' || ls[-1] == '\t')) ls--;
+            if (ls == s || ls[-1] == '\n') { while (*p && *p != '\n') p++; st = *p ? p + 1 : p; continue; }
+        }
+        if (*p == '{') { depth++; p++; continue; }
+        if (*p == '}') { if (depth > 0) depth--; p++; if (depth == 0) st = p; continue; }
+        if (*p == ';' && depth == 0) {
+            const char *b = st, *e = p, *eq = NULL, *q;
+            int pd = 0, first_ok = 1;
+            while (b < e && isspace((unsigned char)*b)) b++;
+            /* primera palabra (despues de un `layout(...)` si lo hay) */
+            {
+                const char* b2 = b; const char* w; size_t wl;
+                if (e - b2 > 6 && !strncmp(b2, "layout", 6) && !is_id((unsigned char)b2[6])) {
+                    int dd = 0;
+                    b2 += 6;
+                    while (b2 < e) { if (*b2 == '(') dd++; else if (*b2 == ')' && --dd == 0) { b2++; break; } b2++; }
+                    while (b2 < e && isspace((unsigned char)*b2)) b2++;
+                }
+                w = b2;
+                while (w < e && is_id((unsigned char)*w)) w++;
+                wl = (size_t)(w - b2);
+                if (wl && ((wl == 7 && !strncmp(b2, "uniform", 7)) || (wl == 2 && !strncmp(b2, "in", 2))) &&
+                    !memchr(b2, '{', (size_t)(e - b2))) {
+                    /* registrar los nombres de los uniforms: cada declarador, sin `[n]` ni `= valor` */
+                    const char* ds = w; const char* r; pd = 0;
+                    for (q = w; q <= e; q++) {
+                        char ch = q < e ? *q : ',';
+                        if (ch == '[' || ch == '(') pd++;
+                        else if (ch == ']' || ch == ')') pd--;
+                        if (pd == 0 && ch == ',') {
+                            const char* de = q; const char* nb;
+                            for (r = ds; r < q; r++) if (*r == '[' || *r == '=') { de = r; break; }
+                            while (de > ds && isspace((unsigned char)de[-1])) de--;
+                            nb = de;
+                            while (nb > ds && is_id((unsigned char)nb[-1])) nb--;
+                            if (de > nb && (size_t)(de - nb) < 64 && nu < HOIST_MAXU) {
+                                memcpy(un[nu], nb, (size_t)(de - nb)); un[nu][de - nb] = 0; nu++;
+                            }
+                            ds = q + 1;
+                        }
+                    }
+                    first_ok = 0;
+                } else {
+                    int k;
+                    for (k = 0; skipkw[k]; k++)
+                        if (strlen(skipkw[k]) == wl && !strncmp(skipkw[k], b2, wl)) { first_ok = 0; break; }
+                }
+            }
+            if (first_ok) {
+                pd = 0;
+                for (q = b; q < e; q++) {
+                    if (*q == '(' || *q == '[') pd++;
+                    else if (*q == ')' || *q == ']') pd--;
+                    else if (*q == '=' && pd == 0 && q[1] != '=' && q > b && !strchr("<>!=", q[-1])) { eq = q; break; }
+                    else if (*q == '(' ) break;
+                }
+                if (eq) {
+                    const char* decl_end = eq;
+                    int has_comma = 0, has_br = 0, has_paren = 0, nonconst, k;
+                    while (decl_end > b && isspace((unsigned char)decl_end[-1])) decl_end--;
+                    for (q = b; q < decl_end; q++) { if (*q == ',') has_comma = 1; if (*q == '[') has_br = 1; if (*q == '(') has_paren = 1; }
+                    nonconst = hoist_has_glprefix(eq + 1, e);
+                    for (k = 0; !nonconst && k < nu; k++) if (hoist_has_word(eq + 1, e, un[k])) nonconst = 1;
+                    if (!has_comma && !has_br && !has_paren && nonconst) {
+                        const char* ne = decl_end; const char* nb = ne;
+                        const char* ib = eq + 1;
+                        while (nb > b && is_id((unsigned char)nb[-1])) nb--;
+                        while (ib < e && isspace((unsigned char)*ib)) ib++;
+                        sb_cat(&out, last, (size_t)(decl_end - last));   /* hasta el final de `TIPO nombre` */
+                        last = e;                                         /* se omite `= inicializador` */
+                        sb_str(&asg, "    "); sb_cat(&asg, nb, (size_t)(ne - nb)); sb_str(&asg, " = ");
+                        sb_cat(&asg, ib, (size_t)(e - ib)); sb_str(&asg, ";\n");
+                        any = 1;
+                    }
+                }
+            }
+            p++; st = p; continue;
+        }
+        p++;
+    }
+    free(un);
+    if (!any) { free(out.p); free(asg.p); return s; }
+    sb_str(&out, last);
+    /* insertar al principio de main() */
+    {
+        char* m = out.p; char* hit = NULL; const char* w = m;
+        while ((w = find_word(w, "main")) != NULL) {
+            const char* q = w + 4; const char* bb = w;
+            while (bb > m && isspace((unsigned char)bb[-1])) bb--;
+            while (isspace((unsigned char)*q)) q++;
+            if (bb - m >= 4 && !strncmp(bb - 4, "void", 4) && *q == '(') { hit = (char*)w; break; }
+            w += 4;
+        }
+        if (hit) {
+            char* br = strchr(hit, '{');
+            if (br) {
+                sb_t o2 = {0, 0, 0, 0};
+                sb_cat(&o2, out.p, (size_t)(br + 1 - out.p));
+                sb_str(&o2, "\n"); sb_cat(&o2, asg.p, asg.n);
+                sb_str(&o2, br + 1);
+                free(out.p); free(asg.p); free(s);
+                if (o2.oom) { free(o2.p); return NULL; }
+                return o2.p;
+            }
+        }
+    }
+    free(out.p); free(asg.p);
+    return s;     /* sin main(): se deja como estaba */
+}
+
 /* Renombra todas las definiciones `void main(` a `void lorica_main(`. *found = 0 si no existe.
  * Todas, no solo la primera: un shader de fuente unica puede tener un main por rama #if/#ifdef. */
 static char* rename_main(char* s, int* found)
@@ -845,6 +1097,9 @@ static void strip_cd_decl(char* s)
 static int lu_transform(char** ps, GLenum type, const gl31_conv_opts_t* op, sb_t* hdr, sb_t* tail)
 {
     char* s = *ps; char buf[256]; int found = 0;
+    s = hoist_global_inits(s);
+    if (!s) { *ps = NULL; return 0; }
+    *ps = s;
     if (type == GL_VERTEX_SHADER && op->last_vs) {
         int wrote_ps = find_word(s, "gl_PointSize") != NULL;
         int cdn = 0, gate_n = 0;
@@ -1265,8 +1520,10 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
         }
     }
 
+    g_imix = 0;
     process_extensions(s, &ext);
     if (ext.oom) goto oom;
+    if (g_imix) { s = repl_word(s, "mix", "lorica_mix"); if (!s) goto oom; }
 
     /* extensiones que el backend exige bajo ES < 3.20 */
     if (shader_type == GL_GEOMETRY_SHADER && es < 320) sb_str(&ext, "#extension GL_EXT_geometry_shader : require\n");
@@ -1372,6 +1629,7 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
     sb_str(&o, num);
     if (ext.n) sb_cat(&o, ext.p, ext.n);
     emit_precisions(&o);
+    if (g_imix) emit_integer_mix(&o);
     if (uses_color) sb_str(&o, "layout(location = 0) out highp vec4 lorica_FragColor; ");
     if (uses_data)  sb_str(&o, "layout(location = 0) out highp vec4 lorica_FragData[4]; ");
     emit_helpers(&o, used, shader_type == GL_FRAGMENT_SHADER);
