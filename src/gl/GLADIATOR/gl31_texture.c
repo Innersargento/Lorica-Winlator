@@ -21,6 +21,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef GL_UNSIGNED_INT_8_8_8_8
+#define GL_UNSIGNED_INT_8_8_8_8 0x8035
+#endif
+#ifndef GL_UNSIGNED_INT_8_8_8_8_REV
+#define GL_UNSIGNED_INT_8_8_8_8_REV 0x8367
+#endif
 #ifndef GL_TEXTURE_BORDER_COLOR
 #define GL_TEXTURE_BORDER_COLOR 0x1004
 #endif
@@ -29,6 +35,21 @@
 #endif
 #ifndef GL_DEPTH_TEXTURE_MODE
 #define GL_DEPTH_TEXTURE_MODE 0x884B
+#endif
+#ifndef GL_LUMINANCE
+#define GL_LUMINANCE 0x1909
+#endif
+#ifndef GL_INTENSITY
+#define GL_INTENSITY 0x8049
+#endif
+#ifndef GL_ALPHA
+#define GL_ALPHA 0x1906
+#endif
+#ifndef GL_TEXTURE_SWIZZLE_R
+#define GL_TEXTURE_SWIZZLE_R 0x8E42
+#define GL_TEXTURE_SWIZZLE_G 0x8E43
+#define GL_TEXTURE_SWIZZLE_B 0x8E44
+#define GL_TEXTURE_SWIZZLE_A 0x8E45
 #endif
 #ifndef GL_GENERATE_MIPMAP
 #define GL_GENERATE_MIPMAP 0x8191
@@ -131,6 +152,8 @@ typedef struct {
     GLint   bi[4];
     int     bi_valid;       /* 1 = el ultimo valor se dio como entero (Iiv/Iuiv) */
     int     immutable;      /* 1 = creada con glTexStorage: re-especificar un nivel da GL_INVALID_OPERATION */
+    GLint   depth_mode;     /* GL_DEPTH_TEXTURE_MODE, predeterminado GL_LUMINANCE */
+    GLint   swizzle[4];     /* swizzle solicitado por la app, antes de componerlo con depth_mode */
 } tex_t;
 typedef struct { GLenum target; GLint level; lvl_t l; } proxy_t;
 
@@ -260,6 +283,9 @@ static tex_t* tex_get(GLuint id)
     t = &g_tex[g_nt++];
     memset(t, 0, sizeof *t);
     t->id = id;
+    t->depth_mode = GL_LUMINANCE;
+    t->swizzle[0] = GL_RED; t->swizzle[1] = GL_GREEN;
+    t->swizzle[2] = GL_BLUE; t->swizzle[3] = GL_ALPHA;
     return t;
 }
 
@@ -274,6 +300,29 @@ static tex_t* cur_tex(GLenum target)
 
 /* almacenamiento inmutable (glTexStorage*): re-especificar un nivel es GL_INVALID_OPERATION (GL 4.2 / ARB_texture_storage).
  * El driver ES lo exige, pero no todos lo cumplen, asi que se lleva la cuenta aqui. */
+static int depth_ifmt(GLenum f)
+{
+    return f == GL_DEPTH_COMPONENT || f == GL_DEPTH_COMPONENT16 || f == GL_DEPTH_COMPONENT24 ||
+           f == GL_DEPTH_COMPONENT32 || f == GL_DEPTH_COMPONENT32F || f == GL_DEPTH_STENCIL ||
+           f == GL_DEPTH24_STENCIL8 || f == GL_DEPTH32F_STENCIL8;
+}
+static GLenum swz_component(GLint s, const GLenum b[4])
+{
+    switch (s) { case GL_RED: return b[0]; case GL_GREEN: return b[1]; case GL_BLUE: return b[2]; case GL_ALPHA: return b[3]; default: return (GLenum)s; }
+}
+static void apply_tex_swizzle(GLenum target, tex_t* t)
+{
+    static const GLenum pn[4] = {GL_TEXTURE_SWIZZLE_R, GL_TEXTURE_SWIZZLE_G, GL_TEXTURE_SWIZZLE_B, GL_TEXTURE_SWIZZLE_A};
+    GLenum b[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA}, v[4];
+    int depth = 0, i;
+    for (i = 0; i < MAX_LV; ++i) if (depth_ifmt(t->lv[i].ifmt)) { depth = 1; break; }
+    if (depth && t->depth_mode == GL_LUMINANCE) { b[0] = b[1] = b[2] = GL_RED; b[3] = GL_ONE; }
+    else if (depth && t->depth_mode == GL_INTENSITY) b[0] = b[1] = b[2] = b[3] = GL_RED;
+    else if (depth) { b[0] = b[1] = b[2] = GL_ZERO; b[3] = GL_RED; }
+    for (i = 0; i < 4; ++i) v[i] = depth ? swz_component(t->swizzle[i], b) : (GLenum)t->swizzle[i];
+    for (i = 0; i < 4; ++i) BE(glTexParameteri)(is_face(target) ? GL_TEXTURE_CUBE_MAP : gl31_tex_be_target(target), pn[i], (GLint)v[i]);
+}
+
 static int tex_is_immutable(GLenum target)
 {
     tex_t* t = cur_tex(target);
@@ -764,6 +813,7 @@ static void record_level(GLenum target, GLint level, GLsizei w, GLsizei h, GLsiz
     if (!t) return;
     t->lv[level].w = w; t->lv[level].h = h; t->lv[level].d = d; t->lv[level].ifmt = ifmt; t->lv[level].app = 0;
     cs_ensure(t->id, cs_face(target), level, w, h, d, ifmt);
+    apply_tex_swizzle(target, t);
 }
 
 /* formato que pidio la app para los niveles [level, level+n) si el backend guarda otro */
@@ -971,13 +1021,17 @@ GLenum gl31_storage_format(GLenum f)
     return f;
 }
 
+#ifndef GL_UNSIGNED_INT_8_8_8_8_REV
+#define GL_UNSIGNED_INT_8_8_8_8_REV 0x8367
+#endif
+
 /* almacenamientos cuyas subidas se validan contra los pares de ES (los demas pasan tal cual, como antes) */
 static int fmt_managed(GLenum rf)
 {
     const fmtinfo_t* fi = fmt_lookup(rf);
     if (!fi || fi->d || fi->shared || rf == GL_R11F_G11F_B10F) return 0;
     if (rf == GL_RGB10_A2) return 1;
-    return fi->type == T_FL || fi->type == T_SN || (fi->type == T_UN && fi->r == 16);
+    return fi->type == T_FL || fi->type == T_SN || (fi->type == T_UN && (fi->r == 8 || fi->r == 16));
 }
 
 static int fmt_comps(const fmtinfo_t* fi) { return (fi->r != 0) + (fi->g != 0) + (fi->b != 0) + (fi->a != 0); }
@@ -989,6 +1043,8 @@ static int es_pair_ok(GLenum rf, GLenum format, GLenum type)
     int nc;
     if (!fi) return 1;
     nc = fmt_comps(fi);
+    if (format == GL_BGRA && nc == 4 && (type == GL_UNSIGNED_BYTE || type == GL_UNSIGNED_INT_8_8_8_8_REV) && fi->type == T_UN)
+        return 1;
     if (format != (nc == 1 ? GL_RED : nc == 2 ? GL_RG : nc == 3 ? GL_RGB : GL_RGBA)) return 0;
     if (rf == GL_RGB10_A2) return type == GL_UNSIGNED_INT_2_10_10_10_REV;
     switch (fi->type) {
@@ -1191,7 +1247,7 @@ static int is_lod_param(GLenum p) { return p == GL_TEXTURE_MIN_LOD || p == GL_TE
 static int ignored_param(GLenum p)
 {
     /* GL_TEXTURE_CUBE_MAP_SEAMLESS por textura (ARB_seamless_cubemap_per_texture): ES siempre filtra sin costuras */
-    return p == GL_TEXTURE_LOD_BIAS || p == GL_DEPTH_TEXTURE_MODE || p == GL_GENERATE_MIPMAP || p == GL_TEXTURE_CUBE_MAP_SEAMLESS;
+    return p == GL_TEXTURE_LOD_BIAS || p == GL_GENERATE_MIPMAP || p == GL_TEXTURE_CUBE_MAP_SEAMLESS;
 }
 
 /* restricciones de GL_TEXTURE_RECTANGLE; 1 = valido */
@@ -1219,17 +1275,27 @@ static int rect_param_ok(GLenum pname, GLint param)
 
 static void param_i(GLenum target, GLenum pname, GLint param)
 {
+    tex_t* t = cur_tex(target);
+    if (pname == GL_DEPTH_TEXTURE_MODE) {
+        if (param != GL_LUMINANCE && param != GL_INTENSITY && param != GL_ALPHA) { gl31_set_error(GL_INVALID_ENUM); return; }
+        if (t) { t->depth_mode = param; apply_tex_swizzle(target, t); }
+        return;
+    }
+    if (pname >= GL_TEXTURE_SWIZZLE_R && pname <= GL_TEXTURE_SWIZZLE_A) {
+        int i = (int)(pname - GL_TEXTURE_SWIZZLE_R);
+        if (param != GL_RED && param != GL_GREEN && param != GL_BLUE && param != GL_ALPHA && param != GL_ZERO && param != GL_ONE) { gl31_set_error(GL_INVALID_ENUM); return; }
+        if (t) { t->swizzle[i] = param; apply_tex_swizzle(target, t); }
+        else BE(glTexParameteri)(gl31_tex_be_target(target), pname, param);
+        return;
+    }
     if (ignored_param(pname)) return;
     if (target == GL_TEXTURE_RECTANGLE && !rect_param_ok(pname, param)) return;
     switch (pname) {
-        case GL_TEXTURE_WRAP_S:
-        case GL_TEXTURE_WRAP_T:
-        case GL_TEXTURE_WRAP_R:
+        case GL_TEXTURE_WRAP_S: case GL_TEXTURE_WRAP_T: case GL_TEXTURE_WRAP_R:
             if (param == GL_CLAMP) param = GL_CLAMP_TO_EDGE;
             else if (param == GL_CLAMP_TO_BORDER && !gl31_caps.border_clamp) param = GL_CLAMP_TO_EDGE;
             break;
-        default:
-            break;
+        default: break;
     }
     BE(glTexParameteri)(gl31_tex_be_target(target), pname, param);
 }
@@ -1322,7 +1388,7 @@ void gl31_glTexParameteriv(GLenum target, GLenum pname, const GLint* params)
     if (pname == GL_TEXTURE_BORDER_COLOR) { set_border_iv(target, params); return; }
     if (pname == GL_TEXTURE_SWIZZLE_RGBA) { swizzle_rgba(target, params); return; }
     if (is_lod_param(pname)) gl31_glTexParameterf(target, pname, (GLfloat)params[0]);
-    else                     param_i(target, pname, params[0]);
+    else param_i(target, pname, params[0]);
 }
 
 void gl31_glTexParameterIiv(GLenum target, GLenum pname, const GLint* params)
@@ -1345,22 +1411,33 @@ void gl31_glTexParameterIuiv(GLenum target, GLenum pname, const GLuint* params)
 
 void gl31_glGetTexParameteriv(GLenum target, GLenum pname, GLint* params)
 {
+    tex_t* t;
     if (!params || !target_param_ok(target)) return;
-    if (pname == GL_TEXTURE_BORDER_COLOR) { border_as_int(cur_tex(target), params); return; }
-    if (ignored_param(pname)) { params[0] = 0; return; }      /* valores por defecto de GL */
-    if (pname == GL_TEXTURE_SWIZZLE_RGBA) {
-        static const GLenum pn[4] = { GL_TEXTURE_SWIZZLE_R, GL_TEXTURE_SWIZZLE_G, GL_TEXTURE_SWIZZLE_B, GL_TEXTURE_SWIZZLE_A };
-        int k;
-        for (k = 0; k < 4; k++) BE(glGetTexParameteriv)(gl31_tex_be_target(target), pn[k], &params[k]);
-        return;
+    t = cur_tex(target);
+    if (pname == GL_TEXTURE_BORDER_COLOR) { border_as_int(t, params); return; }
+    if (pname == GL_DEPTH_TEXTURE_MODE) { params[0] = t ? t->depth_mode : GL_LUMINANCE; return; }
+    if (pname >= GL_TEXTURE_SWIZZLE_R && pname <= GL_TEXTURE_SWIZZLE_A) {
+        static const GLint defaults[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
+        unsigned i = pname - GL_TEXTURE_SWIZZLE_R;
+        params[0] = t ? t->swizzle[i] : defaults[i]; return;
     }
+    if (pname == GL_TEXTURE_SWIZZLE_RGBA) {
+        static const GLint defaults[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
+        int i; for (i = 0; i < 4; ++i) params[i] = t ? t->swizzle[i] : defaults[i]; return;
+    }
+    if (ignored_param(pname)) { params[0] = 0; return; }
     BE(glGetTexParameteriv)(gl31_tex_be_target(target), pname, params);
 }
 
 void gl31_glGetTexParameterfv(GLenum target, GLenum pname, GLfloat* params)
 {
+    tex_t* t;
     if (!params || !target_param_ok(target)) return;
-    if (pname == GL_TEXTURE_BORDER_COLOR) { border_as_float(cur_tex(target), params); return; }
+    t = cur_tex(target);
+    if (pname == GL_TEXTURE_BORDER_COLOR) { border_as_float(t, params); return; }
+    if (pname == GL_DEPTH_TEXTURE_MODE) { params[0] = t ? (GLfloat)t->depth_mode : (GLfloat)GL_LUMINANCE; return; }
+    if (pname >= GL_TEXTURE_SWIZZLE_R && pname <= GL_TEXTURE_SWIZZLE_A) { GLint v; gl31_glGetTexParameteriv(target, pname, &v); params[0] = (GLfloat)v; return; }
+    if (pname == GL_TEXTURE_SWIZZLE_RGBA) { GLint v[4]; int i; gl31_glGetTexParameteriv(target, pname, v); for (i = 0; i < 4; ++i) params[i] = (GLfloat)v[i]; return; }
     if (ignored_param(pname)) { params[0] = 0.f; return; }
     BE(glGetTexParameterfv)(gl31_tex_be_target(target), pname, params);
 }
@@ -1967,7 +2044,9 @@ static int cv_src(GLenum format, GLenum type, int* nc, int* esz)
         case GL_UNSIGNED_BYTE: case GL_BYTE:                       *esz = 1; return 1;
         case GL_UNSIGNED_SHORT: case GL_SHORT: case GL_HALF_FLOAT: *esz = 2; return 1;
         case GL_UNSIGNED_INT: case GL_INT: case GL_FLOAT:          *esz = 4; return 1;
-        case GL_UNSIGNED_INT_2_10_10_10_REV:                       *esz = 4; return *nc == 4 ? 2 : 0;
+        case GL_UNSIGNED_INT_2_10_10_10_REV: *esz = 4; return *nc == 4 ? 2 : 0;
+        case GL_UNSIGNED_INT_8_8_8_8:        *esz = 4; return *nc == 4 ? 3 : 0;
+        case GL_UNSIGNED_INT_8_8_8_8_REV: *esz = 4; return *nc == 4 ? 4 : 0;
     }
     return 0;
 }
@@ -2005,7 +2084,7 @@ static void* cv_convert(GLenum rf, GLenum format, GLenum type, GLsizei w, GLsize
     if (!kind || !fo) return NULL;
     no = fmt_comps(fo);
     osz = rf == GL_RGB10_A2 ? 4 : fo->type == T_FL ? 4 : fo->r == 16 ? 2 : 1;
-    psz = kind == 2 ? 4u : (size_t)nc * (size_t)esz;
+    psz = kind != 1 ? 4u : (size_t)nc * (size_t)esz;
     rl = s->unpack_row_length > 0 ? (size_t)s->unpack_row_length : (size_t)w;
     rowb = rl * psz;
     stride = ((size_t)esz >= (size_t)s->unpack_alignment) ? rowb
@@ -2024,6 +2103,28 @@ static void* cv_convert(GLenum rf, GLenum format, GLenum type, GLsizei w, GLsize
             const unsigned char* p = (const unsigned char*)pixels + ((si + k) * ih + (size_t)s->unpack_skip_rows + j) * stride +
                                      (size_t)s->unpack_skip_pixels * psz;
             for (i = 0; i < (size_t)w; i++, p += psz) {
+                if (fo->type == T_UN && osz == 1 && type == GL_UNSIGNED_BYTE && kind == 1) {
+                    if (format == GL_RGB && no == 4) {
+                        o[0] = p[0]; o[1] = p[1]; o[2] = p[2]; o[3] = 255;
+                        o += 4;
+                        continue;
+                    }
+                    if (format == GL_BGR && no == 4) {
+                        o[0] = p[2]; o[1] = p[1]; o[2] = p[0]; o[3] = 255;
+                        o += 4;
+                        continue;
+                    }
+                    if (format == GL_RGBA && no == 3) {
+                        o[0] = p[0]; o[1] = p[1]; o[2] = p[2];
+                        o += 3;
+                        continue;
+                    }
+                    if (format == GL_BGRA && no == 3) {
+                        o[0] = p[2]; o[1] = p[1]; o[2] = p[0];
+                        o += 3;
+                        continue;
+                    }
+                }
                 float c[4] = { 0.0f, 0.0f, 0.0f, 1.0f }, v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
                 int q;
                 if (kind == 2) {
@@ -2032,6 +2133,14 @@ static void* cv_convert(GLenum rf, GLenum format, GLenum type, GLsizei w, GLsize
                     memcpy(&u, bb, 4);
                     c[0] = (float)(u & 1023u) / 1023.0f; c[1] = (float)((u >> 10) & 1023u) / 1023.0f;
                     c[2] = (float)((u >> 20) & 1023u) / 1023.0f; c[3] = (float)(u >> 30) / 3.0f;
+                } else if (kind == 3 || kind == 4) {
+                    GLuint u; unsigned char bb[4];
+                    for (q = 0; q < 4; q++) bb[q] = p[swap ? 3 - q : q];
+                    memcpy(&u, bb, 4);
+                    c[0] = (float)((u >> (kind == 3 ? 24 : 0)) & 255u) / 255.0f;
+                    c[1] = (float)((u >> (kind == 3 ? 16 : 8)) & 255u) / 255.0f;
+                    c[2] = (float)((u >> (kind == 3 ? 8 : 16)) & 255u) / 255.0f;
+                    c[3] = (float)((u >> (kind == 3 ? 0 : 24)) & 255u) / 255.0f;
                 } else {
                     for (q = 0; q < nc; q++) c[q] = cv_elem(p + (size_t)q * (size_t)esz, type, swap);
                 }
@@ -2092,8 +2201,8 @@ static const void* upload_prepare(GLenum rf, GLenum* format, GLenum* type, GLsiz
     const void* src = pixels;
     void* mapped = NULL;
     void* cv;
-    /* RGBA + UNSIGNED_INT_8_8_8_8_REV: los bytes en memoria son R,G,B,A (little endian) = UNSIGNED_BYTE; ES no tiene ese tipo */
-    if (*type == GL_UNSIGNED_INT_8_8_8_8_REV && (*format == GL_RGBA || *format == GL_RGBA_INTEGER)) *type = GL_UNSIGNED_BYTE;
+    /* RGBA/BGRA + UNSIGNED_INT_8_8_8_8_REV: los bytes en memoria son R,G,B,A (little endian) = UNSIGNED_BYTE; ES no tiene ese tipo */
+    if (*type == GL_UNSIGNED_INT_8_8_8_8_REV && (*format == GL_RGBA || *format == GL_BGRA || *format == GL_RGBA_INTEGER)) *type = GL_UNSIGNED_BYTE;
     if (!fmt_managed(rf) || es_pair_ok(rf, *format, *type))
         return bgra_prepare(format, type, w, h, d, is3d, pixels, b);
     memset(b, 0, sizeof *b);

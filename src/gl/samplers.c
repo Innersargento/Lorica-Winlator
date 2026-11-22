@@ -46,18 +46,21 @@ void del_sampler(GLuint sampler) {
     khash_t(samplerlist_t) *list = glstate->samplers.samplerlist;
     k = kh_get(samplerlist_t, list, sampler);
     glsampler_t* s = NULL;
-    if (k != kh_end(list)){
+    if (k != kh_end(list)) {
         s = kh_value(list, k);
         kh_del(samplerlist_t, list, k);
     }
-    if(s) {
-        for (int i=0; i<MAX_TEX; ++i)
-            if(glstate->samplers.sampler[i]==s)
+    if (s) {
+        for (int i=0; i<MAX_TEX; ++i) {
+            if (glstate->samplers.sampler[i] == s) {
                 glstate->samplers.sampler[i] = NULL;
+                if (glstate->bound_changed < i+1)
+                    glstate->bound_changed = i+1;
+            }
+        }
         free(s);
     }
 }
-
 void init_sampler(glsampler_t* sampler)
 {
     memset(sampler, 0, sizeof(glsampler_t));
@@ -105,7 +108,7 @@ void gl4es_glBindSampler(GLuint unit, GLuint sampler)
 {
     DBG(printf("gl4es_glBindSample(%u, %u)\n", unit, sampler);)
 
-    if(unit>hardext.maxtex) {
+    if(unit>=hardext.maxtex) {
         errorShim(GL_INVALID_VALUE);
         return;
     }

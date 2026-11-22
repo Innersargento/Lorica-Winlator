@@ -1001,6 +1001,16 @@ void APIENTRY_GL4ES gl4es_glGetIntegerv(GLenum pname, GLint *params) {
     }
     gltexture_t* tex;
     switch (pname) {
+        /* Desktop GL limits not exposed by GLES. */
+        case 0x825C: /* GL_VIEWPORT_SUBPIXEL_BITS */
+            *params = 4;
+            break;
+        case 0x90BC: /* GL_MIN_MAP_BUFFER_ALIGNMENT */
+            *params = 64;
+            break;
+        case 0x8E71: /* GL_MAX_VERTEX_STREAMS */
+            *params = 1;
+            break;
         // texture binding only make sense with int
         case GL_TEXTURE_BINDING_1D:
             tex=glstate->texture.bound[glstate->texture.active][ENABLED_TEX1D];

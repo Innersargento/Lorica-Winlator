@@ -1618,6 +1618,28 @@ void APIENTRY_GL4ES gl4es_glDrawElementsInstanced(GLenum mode, GLsizei count, GL
 AliasExport(void,glDrawElementsInstanced,,(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount));
 AliasExport(void,glDrawElementsInstanced,ARB,(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount));
 
+// GL 4.2 base-instance draws (wined3d uses glDrawElementsInstancedBaseVertexBaseInstance). Route these through GL4ES state.
+// Non-zero baseinstance shifts instanced attributes; this compatibility wrapper logs and ignores it.
+static void baseinstance_ignored(GLuint binst) {
+    static int warned;
+    if (binst && !warned++) LOGD("LIBGL: glDraw*BaseInstance con baseinstance=%u: se ignora (solo cuenta con atributos instanciados)\n", binst);
+}
+void APIENTRY_GL4ES gl4es_glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount, GLint basevertex, GLuint baseinstance) {
+    baseinstance_ignored(baseinstance);
+    gl4es_glDrawElementsInstancedBaseVertex(mode, count, type, indices, primcount, basevertex);
+}
+void APIENTRY_GL4ES gl4es_glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount, GLuint baseinstance) {
+    baseinstance_ignored(baseinstance);
+    gl4es_glDrawElementsInstanced(mode, count, type, indices, primcount);
+}
+void APIENTRY_GL4ES gl4es_glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei primcount, GLuint baseinstance) {
+    baseinstance_ignored(baseinstance);
+    gl4es_glDrawArraysInstanced(mode, first, count, primcount);
+}
+AliasExport(void,glDrawElementsInstancedBaseVertexBaseInstance,,(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount, GLint basevertex, GLuint baseinstance));
+AliasExport(void,glDrawElementsInstancedBaseInstance,,(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount, GLuint baseinstance));
+AliasExport(void,glDrawArraysInstancedBaseInstance,,(GLenum mode, GLint first, GLsizei count, GLsizei primcount, GLuint baseinstance));
+
 void APIENTRY_GL4ES gl4es_glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount, GLint basevertex) {
     DBG(printf("glDrawElementsInstanceBaseVertex(%s, %d, %s, %p, %d, %d), vtx=%p map=%p, pending=%d\n", PrintEnum(mode), count, PrintEnum(type), indices, primcount, basevertex, (glstate->vao->vertex)?glstate->vao->vertex->data:NULL, (glstate->vao->elements)?glstate->vao->elements->data:NULL, glstate->list.pending);)
     if (!glstate->list.compiling) CONDITIONAL_RENDER_SKIP();   // glBeginConditionalRender (hybrid.h)

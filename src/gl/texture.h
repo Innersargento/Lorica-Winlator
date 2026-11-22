@@ -156,6 +156,9 @@ typedef struct {
     GLvoid *data;	// in case we want to keep a copy of it (it that case, always RGBA/GL_UNSIGNED_BYTE
     glsampler_t sampler;    // internal sampler if not superseded by glBindSampler
     glsampler_t actual;     // actual sampler
+    GLint depth_mode;
+    GLint swizzle[4];
+    GLboolean depth_swizzle_applied;
     float fbtex_ratio; // Lower rendering resolution
     int hybrid;        // hybrid context: GLADIATOR keeps the storage (sRGB / integer formats, hybrid.c)
 } gltexture_t;

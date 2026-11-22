@@ -2,6 +2,7 @@
 #include "../gl4es.h"
 #include "../loader.h"
 #include "../depth.h"
+#include "../texture.h"
 #include "skips.h"
 
 // emulation of 'glTexParameteri' (for internal use only)

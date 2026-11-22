@@ -280,7 +280,8 @@ void gl4es_hybrid_TexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, 
                              GLenum format, GLenum type, const void* data)
 {
     GLAD(void, glTexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*));
-    gltexture_t* tex = hy_bind2d(target);
+    gltexture_t* tex = NULL;
+    if (target == 0x8C18) hy_unit(); else tex = hy_bind2d(target);
     data = hy_unpack(data);
     if (p_glTexImage2D) p_glTexImage2D(target, level, ifmt, w, h, border, format, type, data);
     hy_unpack_end();
@@ -300,7 +301,8 @@ void gl4es_hybrid_TexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GL
 void gl4es_hybrid_TexStorage2D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h)
 {
     GLAD(void, glTexStorage2D, (GLenum, GLsizei, GLenum, GLsizei, GLsizei));
-    gltexture_t* tex = hy_bind2d(target);
+    gltexture_t* tex = NULL;
+    if (target == 0x8C18) hy_unit(); else tex = hy_bind2d(target);
     if (p_glTexStorage2D) p_glTexStorage2D(target, levels, ifmt, w, h);
     hy_record(tex, 0, ifmt, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
 }

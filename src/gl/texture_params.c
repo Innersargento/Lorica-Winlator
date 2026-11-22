@@ -1,3 +1,24 @@
+#ifndef GL_DEPTH_COMPONENT32F
+#define GL_DEPTH_COMPONENT32F 0x8CAC
+#endif
+#ifndef GL_DEPTH32F_STENCIL8
+#define GL_DEPTH32F_STENCIL8 0x8CAD
+#endif
+#ifndef GL_DEPTH_TEXTURE_MODE
+#define GL_DEPTH_TEXTURE_MODE 0x884B
+#endif
+#ifndef GL_GREEN
+#define GL_GREEN 0x1904
+#endif
+#ifndef GL_BLUE
+#define GL_BLUE 0x1905
+#endif
+#ifndef GL_TEXTURE_SWIZZLE_R
+#define GL_TEXTURE_SWIZZLE_R 0x8E42
+#define GL_TEXTURE_SWIZZLE_G 0x8E43
+#define GL_TEXTURE_SWIZZLE_B 0x8E44
+#define GL_TEXTURE_SWIZZLE_A 0x8E45
+#endif
 #include "texture.h"
 #include "hybrid.h"
 
@@ -166,6 +187,9 @@ gltexture_t* gl4es_getTexture(GLenum target, GLuint texture) {
         tex->streamingID = -1;
         init_sampler(&tex->sampler);
         tex->alpha = true;
+        tex->depth_mode = GL_LUMINANCE;
+        tex->swizzle[0] = GL_RED; tex->swizzle[1] = GL_GREEN;
+        tex->swizzle[2] = GL_BLUE; tex->swizzle[3] = GL_ALPHA;
         tex->fpe_format = FPE_TEX_RGBA;
         tex->format = GL_RGBA;
         tex->type = GL_UNSIGNED_BYTE;
@@ -333,6 +357,17 @@ void APIENTRY_GL4ES gl4es_glTexParameterfv(GLenum target, GLenum pname, const GL
     const GLint itarget = what_target(target);
     const GLuint rtarget = map_tex_target(target);
     gltexture_t *texture = glstate->texture.bound[glstate->texture.active][itarget];
+    if (pname == GL_DEPTH_TEXTURE_MODE) {
+        if (!params) { errorShim(GL_INVALID_VALUE); return; }
+        GLint mode = (GLint)params[0];
+        if (mode != GL_LUMINANCE && mode != GL_INTENSITY && mode != GL_ALPHA) { errorShim(GL_INVALID_ENUM); return; }
+        if (texture) { texture->depth_mode = mode; texture->depth_swizzle_applied = false; }
+        return;
+    }
+    if (pname >= GL_TEXTURE_SWIZZLE_R && pname <= GL_TEXTURE_SWIZZLE_A && params && texture) {
+        texture->swizzle[pname - GL_TEXTURE_SWIZZLE_R] = (GLint)params[0];
+        texture->depth_swizzle_applied = false;
+    }
     if(pname==GL_TEXTURE_BORDER_COLOR && border_clamp_in_es()) {
         // keep GL4ES's copy (getters) and give the ES texture the colour that clamp-to-border reads
         samplerParameterfv(&texture->sampler, pname, params);
@@ -509,6 +544,9 @@ void APIENTRY_GL4ES gl4es_glGenTextures(GLsizei n, GLuint * textures) {
             tex->max_level = -1;
             tex->alpha = true;
             init_sampler(&tex->sampler);
+            tex->depth_mode = GL_LUMINANCE;
+            tex->swizzle[0] = GL_RED; tex->swizzle[1] = GL_GREEN;
+            tex->swizzle[2] = GL_BLUE; tex->swizzle[3] = GL_ALPHA;
             tex->fpe_format = FPE_TEX_RGBA;
             tex->format = GL_RGBA;
             tex->type = GL_UNSIGNED_BYTE;
@@ -843,6 +881,39 @@ static GLuint r1t_bind_on(int TMU, gltexture_t* tex)
     return oldtex;
 }
 
+static int is_depth_texture_format(GLenum f)
+{
+    return f == GL_DEPTH_COMPONENT || f == GL_DEPTH_COMPONENT16 || f == GL_DEPTH_COMPONENT24 ||
+           f == GL_DEPTH_COMPONENT32 || f == GL_DEPTH_COMPONENT32F || f == GL_DEPTH_STENCIL ||
+           f == GL_DEPTH24_STENCIL8 || f == GL_DEPTH32F_STENCIL8;
+}
+
+static GLenum compose_depth_swizzle(GLint selector, const GLenum base[4])
+{
+    switch (selector) {
+        case GL_RED: return base[0]; case GL_GREEN: return base[1];
+        case GL_BLUE: return base[2]; case GL_ALPHA: return base[3];
+        default: return (GLenum)selector;
+    }
+}
+static void realize_depth_swizzle(GLenum target, gltexture_t* tex)
+{
+    void gles_glTexParameteri(glTexParameteri_ARG_EXPAND);
+    static const GLenum pname[4] = {GL_TEXTURE_SWIZZLE_R, GL_TEXTURE_SWIZZLE_G, GL_TEXTURE_SWIZZLE_B, GL_TEXTURE_SWIZZLE_A};
+    GLenum base[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
+    int depth = is_depth_texture_format(tex->internalformat), i;
+    if (!depth && !tex->depth_swizzle_applied) return;
+    if (depth && tex->depth_swizzle_applied) return;
+    if (depth && tex->depth_mode == GL_LUMINANCE) { base[0] = base[1] = base[2] = GL_RED; base[3] = GL_ONE; }
+    else if (depth && tex->depth_mode == GL_INTENSITY) base[0] = base[1] = base[2] = base[3] = GL_RED;
+    else if (depth) { base[0] = base[1] = base[2] = GL_ZERO; base[3] = GL_RED; }
+    for (i = 0; i < 4; ++i) {
+        GLenum value = depth ? compose_depth_swizzle(tex->swizzle[i], base) : (GLenum)tex->swizzle[i];
+        gles_glTexParameteri(target, pname[i], value);
+    }
+    tex->depth_swizzle_applied = depth;
+}
+
 void realize_1texture(GLenum target, int wantedTMU, gltexture_t* tex, glsampler_t* sampler)
 {
     DBG(printf("realize_1texture(%s, %d, %p[%u], %p)\n", PrintEnum(target), wantedTMU, tex, tex->glname, sampler);)
@@ -930,6 +1001,11 @@ void realize_1texture(GLenum target, int wantedTMU, gltexture_t* tex, glsampler_
             tex->actual.compare = cmp;
             tex->actual.func = fn;
         }
+    }
+    if (is_depth_texture_format(tex->internalformat) || tex->depth_swizzle_applied) {
+        if (wantedTMU == -1) { oldtex = r1t_bind_on(TMU, tex); wantedTMU = -2; }
+        if (glstate->gleshard->active != TMU) { glstate->gleshard->active = TMU; gles_glActiveTexture(GL_TEXTURE0 + TMU); }
+        realize_depth_swizzle(target, tex);
     }
     if(wantedTMU==-2) {
         if (oldtex!=tex->glname) gles_glBindTexture(GL_TEXTURE_2D, oldtex);
@@ -1024,8 +1100,11 @@ void realize_textures(int drawing) {
         if(drawing) {
             if((globals4es.automipmap==3) || ((globals4es.automipmap==1) && (tex->mipmap_auto==0)) || (tex->compressed && (tex->mipmap_auto==0)))
                 tex->mipmap_need = 0;
-            else
-                tex->mipmap_need = (is_mipmap_needed(&tex->sampler) && (hardext.esversion!=1) && !tex->npot)?1:0;
+            else {
+                glsampler_t *draw_sampler = glstate->samplers.sampler[i];
+                if (!draw_sampler) draw_sampler = &tex->sampler;
+                tex->mipmap_need = (is_mipmap_needed(draw_sampler) && (hardext.esversion!=1) && !tex->npot)?1:0;
+            }
             if(tex->mipmap_need && !tex->mipmap_done) {
                 // GLES only builds mipmaps of color-renderable, filterable formats: not of depth / stencil, 32-bit
                 // float or the sRGB / integer storage GLADIATOR keeps (GL_INVALID_OPERATION, seen by the application)

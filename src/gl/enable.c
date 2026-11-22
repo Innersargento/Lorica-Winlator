@@ -160,7 +160,15 @@ static void proxy_glEnable(GLenum cap, bool enable, void (APIENTRY_GLES *next)(G
 
         // point sprite
         proxy_GOFPE(GL_POINT_SPRITE, pointsprite, glstate->fpe_state->pointsprite=enable); // TODO: plugin fpe stuffs
-        proxy_GO(GL_PROGRAM_POINT_SIZE, point_size);
+        // GL_PROGRAM_POINT_SIZE is GL4ES shader state. GLES has no matching
+        // enable to forward; converted shaders consume this flag before draw.
+        case GL_PROGRAM_POINT_SIZE:
+            if (glstate->enable.point_size != enable) {
+                if (glstate->list.pending) gl4es_flush();
+                FLUSH_BEGINEND;
+                glstate->enable.point_size = enable;
+            }
+            break;
 
         // Smooth and multisample (todo: do somthing with fpe?)
         proxy_GOFPE(GL_MULTISAMPLE, multisample, );

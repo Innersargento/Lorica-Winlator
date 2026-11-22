@@ -970,6 +970,9 @@ void bindBuffer(GLenum target, GLuint buffer)
         glstate->bind_buffer.index = buffer;
         DBG(printf("Bind buffer %d to GL_ELEMENT_ARRAY_BUFFER\n", buffer);)
         gles_glBindBuffer(target, buffer);
+    } else if (target == GL_PIXEL_PACK_BUFFER || target == GL_PIXEL_UNPACK_BUFFER) {
+        /* GL4ES keeps pixel pack/unpack buffers in CPU shadow storage. */
+        return;
     } else {
         LOGE("Warning, unhandled Buffer type %s in bindBuffer\n", PrintEnum(target));
         return;
