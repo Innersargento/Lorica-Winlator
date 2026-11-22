@@ -656,6 +656,8 @@ typedef struct {
     int level_query;            /* ES 3.1+: glGetTexLevelParameter nativo */
     int base_vertex;            /* ES 3.2 o EXT/OES_draw_elements_base_vertex (si no: se emula) */
     int geometry;               /* ES 3.2 o EXT/OES_geometry_shader */
+    int geometry_point_size;    /* EXT/OES_geometry_point_size: gl_PointSize en geometry shaders */
+    int tess_point_size;        /* EXT/OES_tessellation_point_size: gl_PointSize en shaders de teselacion */
     int multisample_tex;        /* ES 3.1+: texturas 2D multisample, glSampleMaski, glGetMultisamplefv */
     int ms_array;               /* ES 3.2 o OES_texture_storage_multisample_2d_array */
     int provoking_vertex;       /* glProvokingVertex disponible (EXT/ANGLE/OES) */
@@ -1444,10 +1446,11 @@ void   gl31_ubo_invalidate(void);
 void   gl31_ssbo_record(GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size);
 int    gl31_ssbo_get(GLuint index, GLuint* buffer, GLint64* offset, GLint64* size);
 GLint  gl31_program_ssbo_binding(GLuint program, GLuint block_index, GLint backend_binding);
-/* gl31_glsl_pp.c: preprocesador condicional minimo (#if/#ifdef/#ifndef/#elif/#else/#endif, #define/#undef).
- * Sustituye por espacios las lineas inactivas y las directivas condicionales, en sitio (se conservan los saltos).
- * Devuelve 1 si proceso el texto, 0 si lo dejo intacto (expresion no evaluable). */
-int   gl31_glsl_pp_resolve(char* s, long ver);
+/* gl31_glsl_pp.c: preprocesador GLSL de una pasada. Evalua #if/#ifdef/#ifndef/#elif/#else/#endif (las lineas inactivas y las
+ * directivas condicionales pasan a espacios, conservando los saltos) y expande las macros #define (objeto y funcion, argumentos,
+ * `##`, __LINE__, __VERSION__) del codigo activo. Devuelve memoria de malloc, o NULL si no pudo (*why dice por que: condicion que
+ * no se evalua, #if sin cerrar, salida desmesurada...); en ese caso el llamador sigue con el texto original. */
+char* gl31_glsl_preprocess(const char* s, long ver, const char** why);
 int   gl31_ext_advertised(const char* name);              /* gl31_query.c: GL_EXTENSIONS la incluye */
 
 void  gl31_glsl_set_opts(const gl31_conv_opts_t* o);      /* vale solo para la siguiente conversion */

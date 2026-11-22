@@ -91,6 +91,10 @@ static void detect_capabilities(void)
             gl31_caps.base_vertex = 1;
         else if (has_ext(e, "GL_EXT_geometry_shader", "GL_OES_geometry_shader"))
             gl31_caps.geometry = 1;
+        else if (has_ext(e, "GL_EXT_geometry_point_size", "GL_OES_geometry_point_size"))
+            gl31_caps.geometry_point_size = 1;
+        else if (has_ext(e, "GL_EXT_tessellation_point_size", "GL_OES_tessellation_point_size"))
+            gl31_caps.tess_point_size = 1;
         else if (has_ext(e, "GL_OES_texture_storage_multisample_2d_array", NULL))
             gl31_caps.ms_array = 1;
         else if (has_ext(e, "GL_EXT_provoking_vertex", "GL_ANGLE_provoking_vertex"))
@@ -158,6 +162,8 @@ static void detect_capabilities(void)
     /* geometry shaders, texture buffers y bloques de E/S son extensiones de ES 3.1+ */
     if (gl31_caps.glsl_es < 310) {
         gl31_caps.geometry = 0;
+        gl31_caps.geometry_point_size = 0;
+        gl31_caps.tess_point_size = 0;
         gl31_caps.tex_buffer = 0;
         gl31_caps.ms_array = 0;
         gl31_caps.io_blocks_ext = 0;

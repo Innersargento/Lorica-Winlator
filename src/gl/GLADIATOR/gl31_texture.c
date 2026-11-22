@@ -564,20 +564,71 @@ static const char k_dec_src[] =
 "  imageStore(u_out, ivec2(p), v);\n"
 "}\n";
 
+/* ---------- tabla unica de formatos comprimidos ----------
+ * Cada formato que Lorica conoce, una sola vez: tamano de bloque, sRGB, decodificador en GPU (dec_code), y, si lo puede
+ * descomprimir en CPU cuando el backend no lo tiene, el decodificador y el almacenamiento sin comprimir al que va. Antes esta
+ * decision estaba repetida en siete sitios (almacenamiento, transcodificacion, lista de formatos, tamano de bloque,
+ * internalformat_query, decodificador GPU y sRGB). ASTC sigue siendo una familia calculada (gl31_compressed_block). */
+enum { CF_NONE, CF_S3TC, CF_RGTC, CF_BPTC };                       /* la extension del backend que evita transcodificar */
+enum { D_NONE, D_BC1, D_BC1A, D_BC2, D_BC3, D_BC4, D_BC4S, D_BC5, D_BC5S, D_BC7, D_BC6S, D_BC6U };
+typedef struct {
+    GLenum f;
+    unsigned char bytes, srgb;        /* bytes por bloque 4x4; formato sRGB */
+    unsigned char cap, dec;           /* CF_*, D_*: dec != D_NONE = Lorica lo descomprime en CPU si el backend no tiene `cap` */
+    signed char gpu;                  /* indice del decodificador por shader (dec_code), -1 ninguno */
+    GLenum ifmt, fmt, type;           /* almacenamiento sin comprimir (solo con dec != D_NONE) */
+    unsigned char bpp;
+} cfmt_t;
+#define U8   GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, 4
+#define S8   GL_SRGB8_ALPHA8, GL_RGBA, GL_UNSIGNED_BYTE, 4
+#define NOCPU 0, 0, 0, 0
+static const cfmt_t k_cf[] = {
+    /* S3TC: DXT1 (RGB / RGBA), DXT3, DXT5 y sus sRGB (el orden es el de la lista que se anuncia) */
+    { 0x83F0,  8, 0, CF_S3TC, D_BC1,  0,  U8 }, { 0x83F1,  8, 0, CF_S3TC, D_BC1A, 1,  U8 },
+    { 0x83F2, 16, 0, CF_S3TC, D_BC2,  2,  U8 }, { 0x83F3, 16, 0, CF_S3TC, D_BC3,  3,  U8 },
+    { 0x8C4C,  8, 1, CF_S3TC, D_BC1,  0,  S8 }, { 0x8C4D,  8, 1, CF_S3TC, D_BC1A, 1,  S8 },
+    { 0x8C4E, 16, 1, CF_S3TC, D_BC2,  2,  S8 }, { 0x8C4F, 16, 1, CF_S3TC, D_BC3,  3,  S8 },
+    /* RGTC (BC4 / BC5, con y sin signo) */
+    { 0x8DBB,  8, 0, CF_RGTC, D_BC4,  4,  GL_R8,       GL_RED, GL_UNSIGNED_BYTE, 1 },
+    { 0x8DBC,  8, 0, CF_RGTC, D_BC4S, 5,  GL_R8_SNORM, GL_RED, GL_BYTE,          1 },
+    { 0x8DBD, 16, 0, CF_RGTC, D_BC5,  6,  GL_RG8,      GL_RG,  GL_UNSIGNED_BYTE, 2 },
+    { 0x8DBE, 16, 0, CF_RGTC, D_BC5S, 7,  GL_RG8_SNORM, GL_RG, GL_BYTE,          2 },
+    /* BPTC: BC7 (RGBA8 / sRGB) y BC6H (se sube como RGBA16F con alfa 1) */
+    { 0x8E8C, 16, 0, CF_BPTC, D_BC7,  -1, U8 }, { 0x8E8D, 16, 1, CF_BPTC, D_BC7, -1, S8 },
+    { 0x8E8E, 16, 0, CF_BPTC, D_BC6S, -1, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, 8 },
+    { 0x8E8F, 16, 0, CF_BPTC, D_BC6U, -1, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, 8 },
+    /* EAC (R11 / RG11) y ETC2: solo decodificador GPU (glGetTexImage), sin transcodificacion en CPU */
+    { 0x9270,  8, 0, CF_NONE, D_NONE,  8, NOCPU, 0 }, { 0x9271,  8, 0, CF_NONE, D_NONE,  9, NOCPU, 0 },
+    { 0x9272, 16, 0, CF_NONE, D_NONE, 10, NOCPU, 0 }, { 0x9273, 16, 0, CF_NONE, D_NONE, 11, NOCPU, 0 },
+    { 0x9274,  8, 0, CF_NONE, D_NONE, 12, NOCPU, 0 }, { 0x9275,  8, 1, CF_NONE, D_NONE, 12, NOCPU, 0 },
+    { 0x9276,  8, 0, CF_NONE, D_NONE, 13, NOCPU, 0 }, { 0x9277,  8, 1, CF_NONE, D_NONE, 13, NOCPU, 0 },
+    { 0x9278, 16, 0, CF_NONE, D_NONE, 14, NOCPU, 0 }, { 0x9279, 16, 1, CF_NONE, D_NONE, 14, NOCPU, 0 },
+};
+#undef U8
+#undef S8
+#undef NOCPU
+
+static const cfmt_t* cf_find(GLenum f)
+{
+    size_t i;
+    for (i = 0; i < sizeof k_cf / sizeof k_cf[0]; i++) if (k_cf[i].f == f) return &k_cf[i];
+    return NULL;
+}
+
+/* el backend tiene la extension que hace innecesaria la transcodificacion de este formato */
+static int cf_backend_has(const cfmt_t* r)
+{
+    return r->cap == CF_S3TC ? gl31_caps.has_s3tc : r->cap == CF_RGTC ? gl31_caps.has_rgtc : r->cap == CF_BPTC ? gl31_caps.has_bptc : 0;
+}
+
 static GLuint g_dec_prog;
 static int g_dec_state;
 static GLint dec_u[5];
 
 static int dec_code(GLenum f)
 {
-    switch (f) {
-        case 0x83F0: case 0x8C4C: return 0;   case 0x83F1: case 0x8C4D: return 1;
-        case 0x83F2: case 0x8C4E: return 2;   case 0x83F3: case 0x8C4F: return 3;
-        case 0x8DBB: return 4; case 0x8DBC: return 5; case 0x8DBD: return 6; case 0x8DBE: return 7;
-        case 0x9270: return 8; case 0x9271: return 9; case 0x9272: return 10; case 0x9273: return 11;
-        case 0x9274: case 0x9275: return 12;  case 0x9276: case 0x9277: return 13;  case 0x9278: case 0x9279: return 14;
-    }
-    return -1;
+    const cfmt_t* r = cf_find(f);
+    return r ? r->gpu : -1;
 }
 
 static int dec_prog(void)
@@ -911,6 +962,11 @@ GLenum gl31_storage_format(GLenum f)
         case F_RGBA16_SNORM:   return (n16 && sn) ? F_RGBA16_SNORM : (f32 ? GL_RGBA32F : GL_RGBA16F);
         case GL_RGB16F:        return GL_RGBA16F;
         case GL_RGB32F:        return f32 ? GL_RGBA32F : GL_RGBA16F;
+    }
+    {   /* glTexImage*(internalformat comprimido): Mesa lo acepta, ES no. Si Lorica lo transcodifica (tc_lookup) el almacenamiento es
+         * el sin comprimir de la tabla, y de ahi el que el backend pueda renderizar (el mismo que usan los TexStorage) */
+        const cfmt_t* r = cf_find(f);
+        if (r && r->dec != D_NONE && !cf_backend_has(r)) return gl31_storage_format(r->ifmt);
     }
     return f;
 }
@@ -2246,28 +2302,10 @@ void gl31_glCopyTexSubImage3D(GLenum target, GLint level, GLint xo, GLint yo, GL
  * la copia de bloques (cs_upload) sigue alimentando glGetCompressedTexImage. BPTC no tiene decodificador. */
 static int tc_lookup(GLenum f, tc_fmt_t* o)
 {
-    o->block = 16;
-    switch (f) {
-        case GL_COMPRESSED_RED_RGTC1:        if (gl31_caps.has_rgtc) return 0; o->ifmt = GL_R8;        o->fmt = GL_RED; o->type = GL_UNSIGNED_BYTE; o->bpp = 1; o->block = 8; return 1;
-        case GL_COMPRESSED_SIGNED_RED_RGTC1: if (gl31_caps.has_rgtc) return 0; o->ifmt = GL_R8_SNORM;  o->fmt = GL_RED; o->type = GL_BYTE;          o->bpp = 1; o->block = 8; return 1;
-        case GL_COMPRESSED_RG_RGTC2:         if (gl31_caps.has_rgtc) return 0; o->ifmt = GL_RG8;       o->fmt = GL_RG;  o->type = GL_UNSIGNED_BYTE; o->bpp = 2; return 1;
-        case GL_COMPRESSED_SIGNED_RG_RGTC2:  if (gl31_caps.has_rgtc) return 0; o->ifmt = GL_RG8_SNORM;  o->fmt = GL_RG;  o->type = GL_BYTE;          o->bpp = 2; return 1;
-        case 0x83F0: case 0x83F1:            /* GL_COMPRESSED_RGB(A)_S3TC_DXT1_EXT */
-            if (gl31_caps.has_s3tc) return 0; o->ifmt = GL_RGBA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; o->block = 8; return 1;
-        case 0x83F2: case 0x83F3:            /* DXT3, DXT5 */
-            if (gl31_caps.has_s3tc) return 0; o->ifmt = GL_RGBA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; return 1;
-        case 0x8C4C: case 0x8C4D:            /* GL_COMPRESSED_SRGB(_ALPHA)_S3TC_DXT1_EXT */
-            if (gl31_caps.has_s3tc) return 0; o->ifmt = GL_SRGB8_ALPHA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; o->block = 8; return 1;
-        case 0x8C4E: case 0x8C4F:            /* sRGB DXT3, DXT5 */
-            if (gl31_caps.has_s3tc) return 0; o->ifmt = GL_SRGB8_ALPHA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; return 1;
-        case 0x8E8C:                         /* GL_COMPRESSED_RGBA_BPTC_UNORM (BC7) */
-            if (gl31_caps.has_bptc) return 0; o->ifmt = GL_RGBA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; return 1;
-        case 0x8E8D:                         /* GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM */
-            if (gl31_caps.has_bptc) return 0; o->ifmt = GL_SRGB8_ALPHA8; o->fmt = GL_RGBA; o->type = GL_UNSIGNED_BYTE; o->bpp = 4; return 1;
-        case 0x8E8E: case 0x8E8F:            /* GL_COMPRESSED_RGB_BPTC_SIGNED / UNSIGNED_FLOAT (BC6H): se sube como RGBA16F con alfa 1 */
-            if (gl31_caps.has_bptc) return 0; o->ifmt = GL_RGBA16F; o->fmt = GL_RGBA; o->type = GL_HALF_FLOAT; o->bpp = 8; return 1;
-        default: return 0;
-    }
+    const cfmt_t* r = cf_find(f);
+    if (!r || r->dec == D_NONE || cf_backend_has(r)) return 0;       /* el backend lo tiene, o no se transcodifica */
+    o->ifmt = r->ifmt; o->fmt = r->fmt; o->type = r->type; o->bpp = r->bpp; o->block = r->bytes;
+    return 1;
 }
 
 void gl31_bptc_decode_bc7(const unsigned char* block, unsigned char* out);                        /* gl31_bptc.c */
@@ -2276,9 +2314,6 @@ void gl31_bptc_decode_bc6h(const unsigned char* block, int is_signed, unsigned s
 /* formatos comprimidos que acepta Lorica: los del backend mas los que descomprime en CPU (S3TC, RGTC, BPTC) */
 int gl31_compressed_formats(GLint* out)
 {
-    static const GLenum emu[] = { 0x83F0, 0x83F1, 0x83F2, 0x83F3, 0x8C4C, 0x8C4D, 0x8C4E, 0x8C4F,
-                                  GL_COMPRESSED_RED_RGTC1, GL_COMPRESSED_SIGNED_RED_RGTC1, GL_COMPRESSED_RG_RGTC2, GL_COMPRESSED_SIGNED_RG_RGTC2,
-                                  0x8E8C, 0x8E8D, 0x8E8E, 0x8E8F };
     GLint nb = 0, i, n = 0;
     GLint* be;
     size_t k;
@@ -2287,12 +2322,12 @@ int gl31_compressed_formats(GLint* out)
     be = (GLint*)calloc((size_t)nb + 1, sizeof(GLint));
     if (be && nb) BE(glGetIntegerv)(GL_COMPRESSED_TEXTURE_FORMATS, be);
     for (i = 0; i < nb && be; i++) { if (out) out[n] = be[i]; n++; }
-    for (k = 0; k < sizeof emu / sizeof emu[0]; k++) {
+    for (k = 0; k < sizeof k_cf / sizeof k_cf[0]; k++) {
         tc_fmt_t t;
         int have = 0;
-        if (!tc_lookup(emu[k], &t)) continue;       /* el backend lo tiene de verdad (ya esta en su lista) */
-        for (i = 0; i < nb && be; i++) if ((GLenum)be[i] == emu[k]) have = 1;
-        if (!have) { if (out) out[n] = (GLint)emu[k]; n++; }
+        if (!tc_lookup(k_cf[k].f, &t)) continue;       /* el backend lo tiene de verdad (ya esta en su lista) */
+        for (i = 0; i < nb && be; i++) if ((GLenum)be[i] == k_cf[k].f) have = 1;
+        if (!have) { if (out) out[n] = (GLint)k_cf[k].f; n++; }
     }
     free(be);
     return n;
@@ -2346,6 +2381,7 @@ static unsigned char* tc_decode(GLenum f, const tc_fmt_t* t, const unsigned char
     size_t need = (size_t)bw * bh * d * t->block;
     unsigned char* out;
     unsigned char tmp[16 * 8];
+    const cfmt_t* cf = cf_find(f);
     if (w <= 0 || h <= 0 || d <= 0 || (size_t)size < need) return NULL;
     out = (unsigned char*)malloc((size_t)w * h * d * t->bpp);
     if (!out) return NULL;
@@ -2353,20 +2389,21 @@ static unsigned char* tc_decode(GLenum f, const tc_fmt_t* t, const unsigned char
         for (y = 0; y < bh; y++)
             for (x = 0; x < bw; x++) {
                 const unsigned char* b = src + (((size_t)z * bh + y) * bw + x) * t->block;
-                switch (f) {
-                    case GL_COMPRESSED_RED_RGTC1:        tc_bc4(b, 0, tmp, 1); break;
-                    case GL_COMPRESSED_SIGNED_RED_RGTC1: tc_bc4(b, 1, tmp, 1); break;
-                    case GL_COMPRESSED_RG_RGTC2:         tc_bc4(b, 0, tmp, 2); tc_bc4(b + 8, 0, tmp + 1, 2); break;
-                    case GL_COMPRESSED_SIGNED_RG_RGTC2:  tc_bc4(b, 1, tmp, 2); tc_bc4(b + 8, 1, tmp + 1, 2); break;
-                    case 0x83F0: case 0x8C4C:            tc_bc1(b, 0, 0, tmp); break;
-                    case 0x83F1: case 0x8C4D:            tc_bc1(b, 0, 1, tmp); break;
-                    case 0x8E8C: case 0x8E8D:            gl31_bptc_decode_bc7(b, tmp); break;
-                    case 0x8E8E: case 0x8E8F:            gl31_bptc_decode_bc6h(b, f == 0x8E8E, (unsigned short*)tmp); break;
-                    case 0x83F2: case 0x8C4E:            /* DXT3: alfa explicito de 4 bits */
+                switch (cf ? cf->dec : D_NONE) {
+                    case D_BC4:  tc_bc4(b, 0, tmp, 1); break;
+                    case D_BC4S: tc_bc4(b, 1, tmp, 1); break;
+                    case D_BC5:  tc_bc4(b, 0, tmp, 2); tc_bc4(b + 8, 0, tmp + 1, 2); break;
+                    case D_BC5S: tc_bc4(b, 1, tmp, 2); tc_bc4(b + 8, 1, tmp + 1, 2); break;
+                    case D_BC1:  tc_bc1(b, 0, 0, tmp); break;
+                    case D_BC1A: tc_bc1(b, 0, 1, tmp); break;
+                    case D_BC7:  gl31_bptc_decode_bc7(b, tmp); break;
+                    case D_BC6S: gl31_bptc_decode_bc6h(b, 1, (unsigned short*)tmp); break;
+                    case D_BC6U: gl31_bptc_decode_bc6h(b, 0, (unsigned short*)tmp); break;
+                    case D_BC2:                          /* DXT3: alfa explicito de 4 bits */
                         tc_bc1(b + 8, 1, 0, tmp);
                         for (i = 0; i < 16; i++) { int a = (b[i / 2] >> ((i & 1) * 4)) & 15; tmp[i * 4 + 3] = (unsigned char)(a * 17); }
                         break;
-                    default:                              /* DXT5: alfa como BC4 */
+                    default:                             /* D_BC3, DXT5: alfa como BC4 */
                         tc_bc1(b + 8, 1, 0, tmp);
                         tc_bc4(b, 0, tmp + 3, 4);
                         break;
@@ -3110,10 +3147,8 @@ GLenum gl31_tex_be_target_of(GLuint id)
 int gl31_compressed_block(GLenum f, int* bw, int* bh, int* bytes)
 {
     int w = 4, h = 4, b = 0;
-    if ((f >= 0x83F0 && f <= 0x83F3) || (f >= 0x8C4C && f <= 0x8C4F)) b = (f == 0x83F0 || f == 0x83F1 || f == 0x8C4C || f == 0x8C4D) ? 8 : 16;
-    else if (f >= 0x8DBB && f <= 0x8DBE) b = (f == 0x8DBB || f == 0x8DBC) ? 8 : 16;
-    else if (f >= 0x8E8C && f <= 0x8E8F) b = 16;
-    else if (f >= 0x9270 && f <= 0x9279) b = (f == 0x9272 || f == 0x9273 || f == 0x9278 || f == 0x9279) ? 16 : 8;
+    const cfmt_t* cf = cf_find(f);
+    if (cf) b = cf->bytes;
     else if ((f >= 0x93B0 && f <= 0x93BD) || (f >= 0x93D0 && f <= 0x93DD)) {
         static const unsigned char dim[14][2] = {{4,4},{5,4},{5,5},{6,5},{6,6},{8,5},{8,6},{8,8},{10,5},{10,6},{10,8},{10,10},{12,10},{12,12}};
         unsigned i = (f >= 0x93D0) ? f - 0x93D0 : f - 0x93B0;

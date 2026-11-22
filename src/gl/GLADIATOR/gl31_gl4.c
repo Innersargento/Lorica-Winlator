@@ -317,7 +317,7 @@ void gl31_glBindTransformFeedback(GLenum target, GLuint id)
     if (s->xfb_active && !s->xfb_paused) { gl31_set_error(GL_INVALID_OPERATION); return; }
     gl31_err_flush();
     BE(glBindTransformFeedback)(target, id);
-    if (gl31_err_peek() == GL_NO_ERROR) s->xfb_bound = id;
+    { GLenum be_err = BE(glGetError)(); if (be_err == GL_NO_ERROR) s->xfb_bound = id; else gl31_set_error(be_err); }
 }
 
 GLboolean gl31_glIsTransformFeedback(GLuint id) { return id ? BE(glIsTransformFeedback)(id) : GL_FALSE; }

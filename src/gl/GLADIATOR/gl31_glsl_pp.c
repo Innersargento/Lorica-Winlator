@@ -1,4 +1,19 @@
-/* gl31_glsl_pp.c: preprocesador condicional minimo para el conversor GLSL (ver gl31.h). */
+/* gl31_glsl_pp.c: preprocesador GLSL de una pasada para el conversor (ver gl31.h).
+ *
+ * Los shaders de fuente unica (DarkPlaces/Xonotic, por ejemplo) mezclan en el mismo texto ramas de varios modos bajo #if/#ifdef, y
+ * esconden expresiones tras #define. Todas las comprobaciones textuales del conversor (gl_FragColor vs gl_FragData, main, clip
+ * distances, samplers, ...) y el conversor tipado (gl31_glsl_tc.c) deben ver el codigo activo y las expresiones reales, como el
+ * compilador. Una sola pasada, como el glcpp de Mesa:
+ *   - #if / #ifdef / #ifndef / #elif / #else / #endif se evaluan (semantica de GLSL de escritorio: __VERSION__ = version original,
+ *     GL_ES sin definir, GL_xxx definido solo para las extensiones que el driver anuncia). La condicion se evalua como en C: primero
+ *     `defined`, luego se expanden las macros (de objeto y de funcion), y lo que queda se calcula; un identificador sin definir vale 0.
+ *   - las lineas inactivas y las directivas condicionales se sustituyen por espacios (se conservan los \n);
+ *   - el codigo activo se expande: macros de objeto y de funcion, argumentos expandidos antes de sustituir, `##`, nuevo recorrido del
+ *     resultado sin volver a expandir la macro en curso, __LINE__ y __VERSION__. Los saltos de linea se conservan (una llamada que
+ *     ocupa varias lineas deja sus \n al final);
+ *   - las demas directivas (#define incluido, #extension, #pragma, #line...) pasan intactas.
+ * No hay tablas de tamano fijo: macros, argumentos y pila crecen con el fuente. El unico tope es el tamano de la salida (una macro
+ * recursiva en exceso); si algo falla se devuelve NULL con el motivo y el conversor sigue con el texto original. */
 #include "gl31.h"
 #include <stdlib.h>
 #include <string.h>
@@ -7,60 +22,343 @@
 
 static int is_id(unsigned char c) { return isalnum(c) || c == '_'; }
 
-/* ---------- preprocesador condicional minimo ----------
- * Los shaders de fuente unica (DarkPlaces/Xonotic, por ejemplo) mezclan en el mismo texto ramas de
- * varios modos bajo #if/#ifdef. Todas las comprobaciones textuales de este conversor (gl_FragColor vs
- * gl_FragData, main, clip distances, samplers, ...) deben ver solo el codigo activo, como el compilador.
- * Se evaluan #if/#ifdef/#ifndef/#elif/#else/#endif con los #define/#undef del propio texto
- * (semantica de GLSL de escritorio: __VERSION__ = version original, GL_ES sin definir) y las lineas
- * inactivas y las directivas condicionales se sustituyen por espacios (se conservan los \n). Los
- * #define activos se dejan: el compilador del backend los expande. Si alguna expresion no se puede
- * evaluar (sintaxis rara, macro recursiva) se devuelve 0 y el texto queda intacto.
- * Soporta macros con argumentos, el operador ?: y las macros GL_xxx de las extensiones que el
- * driver anuncia (gl31_ext_advertised), como hace el compilador de un driver real. */
-#define PP_MAX_MACROS 512
-#define PP_MAX_DEPTH  64
-typedef struct { char name[64]; char par[128]; char val[256]; int fn, bad; } pp_macro_t;
-typedef struct { pp_macro_t m[PP_MAX_MACROS]; int n; } pp_t;
-typedef struct { const char* p; pp_t* pp; int depth; int err; } pp_ev_t;
+/* ------------------------------------------------------------------------------------------------ buffers y tabla de macros */
+typedef struct { char* name; char** par; int np; int fn; int skip; char* body; } xm_t;
+typedef struct { xm_t* m; int n, cap; } xtab_t;
+typedef struct { char* p; size_t n, cap; int oom; size_t limit; } xsb_t;
+typedef struct { xtab_t* tab; const xm_t** stack; int scap; int depth; int line; xsb_t* out; } xctx_t;
 
-static pp_macro_t* pp_find(pp_t* pp, const char* nm, size_t len)
+static void xsb_put(xsb_t* b, const char* s, size_t n)
+{
+    if (b->oom || !n) return;
+    if (b->n + n + 1 > b->limit) { b->oom = 1; return; }
+    if (b->n + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap : 256;
+        char* t;
+        while (nc < b->n + n + 1) nc *= 2;
+        t = (char*)realloc(b->p, nc);
+        if (!t) { b->oom = 1; return; }
+        b->p = t; b->cap = nc;
+    }
+    memcpy(b->p + b->n, s, n); b->n += n; b->p[b->n] = 0;
+}
+static void xsb_c(xsb_t* b, char c) { xsb_put(b, &c, 1); }
+
+static char* xdup(const char* s, size_t n) { char* r = (char*)malloc(n + 1); if (r) { memcpy(r, s, n); r[n] = 0; } return r; }
+
+static void xm_free(xm_t* m)
 {
     int i;
-    for (i = 0; i < pp->n; i++)
-        if (strlen(pp->m[i].name) == len && strncmp(pp->m[i].name, nm, len) == 0) return &pp->m[i];
+    for (i = 0; i < m->np; i++) free(m->par[i]);
+    free(m->par); free(m->name); free(m->body);
+}
+
+static xm_t* xm_find(xtab_t* t, const char* nm, size_t len)
+{
+    int i;
+    for (i = 0; i < t->n; i++)
+        if (strlen(t->m[i].name) == len && !strncmp(t->m[i].name, nm, len)) return &t->m[i];
     return NULL;
 }
 
-static int pp_define(pp_t* pp, const char* nm, size_t len, const char* par, size_t plen, const char* val, size_t vlen, int fn)
+static void xm_undef(xtab_t* t, const char* nm, size_t len)
 {
-    pp_macro_t* m = pp_find(pp, nm, len);
-    if (!m) {
-        if (pp->n >= PP_MAX_MACROS || len >= sizeof m->name) return 0;
-        m = &pp->m[pp->n++];
-        memcpy(m->name, nm, len); m->name[len] = 0;
+    xm_t* m = xm_find(t, nm, len);
+    if (!m) return;
+    xm_free(m);
+    *m = t->m[--t->n];
+}
+
+/* Registra un #define (toma posesion de par). Una redefinicion sustituye a la anterior. Devuelve 0 sin memoria. */
+static int xm_define(xtab_t* t, const char* nm, size_t len, char** par, int np, int fn, int skip, const char* body, size_t blen)
+{
+    xm_t* m;
+    xm_undef(t, nm, len);
+    if (t->n == t->cap) {
+        int nc = t->cap ? t->cap * 2 : 32;
+        xm_t* nt = (xm_t*)realloc(t->m, (size_t)nc * sizeof *nt);
+        if (!nt) return 0;
+        t->m = nt; t->cap = nc;
     }
-    m->bad = 0;
-    if (plen >= sizeof m->par) { plen = sizeof m->par - 1; m->bad = 1; }
-    if (vlen >= sizeof m->val) { vlen = sizeof m->val - 1; m->bad = 1; }   /* truncada: no se puede evaluar */
-    memcpy(m->par, par, plen); m->par[plen] = 0;
-    memcpy(m->val, val, vlen); m->val[vlen] = 0;
-    m->fn = fn;
+    m = &t->m[t->n];
+    memset(m, 0, sizeof *m);
+    m->name = xdup(nm, len); m->body = xdup(body, blen);
+    if (!m->name || !m->body) { free(m->name); free(m->body); return 0; }
+    m->par = par; m->np = np; m->fn = fn; m->skip = skip;
+    t->n++;
     return 1;
 }
 
-static void pp_undef(pp_t* pp, const char* nm, size_t len)
+static int x_idstart(unsigned char ch) { return isalpha(ch) || ch == '_'; }
+static int x_blank(char ch) { return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'; }
+
+/* Un token numerico entero (1, 1.0, .5, 1e-3, 0x1F, 1.0f, 1u): su sufijo no es un identificador */
+static size_t x_number(const char* in, size_t i, size_t len)
 {
-    pp_macro_t* m = pp_find(pp, nm, len);
-    if (m) *m = pp->m[--pp->n];
+    size_t j = i;
+    int hex = (in[j] == '0' && j + 1 < len && (in[j + 1] == 'x' || in[j + 1] == 'X'));
+    while (j < len) {
+        unsigned char ch = (unsigned char)in[j];
+        if (isalnum(ch) || ch == '_' || ch == '.') { j++; continue; }
+        if ((ch == '+' || ch == '-') && !hex && j > i && (in[j - 1] == 'e' || in[j - 1] == 'E')) { j++; continue; }
+        break;
+    }
+    return j;
 }
 
-static void pp_ws(pp_ev_t* e) { while (*e->p == ' ' || *e->p == '\t' || *e->p == '\r') e->p++; }
-/* ¿esta definido? Las macros del texto, y GL_xxx si el driver anuncia esa extension. */
-static int pp_is_defined(pp_t* pp, const char* nm, size_t len)
+static int x_on_stack(const xctx_t* c, const xm_t* m)
+{
+    int i;
+    for (i = 0; i < c->depth; i++) if (c->stack[i] == m) return 1;
+    return 0;
+}
+
+static int x_param(const xm_t* m, const char* id, size_t n)
+{
+    int a;
+    for (a = 0; a < m->np; a++)
+        if (strlen(m->par[a]) == n && !strncmp(m->par[a], id, n)) return a;
+    return -1;
+}
+
+/* Sustituye los parametros del cuerpo por los argumentos (expandidos). Los operandos de `##` van sin expandir y se pegan. */
+static void x_substitute(const xm_t* m, char** raw, char** exp, xsb_t* o)
+{
+    const char* q = m->body;
+    size_t bl = strlen(q), i = 0;
+    while (i < bl) {
+        unsigned char ch = (unsigned char)q[i];
+        if (ch == '#' && i + 1 < bl && q[i + 1] == '#') {
+            while (o->n && (o->p[o->n - 1] == ' ' || o->p[o->n - 1] == '\t')) o->p[--o->n] = 0;
+            i += 2;
+            while (i < bl && (q[i] == ' ' || q[i] == '\t')) i++;
+            if (i < bl && x_idstart((unsigned char)q[i])) {         /* operando derecho: crudo */
+                size_t s = i;
+                int a;
+                while (i < bl && (isalnum((unsigned char)q[i]) || q[i] == '_')) i++;
+                a = x_param(m, q + s, i - s);
+                if (a >= 0) xsb_put(o, raw[a], strlen(raw[a]));
+                else xsb_put(o, q + s, i - s);
+            }
+            continue;
+        }
+        if (isdigit(ch) || (ch == '.' && i + 1 < bl && isdigit((unsigned char)q[i + 1]))) {
+            size_t j = x_number(q, i, bl);
+            xsb_put(o, q + i, j - i); i = j; continue;
+        }
+        if (x_idstart(ch)) {
+            size_t s = i, b2;
+            int a, pasted;
+            while (i < bl && (isalnum((unsigned char)q[i]) || q[i] == '_')) i++;
+            a = x_param(m, q + s, i - s);
+            if (a < 0) { xsb_put(o, q + s, i - s); continue; }
+            b2 = i; while (b2 < bl && (q[b2] == ' ' || q[b2] == '\t')) b2++;
+            pasted = (b2 + 1 < bl && q[b2] == '#' && q[b2 + 1] == '#');    /* operando izquierdo de un `##` */
+            xsb_put(o, pasted ? raw[a] : exp[a], strlen(pasted ? raw[a] : exp[a]));
+            continue;
+        }
+        xsb_c(o, (char)ch); i++;
+    }
+}
+
+/* Argumentos de `( a, b )` desde in[j] == '('. Devuelve la posicion tras el ')' o 0 si no cierra. Cuenta en *na; si as/ae no son
+ * NULL, guarda el inicio y el fin de cada uno (deben tener *na huecos: primero se llama sin ellos para contar). */
+static size_t x_args(const char* in, size_t j, size_t len, size_t* as, size_t* ae, int* na)
+{
+    int depth = 0, n = 0;
+    size_t i;
+    if (as) as[0] = j + 1;
+    for (i = j + 1; i < len; i++) {
+        char ch = in[i];
+        if (ch == '(') depth++;
+        else if (ch == ')') {
+            if (!depth) { if (ae) ae[n] = i; *na = n + 1; return i + 1; }
+            depth--;
+        } else if (ch == ',' && !depth) {
+            if (ae) { ae[n] = i; as[n + 1] = i + 1; }
+            n++;
+        }
+    }
+    return 0;
+}
+
+static void xexpand(xctx_t* c, const char* in, size_t len);
+
+/* Llamada a una macro de funcion: in[j] es el '('. Devuelve la posicion tras la llamada, o 0 si no es una llamada valida (el
+ * nombre se deja tal cual). */
+static size_t x_call(xctx_t* c, const xm_t* m, const char* in, size_t len, size_t j)
+{
+    xsb_t* o = c->out;
+    size_t *as, *ae, end, k;
+    int na = 0, a, ok = 1, nl = 0, nargs;
+    char **raw, **exp;
+    xsb_t sub = {0, 0, 0, 0, 0};
+    end = x_args(in, j, len, NULL, NULL, &na);
+    if (!end) return 0;
+    if (m->np == 0) {                               /* F(): un unico argumento, vacio */
+        if (na != 1) return 0;
+        for (k = j + 1; k + 1 < end; k++) if (!x_blank(in[k])) return 0;
+        nargs = 0;
+    } else if (na != m->np) return 0;
+    else nargs = na;
+    as = (size_t*)malloc(sizeof *as * (size_t)(na + 1)); ae = (size_t*)malloc(sizeof *ae * (size_t)(na + 1));
+    raw = (char**)calloc((size_t)(na + 1), sizeof *raw); exp = (char**)calloc((size_t)(na + 1), sizeof *exp);
+    if (!as || !ae || !raw || !exp) { free(as); free(ae); free(raw); free(exp); o->oom = 1; return 0; }
+    x_args(in, j, len, as, ae, &na);
+    for (a = 0; a < nargs && ok; a++) {
+        xsb_t ax = {0, 0, 0, 0, 0};
+        xctx_t sc = *c;
+        size_t s0 = as[a], l = ae[a] - as[a];
+        while (l && x_blank(in[s0])) { s0++; l--; }
+        while (l && x_blank(in[s0 + l - 1])) l--;
+        raw[a] = xdup(in + s0, l);
+        if (raw[a]) for (k = 0; k < l; k++) if (raw[a][k] == '\n' || raw[a][k] == '\r') raw[a][k] = ' ';   /* los \n se reponen al final */
+        ax.limit = o->limit;
+        sc.out = &ax;
+        xexpand(&sc, raw[a] ? raw[a] : "", raw[a] ? l : 0);
+        exp[a] = ax.p ? ax.p : xdup("", 0);
+        if (!raw[a] || !exp[a] || ax.oom) ok = 0;
+    }
+    if (ok) {
+        sub.limit = o->limit;
+        x_substitute(m, raw, exp, &sub);
+        if (sub.oom) ok = 0;
+    }
+    if (ok) {
+        if (c->depth < c->scap) {
+            c->stack[c->depth++] = m;
+            xexpand(c, sub.p ? sub.p : "", sub.n);
+            c->depth--;
+        } else xsb_put(o, sub.p ? sub.p : "", sub.n);          /* no ocurre: la pila cabe en tantas macros como hay */
+    } else o->oom = 1;
+    for (a = 0; a < nargs; a++) { free(raw[a]); free(exp[a]); }
+    free(raw); free(exp); free(as); free(ae); free(sub.p);
+    for (k = j; k < end; k++) if (in[k] == '\n') nl++;
+    while (nl--) { xsb_c(o, '\n'); if (!c->depth) c->line++; }
+    return end;
+}
+
+static void xexpand(xctx_t* c, const char* in, size_t len)
+{
+    xsb_t* o = c->out;
+    size_t i = 0;
+    while (i < len && !o->oom) {
+        unsigned char ch = (unsigned char)in[i];
+        if (ch == '\n') { if (!c->depth) c->line++; xsb_c(o, '\n'); i++; continue; }
+        if (isdigit(ch) || (ch == '.' && i + 1 < len && isdigit((unsigned char)in[i + 1]))) {
+            size_t j = x_number(in, i, len);
+            xsb_put(o, in + i, j - i); i = j; continue;
+        }
+        if (x_idstart(ch)) {
+            size_t s = i, j, e;
+            xm_t* m;
+            while (i < len && (isalnum((unsigned char)in[i]) || in[i] == '_')) i++;
+            if (i - s == 8 && !strncmp(in + s, "__LINE__", 8) && !xm_find(c->tab, "__LINE__", 8)) {
+                char b[24]; snprintf(b, sizeof b, "%d", c->line); xsb_put(o, b, strlen(b)); continue;
+            }
+            if (i - s == 8 && !strncmp(in + s, "__FILE__", 8) && !xm_find(c->tab, "__FILE__", 8)) { xsb_c(o, '0'); continue; }
+            m = xm_find(c->tab, in + s, i - s);
+            if (!m || m->skip || x_on_stack(c, m) || c->depth >= c->scap) { xsb_put(o, in + s, i - s); continue; }
+            if (!m->fn) {
+                c->stack[c->depth++] = m;
+                xexpand(c, m->body, strlen(m->body));
+                c->depth--;
+                continue;
+            }
+            j = i;
+            while (j < len && x_blank(in[j])) j++;
+            if (j >= len || in[j] != '(') { xsb_put(o, in + s, i - s); continue; }   /* sin '(' no es una llamada */
+            e = x_call(c, m, in, len, j);
+            if (!e) { xsb_put(o, in + s, i - s); continue; }
+            i = e;
+            continue;
+        }
+        xsb_c(o, (char)ch); i++;
+    }
+}
+
+/* Fin de la linea logica que empieza en `ls` (una directiva continua con \ al final). Apunta al \n o al \0. */
+static const char* x_line_end(const char* ls)
+{
+    const char* d = ls;
+    const char* le = ls;
+    while (*d == ' ' || *d == '\t') d++;
+    for (;;) {
+        while (*le && *le != '\n') le++;
+        if (*d == '#' && le > ls && *le && (le[-1] == '\\' || (le[-1] == '\r' && le > ls + 1 && le[-2] == '\\'))) { le++; continue; }
+        break;
+    }
+    return le;
+}
+
+static void x_free_tab(xtab_t* t)
+{
+    int i;
+    for (i = 0; i < t->n; i++) xm_free(&t->m[i]);
+    free(t->m);
+}
+
+/* `#define nombre[(params)] cuerpo` sobre la linea logica [a, le), con `a` tras la palabra define. 0 solo sin memoria. */
+static int x_parse_define(xtab_t* t, const char* a, const char* le)
+{
+    size_t tl = (size_t)(le - a), k, n, bl;
+    char* tmp = (char*)malloc(tl + 1);
+    const char* id; const char* v;
+    char** par = NULL; int np = 0, fn = 0, skip = 0, ok = 1, i;
+    if (!tmp) return 0;
+    for (k = 0; k < tl; k++) {
+        if (a[k] == '\\' && k + 1 < tl && a[k + 1] == '\n') { tmp[k] = ' '; tmp[k + 1] = ' '; k++; }
+        else if (a[k] == '\\' && k + 2 < tl && a[k + 1] == '\r' && a[k + 2] == '\n') { tmp[k] = tmp[k + 1] = tmp[k + 2] = ' '; k += 2; }
+        else tmp[k] = (a[k] == '\n' || a[k] == '\r') ? ' ' : a[k];
+    }
+    tmp[tl] = 0;
+    id = tmp;
+    while (*id == ' ' || *id == '\t') id++;
+    n = 0; while (is_id((unsigned char)id[n])) n++;
+    if (!n || isdigit((unsigned char)id[0])) { free(tmp); return 1; }       /* no es un nombre valido: no se registra */
+    v = id + n;
+    if (*v == '(') {
+        fn = 1; v++;
+        for (;;) {
+            size_t pl;
+            while (*v == ' ' || *v == '\t') v++;
+            if (*v == ')') { v++; break; }
+            pl = 0; while (is_id((unsigned char)v[pl])) pl++;
+            if (!pl) { skip = 1; while (*v && *v != ')') v++; if (*v) v++; break; }      /* `...` u otra cosa: no se expande */
+            {
+                char** np2 = (char**)realloc(par, (size_t)(np + 1) * sizeof *par);
+                if (!np2) { ok = 0; break; }
+                par = np2;
+                par[np] = xdup(v, pl);
+                if (!par[np]) { ok = 0; break; }
+                np++;
+            }
+            v += pl;
+            while (*v == ' ' || *v == '\t') v++;
+            if (*v == ',') v++;
+            else if (*v == ')') { v++; break; }
+            else { skip = 1; break; }
+        }
+    }
+    while (*v == ' ' || *v == '\t') v++;
+    bl = strlen(v);
+    while (bl && (v[bl - 1] == ' ' || v[bl - 1] == '\t')) bl--;
+    if (ok) ok = xm_define(t, id, n, par, np, fn, skip, v, bl);
+    if (!ok) { for (i = 0; i < np; i++) free(par[i]); free(par); }
+    free(tmp);
+    return ok;
+}
+
+/* ------------------------------------------------------------------------------------------------ condiciones (#if / #elif)
+ * Se evalua sobre el texto ya expandido: lo que queda son numeros, operadores e identificadores sin definir (= 0). Un identificador
+ * GL_xxx vale 1 si el driver anuncia esa extension (como el compilador de un driver real). */
+typedef struct { const char* p; int err; } pp_ev_t;
+
+static void pp_ws(pp_ev_t* e) { while (*e->p == ' ' || *e->p == '\t' || *e->p == '\r' || *e->p == '\n') e->p++; }
+
+static int pp_ext_defined(const char* nm, size_t len)
 {
     char buf[96];
-    if (pp_find(pp, nm, len)) return 1;
     if (len > 3 && len < sizeof buf && nm[0] == 'G' && nm[1] == 'L' && nm[2] == '_') {
         memcpy(buf, nm, len); buf[len] = 0;
         return gl31_ext_advertised(buf);
@@ -68,69 +366,8 @@ static int pp_is_defined(pp_t* pp, const char* nm, size_t len)
     return 0;
 }
 
-static long long pp_expr(pp_ev_t* e, int minprec);
 static long long pp_ternary(pp_ev_t* e);
-
-/* Expande una macro con argumentos: lee `(a, b)` en e->p y sustituye los parametros en el cuerpo. */
-static int pp_expand_fn(pp_ev_t* e, const pp_macro_t* m, char* out, size_t cap)
-{
-    const char* args[16]; size_t alen[16]; int na = 0, np = 0, depth = 0, i;
-    const char* pn[16]; size_t pl[16];
-    const char* q;
-    size_t n = 0;
-    pp_ws(e);
-    if (*e->p != '(') return 0;
-    e->p++;
-    args[0] = e->p;
-    for (;; e->p++) {
-        if (!*e->p) return 0;
-        if (*e->p == '(') depth++;
-        else if (*e->p == ')' && depth) depth--;
-        else if ((*e->p == ',' || *e->p == ')') && !depth) {
-            if (na >= 16) return 0;
-            alen[na] = (size_t)(e->p - args[na]); na++;
-            if (*e->p == ')') { e->p++; break; }
-            args[na] = e->p + 1;
-        }
-    }
-    /* parametros: "a, b" -> nombres */
-    q = m->par;
-    while (*q) {
-        while (*q == ' ' || *q == ',') q++;
-        if (!*q) break;
-        if (np >= 16) return 0;
-        pn[np] = q;
-        while (is_id((unsigned char)*q)) q++;
-        pl[np] = (size_t)(q - pn[np]);
-        if (!pl[np]) return 0;
-        np++;
-    }
-    if (np == 0 && na == 1 && alen[0] == 0) na = 0;     /* F() */
-    if (na != np) return 0;
-    q = m->val;
-    while (*q) {
-        if (isalpha((unsigned char)*q) || *q == '_') {
-            const char* st = q; size_t k;
-            while (is_id((unsigned char)*q)) q++;
-            k = (size_t)(q - st);
-            for (i = 0; i < np; i++)
-                if (pl[i] == k && strncmp(pn[i], st, k) == 0) break;
-            if (i < np) {
-                if (n + alen[i] + 2 >= cap) return 0;
-                out[n++] = '('; memcpy(out + n, args[i], alen[i]); n += alen[i]; out[n++] = ')';
-            } else {
-                if (n + k + 1 >= cap) return 0;
-                memcpy(out + n, st, k); n += k;
-            }
-        } else {
-            if (n + 2 >= cap) return 0;
-            out[n++] = *q++;
-        }
-    }
-    out[n] = 0;
-    return 1;
-}
-
+static long long pp_expr(pp_ev_t* e, int minprec);
 
 static long long pp_primary(pp_ev_t* e)
 {
@@ -153,38 +390,9 @@ static long long pp_primary(pp_ev_t* e)
         return v;
     }
     if (isalpha((unsigned char)*e->p) || *e->p == '_') {
-        const char* st = e->p; size_t n;
+        const char* st = e->p;
         while (is_id((unsigned char)*e->p)) e->p++;
-        n = (size_t)(e->p - st);
-        if (n == 7 && strncmp(st, "defined", 7) == 0) {
-            int paren = 0; const char* id; size_t idn;
-            pp_ws(e);
-            if (*e->p == '(') { paren = 1; e->p++; pp_ws(e); }
-            id = e->p;
-            while (is_id((unsigned char)*e->p)) e->p++;
-            idn = (size_t)(e->p - id);
-            if (!idn) { e->err = 1; return 0; }
-            if (paren) { pp_ws(e); if (*e->p != ')') { e->err = 1; return 0; } e->p++; }
-            return pp_is_defined(e->pp, id, idn);
-        }
-        {
-            pp_macro_t* m = pp_find(e->pp, st, n);
-            pp_ev_t sub;
-            char xb[1024];
-            if (!m) return pp_is_defined(e->pp, st, n);   /* sin definir vale 0; una extension anunciada, 1 */
-            if (m->bad || e->depth > 16) { e->err = 1; return 0; }
-            sub.pp = e->pp; sub.depth = e->depth + 1; sub.err = 0;
-            if (m->fn) {
-                if (!pp_expand_fn(e, m, xb, sizeof xb)) { e->err = 1; return 0; }
-                sub.p = xb;
-            } else sub.p = m->val;
-            pp_ws(&sub);
-            if (!*sub.p) { e->err = 1; return 0; }
-            v = pp_ternary(&sub);
-            pp_ws(&sub);
-            if (sub.err || *sub.p) { e->err = 1; return 0; }
-            return v;
-        }
+        return pp_ext_defined(st, (size_t)(e->p - st));         /* sin definir vale 0; una extension anunciada, 1 */
     }
     e->err = 1;
     return 0;
@@ -266,140 +474,184 @@ static long long pp_ternary(pp_ev_t* e)
     return c ? a : b;
 }
 
-/* Evalua una condicion #if / #elif. *ok = 0 si no se pudo. */
-static int pp_eval(pp_t* pp, const char* text, int* ok)
+static int x_defined(xtab_t* t, const char* nm, size_t len) { return xm_find(t, nm, len) != NULL || pp_ext_defined(nm, len); }
+
+/* Evalua el cuerpo de un #if / #elif: `defined` primero (sin expandir su operando), luego la expansion de macros, luego el calculo.
+ * *ok = 0 si no se pudo (sintaxis rota, falta de memoria). */
+static int x_cond(xctx_t* c, const char* body, int* ok)
 {
+    xsb_t d = {0, 0, 0, 0, 0}, x = {0, 0, 0, 0, 0};
+    xctx_t sc = *c;
     pp_ev_t e;
-    long long v;
-    e.p = text; e.pp = pp; e.depth = 0; e.err = 0;
+    const char* p = body;
+    long long v = 0;
+    d.limit = x.limit = c->out->limit;
+    while (*p) {
+        if (x_idstart((unsigned char)*p)) {
+            const char* s = p;
+            while (is_id((unsigned char)*p)) p++;
+            if (p - s == 7 && !strncmp(s, "defined", 7)) {
+                const char* q = p;
+                int paren = 0;
+                const char* id;
+                size_t n;
+                while (*q == ' ' || *q == '\t') q++;
+                if (*q == '(') { paren = 1; q++; while (*q == ' ' || *q == '\t') q++; }
+                id = q;
+                while (is_id((unsigned char)*q)) q++;
+                n = (size_t)(q - id);
+                if (!n) { *ok = 0; free(d.p); free(x.p); return 0; }
+                if (paren) {
+                    while (*q == ' ' || *q == '\t') q++;
+                    if (*q != ')') { *ok = 0; free(d.p); free(x.p); return 0; }
+                    q++;
+                }
+                xsb_c(&d, x_defined(c->tab, id, n) ? '1' : '0');
+                p = q;
+            } else xsb_put(&d, s, (size_t)(p - s));
+        } else if (isdigit((unsigned char)*p)) { size_t j = x_number(p, 0, strlen(p)); xsb_put(&d, p, j); p += j; }
+        else { xsb_c(&d, *p); p++; }
+    }
+    sc.out = &x; sc.depth = 0; sc.line = 0;
+    xexpand(&sc, d.p ? d.p : "", d.n);
+    if (d.oom || x.oom) { *ok = 0; free(d.p); free(x.p); return 0; }
+    e.p = x.p ? x.p : ""; e.err = 0;
     v = pp_ternary(&e);
     pp_ws(&e);
     *ok = !e.err && !*e.p;
+    free(d.p); free(x.p);
     return v != 0;
 }
 
+/* ------------------------------------------------------------------------------------------------ pasada unica */
 typedef struct { int parent, taken, active; } pp_frame_t;
 
-/* Devuelve 1 si el texto se proceso (s modificado en sitio), 0 si se dejo intacto. */
-int gl31_glsl_pp_resolve(char* s, long ver)
+static void blank_range(xsb_t* out, const char* a, const char* b)       /* espacios, conservando los \n */
 {
-    pp_t* pp = (pp_t*)calloc(1, sizeof *pp);
-    char* t = (char*)malloc(strlen(s) + 1);
-    pp_frame_t st[PP_MAX_DEPTH];
-    int sp = 0, active = 1, ok = 1;
-    char* p;
-    char vbuf[24];
-    if (!pp || !t) { free(pp); free(t); return 0; }
-    strcpy(t, s);
-    snprintf(vbuf, sizeof vbuf, "%ld", ver);
-    pp_define(pp, "__VERSION__", 11, "", 0, vbuf, strlen(vbuf), 0);
+    for (; a < b; a++) xsb_c(out, *a == '\n' ? '\n' : ' ');
+}
 
-    p = t;
+char* gl31_glsl_preprocess(const char* s, long ver, const char** why)
+{
+    xtab_t tab = {0, 0, 0};
+    xsb_t out = {0, 0, 0, 0, 0};
+    xctx_t c;
+    pp_frame_t* st = NULL;
+    int sp = 0, scap = 0, active = 1, ok = 1, line = 1;
+    const char* p = s;
+    const char* reason = NULL;
+    char vbuf[24];
+    size_t k, hashes = 0;
+    memset(&c, 0, sizeof c);
+    for (k = 0; s[k]; k++) if (s[k] == '#') hashes++;
+    out.limit = strlen(s) * 8 + ((size_t)1 << 20);
+    c.scap = (int)(hashes + 3);                    /* una macro no puede estar dos veces en la pila: cabe una por #define */
+    c.stack = (const xm_t**)malloc(sizeof *c.stack * (size_t)c.scap);
+    if (!c.stack) { if (why) *why = "out of memory"; return NULL; }
+    snprintf(vbuf, sizeof vbuf, "%ld", ver);
+    if (!xm_define(&tab, "__VERSION__", 11, NULL, 0, 0, 0, vbuf, strlen(vbuf))) { free(c.stack); x_free_tab(&tab); if (why) *why = "out of memory"; return NULL; }
+    c.tab = &tab; c.out = &out;
+
     while (*p && ok) {
-        char* ls = p;            /* inicio de la linea logica */
-        char* le;                /* fin (sin el \n) */
-        char* d = p;
+        const char* d = p;
+        const char* le;
         while (*d == ' ' || *d == '\t') d++;
-        /* fin de linea logica: una directiva continua con \ al final de linea */
-        le = p;
-        for (;;) {
-            while (*le && *le != '\n') le++;
-            if (*d == '#' && le > ls && le[-1] == '\\' && *le) { le++; continue; }
-            if (*d == '#' && le > ls + 1 && le[-1] == '\r' && le[-2] == '\\' && *le) { le++; continue; }
-            break;
-        }
         if (*d == '#') {
-            char dir[16]; size_t dn = 0; char* a = d + 1;
-            char bc[1024]; char* body = bc; size_t bl = 0;
-            int blank = 0;
+            const char* a = d + 1;
+            char dir[16]; size_t dn = 0;
+            char* body; size_t bl = 0;
+            const char* b;
+            le = x_line_end(p);
             while (*a == ' ' || *a == '\t') a++;
             while (is_id((unsigned char)*a) && dn < sizeof dir - 1) dir[dn++] = *a++;
             dir[dn] = 0;
-            /* copia del cuerpo (hasta el fin de la linea logica) sin las continuaciones `\` + salto */
-            for (; a < le && bl < sizeof bc - 1; a++)
-                bc[bl++] = (*a == '\\' && (a[1] == '\n' || (a[1] == '\r' && a[2] == '\n'))) ? ' '
-                         : (*a == '\n' || *a == '\r') ? ' ' : *a;
-            bc[bl] = 0;
-            if (a < le) ok = 0;                         /* directiva demasiado larga */
+            body = (char*)malloc((size_t)(le - a) + 1);
+            if (!body) { ok = 0; reason = "out of memory"; break; }
+            for (b = a; b < le; b++)               /* cuerpo sin las continuaciones `\` + salto */
+                body[bl++] = (*b == '\\' && (b[1] == '\n' || (b[1] == '\r' && b[2] == '\n'))) ? ' ' : (*b == '\n' || *b == '\r') ? ' ' : *b;
+            body[bl] = 0;
             if (!strcmp(dir, "if") || !strcmp(dir, "ifdef") || !strcmp(dir, "ifndef")) {
                 int cond = 0;
-                blank = 1;
-                if (sp >= PP_MAX_DEPTH) { ok = 0; }
-                else {
-                    st[sp].parent = active;
-                    if (active) {
-                        if (dir[2] == 0) cond = pp_eval(pp, body, &ok);
-                        else {
-                            const char* id = body; size_t n;
-                            while (*id == ' ' || *id == '\t') id++;
-                            n = 0; while (is_id((unsigned char)id[n])) n++;
-                            if (!n) ok = 0;
-                            cond = pp_is_defined(pp, id, n);
-                            if (dir[2] == 'n') cond = !cond;
-                        }
-                    }
-                    st[sp].taken = active && cond;
-                    active = active && cond;
-                    st[sp].active = active;
-                    sp++;
+                if (sp == scap) {
+                    pp_frame_t* nf = (pp_frame_t*)realloc(st, sizeof *st * (size_t)(scap ? scap * 2 : 16));
+                    if (!nf) { ok = 0; reason = "out of memory"; free(body); break; }
+                    st = nf; scap = scap ? scap * 2 : 16;
                 }
+                st[sp].parent = active;
+                if (active) {
+                    if (dir[2] == 0) { cond = x_cond(&c, body, &ok); if (!ok) reason = "cannot evaluate an #if expression"; }
+                    else {
+                        const char* id = body; size_t n = 0;
+                        while (*id == ' ' || *id == '\t') id++;
+                        while (is_id((unsigned char)id[n])) n++;
+                        if (!n) { ok = 0; reason = "#ifdef without a name"; }
+                        cond = x_defined(&tab, id, n);
+                        if (dir[2] == 'n') cond = !cond;
+                    }
+                }
+                st[sp].taken = active && cond;
+                active = active && cond;
+                st[sp].active = active;
+                sp++;
+                blank_range(&out, p, le);
             } else if (!strcmp(dir, "elif")) {
-                blank = 1;
-                if (!sp) ok = 0;
+                if (!sp) { ok = 0; reason = "#elif without #if"; }
                 else {
                     pp_frame_t* f = &st[sp - 1];
                     if (!f->parent || f->taken) active = 0;
-                    else {
-                        int cond = pp_eval(pp, body, &ok);
-                        active = cond; f->taken = cond;
-                    }
+                    else { int cond = x_cond(&c, body, &ok); if (!ok) reason = "cannot evaluate an #elif expression"; active = cond; f->taken = cond; }
                 }
+                blank_range(&out, p, le);
             } else if (!strcmp(dir, "else")) {
-                blank = 1;
-                if (!sp) ok = 0;
-                else {
-                    pp_frame_t* f = &st[sp - 1];
-                    active = f->parent && !f->taken;
-                    f->taken = 1;
-                }
+                if (!sp) { ok = 0; reason = "#else without #if"; }
+                else { pp_frame_t* f = &st[sp - 1]; active = f->parent && !f->taken; f->taken = 1; }
+                blank_range(&out, p, le);
             } else if (!strcmp(dir, "endif")) {
-                blank = 1;
-                if (!sp) ok = 0;
+                if (!sp) { ok = 0; reason = "#endif without #if"; }
                 else active = st[--sp].parent;
+                blank_range(&out, p, le);
             } else if (!active) {
-                blank = 1;
-            } else if (!strcmp(dir, "define")) {
-                const char* id = body; size_t n;
-                while (*id == ' ' || *id == '\t') id++;
-                n = 0; while (is_id((unsigned char)id[n])) n++;
-                if (!n) ok = 0;
-                else {
-                    const char* v = id + n; int fn = (*v == '(');
-                    const char* par = ""; size_t pl = 0;
-                    if (fn) {                              /* #define F(a, b) cuerpo */
-                        par = v + 1;
-                        while (*v && *v != ')') v++;
-                        if (!*v) ok = 0;
-                        else { pl = (size_t)(v - par); v++; }
-                    }
-                    while (*v == ' ' || *v == '\t') v++;
-                    if (ok && !pp_define(pp, id, n, par, pl, v, strlen(v), fn)) ok = 0;
+                blank_range(&out, p, le);
+            } else {
+                if (!strcmp(dir, "define")) { if (!x_parse_define(&tab, a, le)) { ok = 0; reason = "out of memory"; } }
+                else if (!strcmp(dir, "undef")) {
+                    const char* id = body; size_t n = 0;
+                    while (*id == ' ' || *id == '\t') id++;
+                    while (is_id((unsigned char)id[n])) n++;
+                    xm_undef(&tab, id, n);
                 }
-            } else if (!strcmp(dir, "undef")) {
-                const char* id = body; size_t n;
-                while (*id == ' ' || *id == '\t') id++;
-                n = 0; while (is_id((unsigned char)id[n])) n++;
-                pp_undef(pp, id, n);
+                xsb_put(&out, p, (size_t)(le - p));   /* las demas directivas pasan intactas */
             }
-            if (blank) { char* b; for (b = ls; b < le; b++) if (*b != '\n') *b = ' '; }
-        } else if (!active) {
-            char* b; for (b = ls; b < le; b++) *b = ' ';
+            free(body);
+            for (k = 0; k < (size_t)(le - p); k++) if (p[k] == '\n') line++;
+            if (*le == '\n') { xsb_c(&out, '\n'); line++; le++; }
+            p = le;
+        } else {
+            /* tramo de codigo hasta la siguiente directiva (una llamada a macro puede ocupar varias lineas) */
+            const char* e = p;
+            for (;;) {
+                const char* q;
+                while (*e && *e != '\n') e++;
+                if (*e == '\n') e++;
+                q = e; while (*q == ' ' || *q == '\t') q++;
+                if (!*e || *q == '#') break;
+            }
+            if (active) {
+                c.line = line; c.depth = 0;
+                xexpand(&c, p, (size_t)(e - p));
+                line = c.line;
+            } else {
+                blank_range(&out, p, e);
+                for (k = 0; k < (size_t)(e - p); k++) if (p[k] == '\n') line++;
+            }
+            p = e;
         }
-        p = *le ? le + 1 : le;
+        if (out.oom && ok) { ok = 0; reason = "output too large (runaway macro expansion?)"; }
     }
-    if (sp) ok = 0;                                   /* #if sin cerrar */
-    if (ok) strcpy(s, t);
-    free(pp); free(t);
-    return ok;
+    if (ok && sp) { ok = 0; reason = "#if without #endif"; }
+    free(st); free(c.stack);
+    x_free_tab(&tab);
+    if (!ok) { free(out.p); if (why) *why = reason ? reason : "preprocessing failed"; return NULL; }
+    if (!out.p) out.p = xdup("", 0);
+    return out.p;
 }
-

@@ -79,6 +79,7 @@ static GLuint bound_buffer(GLenum target)
         case GL_ATOMIC_COUNTER_BUFFER: q = GL_ATOMIC_COUNTER_BUFFER_BINDING; break;
         case GL_DRAW_INDIRECT_BUFFER:  q = GL_DRAW_INDIRECT_BUFFER_BINDING; break;
         case GL_DISPATCH_INDIRECT_BUFFER: q = GL_DISPATCH_INDIRECT_BUFFER_BINDING; break;
+        case GL_TEXTURE_BUFFER:        q = GL_TEXTURE_BUFFER; break;   /* GL_TEXTURE_BUFFER_BINDING vale lo mismo que el objetivo */
         default: return 0;
     }
     BE(glGetIntegerv)(q, &v);
@@ -181,7 +182,10 @@ void gl31_glBindBuffer(GLenum target, GLuint buffer)
                 return;
             }
             break;
-        default:  /* incluye GL_TEXTURE_BUFFER (no soportado) */
+        case GL_TEXTURE_BUFFER:      /* core en ES 3.2 (o EXT/OES_texture_buffer): solo si el backend lo tiene */
+            if (!gl31_caps.tex_buffer) { gl31_set_error(GL_INVALID_ENUM); return; }
+            break;
+        default:
             gl31_set_error(GL_INVALID_ENUM);
             return;
     }
@@ -253,8 +257,13 @@ void gl31_glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbi
         return;
     }
     if (path == 1) {
+        /* solo cuenta el error de ESTA llamada al backend: gl31_err_peek() devuelve el error pendiente del programa (de
+         * cualquier llamada anterior) y abortaba aqui sin registrar el buffer, dejando un buffer persistente sin mapeo */
+        GLenum be_err;
+        gl31_err_flush();
         BE(glBufferStorage)(target, size, data, flags);
-        if (gl31_err_peek() != GL_NO_ERROR) return;
+        be_err = BE(glGetError)();
+        if (be_err != GL_NO_ERROR) { gl31_set_error(be_err); return; }
     } else if (path == 2) {
         lvk_buffer vb; GLuint mo = 0; int fd; GLenum err;
         if (!lvk_buffer_create(&vb, (VkDeviceSize)size,

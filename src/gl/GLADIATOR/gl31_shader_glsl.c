@@ -24,6 +24,7 @@
 #include "gl31.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <ctype.h>
 #ifdef __ANDROID__
@@ -63,7 +64,16 @@ static void strip_comments(char* s)
 {
     while (*s) {
         if (s[0] == '/' && s[1] == '/') {
-            while (*s && *s != '\n') *s++ = ' ';
+            /* un `\` al final de la linea (con \r o sin el) continua el comentario en la siguiente, como en C */
+            while (*s && *s != '\n') {
+                if (*s == '\\' && (s[1] == '\n' || (s[1] == '\r' && s[2] == '\n'))) {
+                    *s++ = ' ';
+                    if (*s == '\r') *s++ = ' ';
+                    s++;                         /* el salto de linea se conserva y el comentario sigue */
+                    continue;
+                }
+                *s++ = ' ';
+            }
         } else if (s[0] == '/' && s[1] == '*') {
             s[0] = s[1] = ' '; s += 2;
             while (*s && !(s[0] == '*' && s[1] == '/')) { if (*s != '\n') *s = ' '; s++; }
@@ -1362,6 +1372,61 @@ static size_t lcg_strip_builtin_decl(char* s, size_t len)
     return o;
 }
 
+/* ---------- extensiones de ES que cada construccion de GLSL necesita ----------
+ * Una tabla en vez de un `if` por construccion: palabra (o etapa) que la activa, desde que version de GLSL ES es core, que
+ * capacidad del backend la sostiene y que extension se pide cuando no es core. Si la construccion aparece y el backend no la
+ * tiene, el shader se rechaza con un mensaje claro (antes se dejaba al compilador del driver, que no dice por que). */
+enum { ST_V = 1, ST_F = 2, ST_G = 4, ST_TC = 8, ST_TE = 16, ST_C = 32, ST_ALL = 63 };
+#define NOCAP ((size_t)-1)
+#define CAP(f) offsetof(gl31_caps_t, f)
+typedef struct {
+    const char* const* words;   /* palabras que la activan; NULL = la activa la etapa */
+    int stages;                 /* etapas a las que se aplica */
+    int es_core;                /* GLSL ES desde el que es core; 0 = hace falta la extension siempre */
+    size_t cap;                 /* CAP(campo) que dice que el backend la tiene; NOCAP = sin requisito */
+    const char* ext;            /* extension que se pide si no es core (NULL = ninguna) */
+    const char* err;            /* mensaje si el backend no la tiene */
+} ext_rule_t;
+static const char* const w_cubearr[] = { "samplerCubeArray", "isamplerCubeArray", "usamplerCubeArray", "samplerCubeArrayShadow", NULL };
+static const char* const w_ms[]      = { "sampler2DMS", "isampler2DMS", "usampler2DMS", NULL };
+static const char* const w_msarr[]   = { "sampler2DMSArray", "isampler2DMSArray", "usampler2DMSArray", NULL };
+static const char* const w_texbuf[]  = { "samplerBuffer", "isamplerBuffer", "usamplerBuffer", NULL };
+static const char* const w_psize[]   = { "gl_PointSize", NULL };
+static const ext_rule_t k_ext_rules[] = {
+    { NULL,       ST_G,           320, NOCAP, "GL_EXT_geometry_shader", NULL },
+    { NULL,       ST_TC | ST_TE,  320, NOCAP, "GL_EXT_tessellation_shader", NULL },
+    { w_cubearr,  ST_ALL,         320, CAP(cube_array), "GL_EXT_texture_cube_map_array", "requiere cube map arrays (ES 3.2 o EXT_texture_cube_map_array)" },
+    { w_ms,       ST_ALL,         310, CAP(multisample_tex), NULL, "requiere ES 3.1 en el backend" },
+    { w_msarr,    ST_ALL,         0,   CAP(ms_array), "GL_OES_texture_storage_multisample_2d_array", "requiere OES_texture_storage_multisample_2d_array" },
+    { w_texbuf,   ST_ALL,         320, CAP(tex_buffer), "GL_EXT_texture_buffer", "requiere texture buffers (ES 3.2 o EXT_texture_buffer)" },
+    /* gl_PointSize fuera del vertex shader es una extension aparte tambien en ES 3.2 */
+    { w_psize,    ST_G,           0,   CAP(geometry_point_size), "GL_EXT_geometry_point_size", "gl_PointSize en geometry shaders requiere EXT_geometry_point_size en el backend" },
+    { w_psize,    ST_TC | ST_TE,  0,   CAP(tess_point_size), "GL_EXT_tessellation_point_size", "gl_PointSize en teselacion requiere EXT_tessellation_point_size en el backend" },
+};
+
+static int stage_bit(GLenum t)
+{
+    return t == GL_VERTEX_SHADER ? ST_V : t == GL_FRAGMENT_SHADER ? ST_F : t == GL_GEOMETRY_SHADER ? ST_G :
+           t == GL_TESS_CONTROL_SHADER ? ST_TC : t == GL_TESS_EVALUATION_SHADER ? ST_TE : ST_C;
+}
+
+/* Aplica la tabla: emite las `#extension` que hacen falta en `ext`. Devuelve 0, o 1 si falta una capacidad (*word y *err dicen cual). */
+static int apply_ext_rules(const char* s, GLenum type, int es, sb_t* ext, const char** word, const char** err)
+{
+    size_t r;
+    for (r = 0; r < sizeof k_ext_rules / sizeof k_ext_rules[0]; r++) {
+        const ext_rule_t* e = &k_ext_rules[r];
+        const char* hit = NULL;
+        if (!(e->stages & stage_bit(type))) continue;
+        if (!e->words) hit = "";
+        else { int i; for (i = 0; e->words[i] && !hit; i++) if (find_word(s, e->words[i])) hit = e->words[i]; }
+        if (!hit) continue;
+        if (e->cap != NOCAP && !*(const int*)((const char*)&gl31_caps + e->cap)) { *word = hit; *err = e->err; return 1; }
+        if (e->ext && (e->es_core == 0 || es < e->es_core)) { sb_str(ext, "#extension "); sb_str(ext, e->ext); sb_str(ext, " : require\n"); }
+    }
+    return 0;
+}
+
 char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
                            const gl31_fragbind_t* binds, int nbinds,
                            gl31_sampler_info_t* samplers, char* err, size_t errlen)
@@ -1431,7 +1496,13 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
     }
 
     /* solo el codigo activo: todas las comprobaciones textuales de abajo dependen de esto */
-    gl31_glsl_pp_resolve(s, ver);
+    {   /* preprocesador de una pasada: condicionales resueltos y macros expandidas, de modo que el conversor tipado y las
+         * comprobaciones textuales ven las expresiones reales (#define TAM textureSize(t, 0) dejaria sin tipo una asignacion a vec2) */
+        const char* why = NULL;
+        char* x = gl31_glsl_preprocess(s, ver, &why);
+        if (x) { free(s); s = x; }
+        else if (gl31_diag()) gl31_log("LORICA GLSL: preprocessing skipped (%s): conditionals and macros are left to the driver", why ? why : "?");
+    }
 
     /* built-ins de compatibilidad que son un varying puro (sin estado externo, como VARYING_SLOT_COL0 en Mesa):
      * par de color, gl_TexCoord[] y gl_FogFragCoord pasan a varyings genericos. Los que necesitan estado de funcion fija
@@ -1474,16 +1545,9 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
             goto fail;
         }
     {
-        static const char* const ca[] = { "samplerCubeArray", "isamplerCubeArray", "usamplerCubeArray",
-                                          "samplerCubeArrayShadow", NULL };
         static const char* const im[] = { "image2D", "iimage2D", "uimage2D", "image3D", "iimage3D", "uimage3D",
                                           "imageCube", "iimageCube", "uimageCube", "image2DArray",
                                           "iimage2DArray", "uimage2DArray", "atomic_uint", NULL };
-        for (i = 0; ca[i]; i++)
-            if (find_word(s, ca[i]) && !gl31_caps.cube_array) {
-                set_err(err, errlen, "requiere cube map arrays (ES 3.2 o EXT_texture_cube_map_array)", ca[i]);
-                goto fail;
-            }
         for (i = 0; im[i]; i++)
             if (find_word(s, im[i]) && !gl31_caps.es31) {
                 set_err(err, errlen, "requiere ES 3.1 en el backend", im[i]);
@@ -1498,17 +1562,6 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
         !(shader_type == GL_VERTEX_SHADER && opts.last_vs)) {
         set_err(err, errlen, "gl_ClipDistance requiere EXT_clip_cull_distance en el backend", "gl_ClipDistance");
         goto fail;
-    }
-    {
-        static const char* const ms[] = { "sampler2DMS", "isampler2DMS", "usampler2DMS", NULL };
-        static const char* const msa[] = { "sampler2DMSArray", "isampler2DMSArray", "usampler2DMSArray", NULL };
-        static const char* const bf[] = { "samplerBuffer", "isamplerBuffer", "usamplerBuffer", NULL };
-        for (i = 0; ms[i]; i++)
-            if (find_word(s, ms[i]) && !gl31_caps.multisample_tex) { set_err(err, errlen, "requiere ES 3.1 en el backend", ms[i]); goto fail; }
-        for (i = 0; msa[i]; i++)
-            if (find_word(s, msa[i]) && !gl31_caps.ms_array) { set_err(err, errlen, "requiere OES_texture_storage_multisample_2d_array", msa[i]); goto fail; }
-        for (i = 0; bf[i]; i++)
-            if (find_word(s, bf[i]) && !gl31_caps.tex_buffer) { set_err(err, errlen, "requiere texture buffers (ES 3.2 o EXT_texture_buffer)", bf[i]); goto fail; }
     }
     if (shader_type == GL_FRAGMENT_SHADER) {
         uses_color = find_word(s, "gl_FragColor") != NULL;
@@ -1525,18 +1578,12 @@ char* gl31_glsl_convert_ex(const char* src, GLenum shader_type,
     if (ext.oom) goto oom;
     if (g_imix) { s = repl_word(s, "mix", "lorica_mix"); if (!s) goto oom; }
 
-    /* extensiones que el backend exige bajo ES < 3.20 */
-    if (shader_type == GL_GEOMETRY_SHADER && es < 320) sb_str(&ext, "#extension GL_EXT_geometry_shader : require\n");
-    if ((shader_type == GL_TESS_CONTROL_SHADER || shader_type == GL_TESS_EVALUATION_SHADER) && es < 320)
-        sb_str(&ext, "#extension GL_EXT_tessellation_shader : require\n");
-    if (es < 320 && (find_word(s, "samplerCubeArray") || find_word(s, "isamplerCubeArray") ||
-                     find_word(s, "usamplerCubeArray") || find_word(s, "samplerCubeArrayShadow")))
-        sb_str(&ext, "#extension GL_EXT_texture_cube_map_array : require\n");
-    if (es < 320 && gl31_caps.tex_buffer &&
-        (find_word(s, "samplerBuffer") || find_word(s, "isamplerBuffer") || find_word(s, "usamplerBuffer")))
-        sb_str(&ext, "#extension GL_EXT_texture_buffer : require\n");
-    if (find_word(s, "sampler2DMSArray") || find_word(s, "isampler2DMSArray") || find_word(s, "usampler2DMSArray"))
-        sb_str(&ext, "#extension GL_OES_texture_storage_multisample_2d_array : require\n");
+    /* extensiones que cada construccion pide al backend (tabla k_ext_rules) */
+    {
+        const char *bw = NULL, *be = NULL;
+        if (apply_ext_rules(s, shader_type, es, &ext, &bw, &be)) { set_err(err, errlen, be, bw); goto fail; }
+        if (ext.oom) goto oom;
+    }
     if (gl31_caps.clip_distance && find_word(s, "gl_ClipDistance"))
         sb_str(&ext, gl31_caps.clip_distance == 2 ? "#extension GL_ANGLE_clip_cull_distance : require\n"
                                                   : "#extension GL_EXT_clip_cull_distance : require\n");

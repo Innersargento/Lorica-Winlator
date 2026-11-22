@@ -62,7 +62,7 @@ static void ctor_name(ty_t t, char* out)
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ estado */
-typedef struct { size_t pos; int grp; int seq; char txt[12]; } edit_t;
+typedef struct { size_t pos; int grp; int seq; size_t del; char txt[12]; } edit_t;   /* del: bytes que se borran en pos (0 = solo inserta) */
 typedef struct { const char* n; size_t l; ty_t t; int depth; } sym_t;
 typedef struct { const char* n; size_t l; ty_t t; } field_t;
 typedef struct { const char* n; size_t l; int nf; field_t* f; } struct_t;
@@ -198,8 +198,15 @@ static void add_edit(P* p, size_t pos, int grp, const char* txt)
     p->ed = (edit_t*)grow(p->ed, p->ne, &p->cape, sizeof(edit_t), &p->oom);
     if (p->oom) return;
     e = &p->ed[p->ne++];
-    e->pos = pos; e->grp = grp; e->seq = p->seq++;
+    e->pos = pos; e->grp = grp; e->seq = p->seq++; e->del = 0;
     strncpy(e->txt, txt, sizeof e->txt - 1); e->txt[sizeof e->txt - 1] = 0;
+}
+
+/* borra `len` bytes del fuente en `pos` (una declaracion vacia, por ejemplo) */
+static void add_del(P* p, size_t pos, size_t len)
+{
+    add_edit(p, pos, 0, "");
+    if (!p->oom) p->ed[p->ne - 1].del = len;
 }
 
 /* conversion explicita de x al tipo `to` (que can_up ya aprobo) */
@@ -273,21 +280,28 @@ static int parse_opaque(const char* s, size_t l, ty_t* t)
     int sb = B_FLOAT, sd = 0, shadow = 0;
     if (l >= sizeof b) return 0;
     memcpy(b, s, l); b[l] = 0;
+    /* Solo los nombres exactos de los tipos opacos de GLSL: `sampler`, `image`, `imageSize`, `samplerState`... son
+     * identificadores validos del usuario (parametros, variables, funciones) y un casamiento por prefijo los tomaba por tipos. */
     if (!strcmp(b, "atomic_uint")) { *t = t_unk(); return 1; }
     q = b;
-    if (!strncmp(q, "image", 5) || !strncmp(q, "iimage", 6) || !strncmp(q, "uimage", 6)) { *t = t_unk(); return 1; }
-    if (*q == 'i') { sb = B_INT; q++; } else if (*q == 'u') { sb = B_UINT; q++; }
-    if (strncmp(q, "sampler", 7)) return 0;
-    q += 7;
-    {
-        size_t ql = strlen(q);
-        if (ql >= 6 && !strcmp(q + ql - 6, "Shadow")) { shadow = 1; b[l - 6] = 0; }
+    if (*q == 'i' || *q == 'u') {                         /* prefijo de tipo base solo si lo que sigue es un sampler / image */
+        if (!strncmp(q + 1, "sampler", 7) || !strncmp(q + 1, "image", 5)) { sb = (*q == 'i') ? B_INT : B_UINT; q++; }
     }
-    if (!strcmp(q, "1D")) sd = 1; else if (!strcmp(q, "2D")) sd = 2; else if (!strcmp(q, "3D")) sd = 3;
-    else if (!strcmp(q, "Cube")) sd = 2; else if (!strcmp(q, "2DRect")) sd = 2; else if (!strcmp(q, "1DArray")) sd = 2;
-    else if (!strcmp(q, "2DArray")) sd = 3; else if (!strcmp(q, "CubeArray")) sd = 3; else if (!strcmp(q, "Buffer")) sd = 1;
-    else if (!strcmp(q, "2DMS")) sd = 2; else if (!strcmp(q, "2DMSArray")) sd = 3;
-    else { *t = t_unk(); return 1; }
+    {
+        int is_img = !strncmp(q, "image", 5);
+        const char* suf;
+        size_t ql;
+        if (!is_img && strncmp(q, "sampler", 7)) return 0;
+        suf = q + (is_img ? 5 : 7);
+        ql = strlen(suf);
+        if (!is_img && ql >= 6 && !strcmp(suf + ql - 6, "Shadow")) { shadow = 1; b[l - 6] = 0; }
+        if (!strcmp(suf, "1D")) sd = 1; else if (!strcmp(suf, "2D")) sd = 2; else if (!strcmp(suf, "3D")) sd = 3;
+        else if (!strcmp(suf, "Cube")) sd = 2; else if (!strcmp(suf, "2DRect")) sd = 2; else if (!strcmp(suf, "1DArray")) sd = 2;
+        else if (!strcmp(suf, "2DArray")) sd = 3; else if (!strcmp(suf, "CubeArray")) sd = 3; else if (!strcmp(suf, "Buffer")) sd = 1;
+        else if (!strcmp(suf, "2DMS")) sd = 2; else if (!strcmp(suf, "2DMSArray")) sd = 3;
+        else return 0;                                    /* `sampler`, `imageSize`, `samplerFoo`: no son tipos */
+        if (is_img) { *t = t_unk(); return 1; }
+    }
     *t = t_unk(); t->k = K_SMP; t->sb = (unsigned char)sb; t->shadow = (unsigned char)shadow; t->sd = (unsigned char)sd;
     return 1;
 }
@@ -1134,7 +1148,12 @@ char* gl31_glsl_implicit_conv(const char* src)
     while (!p.oom && p.tk[p.cur].k != TK_EOF) {
         int start = p.cur, r;
         if (is_kw(&p, "precision")) { if (skip_to_semi(&p) < 0) break; continue; }
-        if (is_p(&p, ";")) { p.cur++; continue; }
+        if (is_p(&p, ";")) {   /* declaracion vacia (`int i;;`, `void f(){};`): el parser consume el `;` de toda declaracion, asi que este sobra */
+            /* salvaguarda: solo tras otro `;` o un `}`; si no, el parser se desincronizo y el `;` puede ser de una declaracion */
+            if (p.cur == 0 || is_pn(&p, p.cur - 1, ";") || is_pn(&p, p.cur - 1, "}")) add_del(&p, p.tk[p.cur].b, 1);
+            p.cur++;
+            continue;
+        }
         r = parse_decl(&p, 1);
         if (r != 0) resync(&p, start);
         if (p.cur <= start) p.cur = start + 1;
@@ -1150,7 +1169,11 @@ char* gl31_glsl_implicit_conv(const char* src)
         size_t upto = i < p.ne ? p.ed[i].pos : p.len;
         if (upto > p.len) upto = p.len;
         if (upto > n) { memcpy(out + o, src + n, upto - n); o += upto - n; n = upto; }
-        if (i < p.ne) { size_t l = strlen(p.ed[i].txt); memcpy(out + o, p.ed[i].txt, l); o += l; }
+        if (i < p.ne) {
+            size_t l = strlen(p.ed[i].txt);
+            memcpy(out + o, p.ed[i].txt, l); o += l;
+            if (p.ed[i].del) n = upto + p.ed[i].del;      /* se omiten los bytes borrados */
+        }
     }
     out[o] = 0;
     free_all(&p);
