@@ -1444,7 +1444,7 @@ void APIENTRY_GL4ES gl4es_glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX
         gl4es_glActiveTexture(GL_TEXTURE0);
     float nwidth, nheight;
     if (created) {
-        gltexture_t *old = glstate->texture.bound[ENABLED_TEX2D][0];
+        gltexture_t *old = glstate->texture.bound[0][ENABLED_TEX2D];
         gl4es_glGenTextures(1, &texture);
         gl4es_glBindTexture(GL_TEXTURE_2D, texture);
         gl4es_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1468,13 +1468,13 @@ void APIENTRY_GL4ES gl4es_glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX
             glname = tex->glname;
             if(!created) {
                 if((tex->actual.min_filter!=filter) || (tex->actual.mag_filter!=filter)) {
-                    gltexture_t *old = glstate->texture.bound[ENABLED_TEX2D][0];
-                    if(old->texture != glname)
-                        gl4es_glBindTexture(GL_TEXTURE_2D, glname);
+                    gltexture_t *old = glstate->texture.bound[0][ENABLED_TEX2D];
+                    if(old->texture != texture)
+                        gl4es_glBindTexture(GL_TEXTURE_2D, texture);
                     gl4es_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
                     gl4es_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
                     tex->actual.min_filter = tex->actual.mag_filter = filter;
-                    if(old->texture != glname)
+                    if(old->texture != texture)
                         gl4es_glBindTexture(GL_TEXTURE_2D, old->texture);
                 }
             }

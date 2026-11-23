@@ -527,9 +527,21 @@ void gl31_glClearBufferSubData(GLenum target, GLenum ifmt, GLintptr offset, GLsi
 static int iq_can_msaa(GLenum target, GLenum ifmt)
 {
     GLint64 r = 0;
+    if (target == GL_TEXTURE_2D_MULTISAMPLE && !gl31_caps.multisample_tex) return 0;
+    if (target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY && !gl31_caps.ms_array) return 0;
     if (target != GL_RENDERBUFFER && target != GL_TEXTURE_2D_MULTISAMPLE && target != GL_TEXTURE_2D_MULTISAMPLE_ARRAY)
         return 0;
     return gl31_internalformat_query(target, ifmt, 0x8289, &r) && r != 0;   /* FRAMEBUFFER_RENDERABLE */
+}
+
+static void iq_query_samples(GLenum target, GLenum ifmt, GLenum pname, GLsizei n, GLint* out)
+{
+    GLenum be_ifmt = gl31_rb_storage_format(ifmt);
+    out[0] = 0;
+    if (!iq_can_msaa(target, ifmt)) return;
+    gl31_err_flush();
+    BE(glGetInternalformativ)(target, be_ifmt, pname, n, out);
+    if (BE(glGetError)() != GL_NO_ERROR) out[0] = 0;
 }
 
 void gl31_glGetInternalformati64v(GLenum target, GLenum ifmt, GLenum pname, GLsizei bufSize, GLint64* params)
@@ -540,10 +552,9 @@ void gl31_glGetInternalformati64v(GLenum target, GLenum ifmt, GLenum pname, GLsi
     if (pname == GL_SAMPLES || pname == GL_NUM_SAMPLE_COUNTS) {
         GLint tmp[64];
         GLsizei n = bufSize < 64 ? bufSize : 64, i;
-        if (iq_can_msaa(target, ifmt)) {
-            BE(glGetInternalformativ)(target, ifmt, pname, n, tmp);
-            for (i = 0; i < n; i++) params[i] = tmp[i];
-        } else params[0] = 0;
+        memset(tmp, 0, (size_t)n * sizeof(GLint));
+        iq_query_samples(target, ifmt, pname, n, tmp);
+        for (i = 0; i < n; i++) params[i] = tmp[i];
         return;
     }
     if (gl31_internalformat_query(target, ifmt, pname, &v)) { params[0] = v; return; }
@@ -556,8 +567,7 @@ void gl31_glGetInternalformativ(GLenum target, GLenum ifmt, GLenum pname, GLsize
     if (bufSize < 0) { gl31_set_error(GL_INVALID_VALUE); return; }
     if (!bufSize || !params) return;
     if (pname == GL_SAMPLES || pname == GL_NUM_SAMPLE_COUNTS) {
-        if (iq_can_msaa(target, ifmt)) BE(glGetInternalformativ)(target, ifmt, pname, bufSize, params);
-        else params[0] = 0;
+        iq_query_samples(target, ifmt, pname, bufSize, params);
         return;
     }
     if (gl31_internalformat_query(target, ifmt, pname, &v)) {
