@@ -61,31 +61,12 @@ void APIENTRY_GL4ES gl4es_glBindAttribLocation(GLuint program, GLuint index, con
     FLUSH_BEGINEND;
     // sanity tests
     CHECK_PROGRAM(void, program)
-    // look / create attribloc at index
-    attribloc_t *attribloc = NULL;
-    {
-        khint_t k;
-        int ret;
-        khash_t(attribloclist) *attribloclist = glprogram->attribloc;
-        k = kh_get(attribloclist, attribloclist, index);
-        if (k != kh_end(attribloclist)) {
-            attribloc = kh_value(attribloclist, k);
-        } else {
-            k = kh_put(attribloclist, attribloclist, index, &ret);
-            attribloc = kh_value(attribloclist, k) = malloc(sizeof(attribloc_t));
-            memset(attribloc, 0, sizeof(attribloc_t));
-            attribloc->real_index = -1;
-            attribloc->index = index;
-        }
-    }
-    // update name
-    if(attribloc->name) free(attribloc->name);
-    attribloc->name = strdup(name);
-    attribloc->glname = attribloc->name;
-    // send to hardware
+    // Per OpenGL spec, glBindAttribLocation only takes effect on the next glLinkProgram and must not
+    // mutate the active attribute table (glprogram->attribloc) of an already-linked program (otherwise
+    // calling glBindAttribLocation while iterating glGetActiveAttrib clobbers active attribute names).
     LOAD_GLES2(glBindAttribLocation);
     if(gles_glBindAttribLocation) {
-        gles_glBindAttribLocation(glprogram->id, index, attribloc->name);
+        gles_glBindAttribLocation(glprogram->id, index, name);
         errorGL();
     } else
         noerrorShim();

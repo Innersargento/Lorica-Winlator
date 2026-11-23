@@ -1365,7 +1365,7 @@ const char* hasBuiltinAttrib(const char* vertexShader, int Att) {
               ret = builtin_attrib_compressed[i].name;
       }
     }
-    if (!ret)
+    if (!ret || !*ret)
       return NULL;
     if(strstr(vertexShader, ret)) // it's here!
       return ret;
