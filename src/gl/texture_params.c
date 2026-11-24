@@ -867,7 +867,7 @@ void realize_active() {
  * realize_textures may leave GLES on another unit, so the unit is set before the bind (otherwise the texture landed on
  * that other unit, behind GL4ES's cache, and the parameters went to TMU's texture). The texture to put back is what GLES
  * has on TMU (actual_tex2d), not always bound[TMU][TEX2D]: a rectangle / 1D texture may be the one realized there. */
-static GLuint r1t_bind_on(int TMU, gltexture_t* tex)
+static GLuint r1t_bind_on(int TMU, GLenum target, gltexture_t* tex)
 {
     LOAD_GLES(glActiveTexture);
     LOAD_GLES(glBindTexture);
@@ -876,8 +876,10 @@ static GLuint r1t_bind_on(int TMU, gltexture_t* tex)
         glstate->gleshard->active = TMU;
         gles_glActiveTexture(GL_TEXTURE0+TMU);
     }
-    GLuint oldtex = glstate->actual_tex2d[TMU];
-    if (oldtex!=tex->glname) gles_glBindTexture(GL_TEXTURE_2D, tex->glname);
+    GLuint oldtex = (target == GL_TEXTURE_CUBE_MAP)
+        ? glstate->texture.bound[TMU][ENABLED_CUBE_MAP]->glname
+        : glstate->actual_tex2d[TMU];
+    if (oldtex!=tex->glname) gles_glBindTexture(target, tex->glname);
     return oldtex;
 }
 
@@ -916,6 +918,8 @@ static void realize_depth_swizzle(GLenum target, gltexture_t* tex)
 
 void realize_1texture(GLenum target, int wantedTMU, gltexture_t* tex, glsampler_t* sampler)
 {
+    if (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)
+        target = GL_TEXTURE_CUBE_MAP;
     DBG(printf("realize_1texture(%s, %d, %p[%u], %p)\n", PrintEnum(target), wantedTMU, tex, tex->glname, sampler);)
     LOAD_GLES(glActiveTexture);
     void gles_glTexParameteri(glTexParameteri_ARG_EXPAND); //LOAD_GLES(glTexParameteri);
@@ -928,7 +932,7 @@ void realize_1texture(GLenum target, int wantedTMU, gltexture_t* tex, glsampler_
     param = get_texture_min_filter(tex, sampler);
     if(tex->actual.min_filter!=param) {
         if(wantedTMU==-1) {
-            oldtex = r1t_bind_on(TMU, tex);
+            oldtex = r1t_bind_on(TMU, target, tex);
             wantedTMU=-2;
         }
         DBG(printf("Adjusting %s[%d]:Texture[%u].min_filter = %s (binded=%u)\n", PrintEnum(target), TMU, tex->glname, PrintEnum(param), glstate->actual_tex2d[TMU]);)
@@ -942,7 +946,7 @@ void realize_1texture(GLenum target, int wantedTMU, gltexture_t* tex, glsampler_
     param = sampler->mag_filter;
     if(tex->actual.mag_filter!=param) {
         if(wantedTMU==-1) {
-            oldtex = r1t_bind_on(TMU, tex);
+            oldtex = r1t_bind_on(TMU, target, tex);
             wantedTMU=-2;
         }
         DBG(printf("Adjusting %s[%d]:Texture[%u].mag_filter = %s (min=%s/%s)\n", PrintEnum(target), TMU, tex->glname, PrintEnum(param), PrintEnum(sampler->min_filter), PrintEnum(tex->actual.min_filter));)
@@ -956,7 +960,7 @@ void realize_1texture(GLenum target, int wantedTMU, gltexture_t* tex, glsampler_
     param = get_texture_wrap_s(tex, sampler);
     if(tex->actual.wrap_s!=param) {
         if(wantedTMU==-1) {
-            oldtex = r1t_bind_on(TMU, tex);
+            oldtex = r1t_bind_on(TMU, target, tex);
             wantedTMU=-2;
         }
         DBG(printf("Adjusting %s[%d]:Texture[%u].wrap_s = %s\n", PrintEnum(target), TMU, tex->glname, PrintEnum(param));)
@@ -970,7 +974,7 @@ void realize_1texture(GLenum target, int wantedTMU, gltexture_t* tex, glsampler_
     param = get_texture_wrap_t(tex, sampler);
     if(tex->actual.wrap_t!=param) {
         if(wantedTMU==-1) {
-            oldtex = r1t_bind_on(TMU, tex);
+            oldtex = r1t_bind_on(TMU, target, tex);
             wantedTMU=-2;
         }
         DBG(printf("Adjusting %s[%d]:Texture[%u].wrap_t = %s\n", PrintEnum(target), TMU, tex->glname, PrintEnum(param));)
@@ -989,7 +993,7 @@ void realize_1texture(GLenum target, int wantedTMU, gltexture_t* tex, glsampler_
         GLenum afn = tex->actual.func ? tex->actual.func : GL_LEQUAL;
         if(acmp!=cmp || afn!=fn) {
             if(wantedTMU==-1) {
-                oldtex = r1t_bind_on(TMU, tex);
+                oldtex = r1t_bind_on(TMU, target, tex);
                 wantedTMU=-2;
             }
             if(glstate->gleshard->active!=TMU) {
@@ -1003,12 +1007,12 @@ void realize_1texture(GLenum target, int wantedTMU, gltexture_t* tex, glsampler_
         }
     }
     if (is_depth_texture_format(tex->internalformat) || tex->depth_swizzle_applied) {
-        if (wantedTMU == -1) { oldtex = r1t_bind_on(TMU, tex); wantedTMU = -2; }
+        if (wantedTMU == -1) { oldtex = r1t_bind_on(TMU, target, tex); wantedTMU = -2; }
         if (glstate->gleshard->active != TMU) { glstate->gleshard->active = TMU; gles_glActiveTexture(GL_TEXTURE0 + TMU); }
         realize_depth_swizzle(target, tex);
     }
     if(wantedTMU==-2) {
-        if (oldtex!=tex->glname) gles_glBindTexture(GL_TEXTURE_2D, oldtex);
+        if (oldtex!=tex->glname) gles_glBindTexture(target, oldtex);
     }
 }
 

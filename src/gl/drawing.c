@@ -619,7 +619,81 @@ void APIENTRY_GL4ES gl4es_glDrawRangeElements(GLenum mode, GLuint start, GLuint 
         
         return;
     } else {
-        glDrawElementsCommon(mode, 0, count, end+1, sindices, iindices, 1);
+        // When drawing a subrange [start..end] from client-side vertex arrays, rebase the
+        // indices by -start and shift the enabled client pointers by +start*stride so the
+        // GLES driver only uploads [0..end-start] instead of [0..end].
+        int rebased = 0;
+        if (start > 0 && end >= start && (iindices || sindices)) {
+            int max_att = hardext.maxvattrib;
+            if (max_att > MAX_VATTRIB) max_att = MAX_VATTRIB;
+            int can_rebase = 1;
+            for (int a = 0; a < max_att; a++) {
+                vertexattrib_t *va = &glstate->vao->vertexattrib[a];
+                if (!va->enabled) continue;
+                if (va->buffer || va->divisor || !va->pointer) {
+                    can_rebase = 0;
+                    break;
+                }
+            }
+            if (can_rebase) {
+                int valid = 1;
+                GLuint max_rel = 0;
+                if (iindices) {
+                    for (int i = 0; i < count; i++) {
+                        if (iindices[i] < start) { valid = 0; break; }
+                        GLuint rel = iindices[i] - start;
+                        if (rel > max_rel) max_rel = rel;
+                    }
+                } else {
+                    for (int i = 0; i < count; i++) {
+                        if (sindices[i] < start) { valid = 0; break; }
+                        GLuint rel = sindices[i] - start;
+                        if (rel > max_rel) max_rel = rel;
+                    }
+                }
+                if (valid) {
+                    const GLvoid *saved_ptr[MAX_VATTRIB];
+                    for (int a = 0; a < max_att; a++) {
+                        vertexattrib_t *va = &glstate->vao->vertexattrib[a];
+                        saved_ptr[a] = va->pointer;
+                        if (!va->enabled) continue;
+                        int comps = (va->size == GL_BGRA) ? 4 : va->size;
+                        size_t stride = va->stride ? (size_t)va->stride : (size_t)gl_sizeof(va->type) * (size_t)comps;
+                        va->pointer = (const char *)va->pointer + (size_t)start * stride;
+                    }
+                    if (max_rel <= 0xFFFF) {
+                        GLushort *rs = (GLushort *)malloc((size_t)count * sizeof(GLushort));
+                        if (rs) {
+                            if (iindices) {
+                                for (int i = 0; i < count; i++) rs[i] = (GLushort)(iindices[i] - start);
+                            } else {
+                                for (int i = 0; i < count; i++) rs[i] = (GLushort)(sindices[i] - start);
+                            }
+                            glDrawElementsCommon(mode, 0, count, max_rel + 1, rs, NULL, 1);
+                            free(rs);
+                            rebased = 1;
+                        }
+                    } else {
+                        GLuint *ri = (GLuint *)malloc((size_t)count * sizeof(GLuint));
+                        if (ri) {
+                            if (iindices) {
+                                for (int i = 0; i < count; i++) ri[i] = iindices[i] - start;
+                            } else {
+                                for (int i = 0; i < count; i++) ri[i] = (GLuint)sindices[i] - start;
+                            }
+                            glDrawElementsCommon(mode, 0, count, max_rel + 1, NULL, ri, 1);
+                            free(ri);
+                            rebased = 1;
+                        }
+                    }
+                    for (int a = 0; a < max_att; a++) {
+                        glstate->vao->vertexattrib[a].pointer = saved_ptr[a];
+                    }
+                }
+            }
+        }
+        if (!rebased)
+            glDrawElementsCommon(mode, 0, count, end+1, sindices, iindices, 1);
         if(need_free)
             free(sindices);
     }

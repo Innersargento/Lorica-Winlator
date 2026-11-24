@@ -64,6 +64,12 @@ void change_vao_texcoord(int tmu, bool enable)
 #ifndef GL_TEXTURE_STREAM_IMG  
 #define GL_TEXTURE_STREAM_IMG                                   0x8C0D     
 #endif
+#ifndef GL_INDEX_ARRAY
+#define GL_INDEX_ARRAY                                          0x8077
+#endif
+#ifndef GL_EDGE_FLAG_ARRAY
+#define GL_EDGE_FLAG_ARRAY                                      0x8079
+#endif
 
 #ifndef NOEGL
 // glx/gl31_bridge.c: cap handled by GLADIATOR in a hybrid context (enable 1/0 = glEnable/glDisable, -1 = glIsEnabled into *is)
@@ -194,6 +200,10 @@ static void proxy_glEnable(GLenum cap, bool enable, void (APIENTRY_GLES *next)(G
         clientGO(GL_NORMAL_ARRAY, vertexattrib[ATT_NORMAL].enabled);
         clientGO(GL_COLOR_ARRAY, vertexattrib[ATT_COLOR].enabled);
         case GL_TEXTURE_COORD_ARRAY: change_vao_texcoord(glstate->texture.client, enable); break;
+        // Legacy client-state arrays unsupported in GLES: swallow instead of forwarding GL_INVALID_ENUM
+        case GL_INDEX_ARRAY:
+        case GL_EDGE_FLAG_ARRAY:
+            break;
 
         // map eval
         GONF(GL_MAP1_COLOR_4 , map1_color4);
@@ -434,6 +444,9 @@ GLboolean gl4es_enable_state(GLenum cap) {
         clientisenabled(GL_NORMAL_ARRAY, vertexattrib[ATT_NORMAL].enabled);
         clientisenabled(GL_COLOR_ARRAY, vertexattrib[ATT_COLOR].enabled);
         clientisenabled(GL_TEXTURE_COORD_ARRAY, vertexattrib[ATT_MULTITEXCOORD0+glstate->texture.client].enabled);
+        case GL_INDEX_ARRAY:
+        case GL_EDGE_FLAG_ARRAY:
+            return GL_FALSE;
         isenabled(GL_NORMALIZE, normalize);
         isenabled(GL_RESCALE_NORMAL, normal_rescale);
         isenabled(GL_MAP1_COLOR_4, map1_color4);
