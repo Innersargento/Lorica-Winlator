@@ -630,7 +630,7 @@ void APIENTRY_GL4ES gl4es_glDrawRangeElements(GLenum mode, GLuint start, GLuint 
             for (int a = 0; a < max_att; a++) {
                 vertexattrib_t *va = &glstate->vao->vertexattrib[a];
                 if (!va->enabled) continue;
-                if (va->buffer || va->divisor || !va->pointer) {
+                if (va->buffer || va->vbuf || va->real_buffer || va->divisor || !va->pointer) {
                     can_rebase = 0;
                     break;
                 }
@@ -669,7 +669,9 @@ void APIENTRY_GL4ES gl4es_glDrawRangeElements(GLenum mode, GLuint start, GLuint 
                             } else {
                                 for (int i = 0; i < count; i++) rs[i] = (GLushort)(sindices[i] - start);
                             }
+                            GLuint old_index = wantBufferIndex(0);
                             glDrawElementsCommon(mode, 0, count, max_rel + 1, rs, NULL, 1);
+                            wantBufferIndex(old_index);
                             free(rs);
                             rebased = 1;
                         }
@@ -681,7 +683,9 @@ void APIENTRY_GL4ES gl4es_glDrawRangeElements(GLenum mode, GLuint start, GLuint 
                             } else {
                                 for (int i = 0; i < count; i++) ri[i] = (GLuint)sindices[i] - start;
                             }
+                            GLuint old_index = wantBufferIndex(0);
                             glDrawElementsCommon(mode, 0, count, max_rel + 1, NULL, ri, 1);
+                            wantBufferIndex(old_index);
                             free(ri);
                             rebased = 1;
                         }
